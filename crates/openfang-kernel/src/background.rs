@@ -254,7 +254,7 @@ pub fn parse_condition(condition: &str) -> Option<TriggerPattern> {
 pub fn parse_cron_to_secs(cron: &str) -> u64 {
     let cron = cron.trim().to_lowercase();
 
-    // Try "every <N><unit>" format
+    // Try "every <N><unit>" format (e.g. "every 5m", "every 1h")
     if let Some(rest) = cron.strip_prefix("every ") {
         let rest = rest.trim();
         if let Some(num_str) = rest.strip_suffix('s') {
@@ -276,6 +276,52 @@ pub fn parse_cron_to_secs(cron: &str) -> u64 {
             if let Ok(n) = num_str.trim().parse::<u64>() {
                 return n * 86400;
             }
+        }
+    }
+
+    // Try standard 5-field cron expressions (min hour dom month dow)
+    // We approximate the interval from the expression pattern:
+    // "*/N * * * *" → every N minutes
+    // "0 */N * * *" → every N hours
+    // "0 N * * *"   → daily (at hour N) = 86400s
+    // "0 N * * 0"   → weekly = 604800s
+    let parts: Vec<&str> = cron.split_whitespace().collect();
+    if parts.len() == 5 {
+        let (min, hour, dom, _month, dow) = (parts[0], parts[1], parts[2], parts[3], parts[4]);
+
+        // "*/N * * * *" → every N minutes
+        if let Some(n_str) = min.strip_prefix("*/") {
+            if let Ok(n) = n_str.parse::<u64>() {
+                if hour == "*" && dom == "*" {
+                    return n * 60;
+                }
+            }
+        }
+
+        // "0 */N * * *" → every N hours
+        if min == "0" {
+            if let Some(n_str) = hour.strip_prefix("*/") {
+                if let Ok(n) = n_str.parse::<u64>() {
+                    if dom == "*" {
+                        return n * 3600;
+                    }
+                }
+            }
+        }
+
+        // "0 H * * 0" or "0 H * * 6-7" → weekly
+        if min.parse::<u64>().is_ok() && hour.parse::<u64>().is_ok() && dom == "*" && dow != "*" {
+            return 604800; // 7 days
+        }
+
+        // "0 H * * *" → daily
+        if min.parse::<u64>().is_ok() && hour.parse::<u64>().is_ok() && dom == "*" && dow == "*" {
+            return 86400; // 24 hours
+        }
+
+        // "0 H D * *" → monthly (approximate as 30 days)
+        if min.parse::<u64>().is_ok() && hour.parse::<u64>().is_ok() && dom.parse::<u64>().is_ok() {
+            return 2592000; // 30 days
         }
     }
 
@@ -311,9 +357,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_standard_cron() {
+        // Standard 5-field cron expressions
+        assert_eq!(parse_cron_to_secs("*/5 * * * *"), 300);    // every 5 minutes
+        assert_eq!(parse_cron_to_secs("*/30 * * * *"), 1800);  // every 30 minutes
+        assert_eq!(parse_cron_to_secs("0 */4 * * *"), 14400);  // every 4 hours
+        assert_eq!(parse_cron_to_secs("0 6 * * *"), 86400);    // daily at 6am
+        assert_eq!(parse_cron_to_secs("0 3 * * 0"), 604800);   // weekly on Sunday 3am
+    }
+
+    #[test]
     fn test_parse_cron_fallback() {
-        // Unparseable → 300
-        assert_eq!(parse_cron_to_secs("*/5 * * * *"), 300);
+        // Truly unparseable → 300
         assert_eq!(parse_cron_to_secs("gibberish"), 300);
     }
 

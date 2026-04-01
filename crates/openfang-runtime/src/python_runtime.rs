@@ -95,20 +95,54 @@ pub fn validate_script_path(path: &str) -> Result<(), PythonError> {
 }
 
 /// Find the Python interpreter on this system.
+///
+/// Resolution order:
+/// 1. `OPENFANG_PYTHON` env var (explicit override)
+/// 2. `python3` / `python` on PATH
+/// 3. Windows: common pyenv install paths
 fn find_python_interpreter() -> String {
-    // Try python3 first, then python
+    // 1. Explicit override via env var
+    if let Ok(py) = std::env::var("OPENFANG_PYTHON") {
+        if !py.is_empty() && check_python(&py) {
+            return py;
+        }
+    }
+
+    // 2. Standard names on PATH
     for cmd in &["python3", "python"] {
-        if std::process::Command::new(cmd)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
+        if check_python(cmd) {
             return cmd.to_string();
         }
     }
+
+    // 3. Windows: check common pyenv / standard install paths
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            // pyenv-win versions (most common on dev machines)
+            for ver in &["3.13", "3.12", "3.11", "3.10"] {
+                let full = format!("{}/.pyenv/pyenv-win/versions/{}.0/python.exe", home, ver);
+                // Also check without .0 suffix
+                for candidate in [&full, &format!("{}/.pyenv/pyenv-win/versions/{}/python.exe", home, ver)] {
+                    if std::path::Path::new(candidate).exists() && check_python(candidate) {
+                        return candidate.to_string();
+                    }
+                }
+            }
+        }
+    }
+
     "python3".to_string() // default, will fail with helpful message
+}
+
+/// Check if a Python command is runnable.
+fn check_python(cmd: &str) -> bool {
+    std::process::Command::new(cmd)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 /// Extract the script path from a module string like "python:path/to/script.py".
