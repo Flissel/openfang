@@ -1,0 +1,182 @@
+# OpenFang — VibeMind Integration Config
+# Copy to ~/.openfang/config.toml or merge with existing config.
+#
+# This config enables:
+# - Brain (Tahlamus) as MCP server for cognitive state queries
+# - A2A protocol for inter-service task routing
+# - Claude Code as default model for brain-* agents
+
+[default_model]
+provider = "claude-code"
+model = "claude-code/sonnet"
+
+[network]
+listen_addr = "127.0.0.1:4200"
+
+# Brain (Tahlamus) MCP Server — gives agents access to cognitive state
+[[mcp_servers]]
+name = "brain"
+timeout_secs = 5
+
+[mcp_servers.transport]
+type = "sse"
+url = "http://localhost:8900"
+
+# ── Security PoC MCP Servers ─────────────────────────────────────
+# Real-time network security monitoring (WiFi, ARP, DNS, TLS, ports)
+[[mcp_servers]]
+name = "network-monitor"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_network_monitor/mcp_server.py"]
+
+# Endpoint hardening audit (Defender, BitLocker, secrets, USB, browser)
+[[mcp_servers]]
+name = "endpoint-hardening"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_endpoint_hardening/mcp_server.py"]
+
+# Windows Event Log analysis (errors, BSODs, login audit, security events)
+[[mcp_servers]]
+name = "event-log"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_event_log/mcp_server.py"]
+
+# Windows Firewall management (status, rules, blocked connections)
+[[mcp_servers]]
+name = "firewall"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_firewall/mcp_server.py"]
+
+# Botnet detection (DGA analysis, C2 beacons, zombie scanning)
+[[mcp_servers]]
+name = "botnet-detector"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_botnet_detector/mcp_server.py"]
+
+# ── System Management MCP Servers ────────────────────────────────
+# Driver management (list, conflicts, unsigned, repair)
+[[mcp_servers]]
+name = "driver-manager"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/system/poc_driver_manager/mcp_server.py"]
+
+# Power management (battery, sleep, shutdown, power plans)
+[[mcp_servers]]
+name = "power-manager"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/system/poc_power_manager/mcp_server.py"]
+
+# Display & audio settings (resolution, brightness, volume, monitors)
+[[mcp_servers]]
+name = "display-audio"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/system/poc_display_audio/mcp_server.py"]
+
+# Process management (list, kill, priority, resource usage)
+[[mcp_servers]]
+name = "process-manager"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/system/poc_process_manager/mcp_server.py"]
+
+# Windows Registry (read, search, backup, restore)
+[[mcp_servers]]
+name = "registry"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/system/poc_registry/mcp_server.py"]
+
+# Scheduled tasks (list, create, delete, enable/disable)
+[[mcp_servers]]
+name = "scheduled-tasks"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/system/poc_scheduled_tasks/mcp_server.py"]
+
+# Windows Update management (check, install, history)
+[[mcp_servers]]
+name = "update-manager"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/system/poc_update_manager/mcp_server.py"]
+
+# Environment variable management (list, set, delete)
+[[mcp_servers]]
+name = "env-manager"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/system/poc_env_manager/mcp_server.py"]
+
+# ── DevOps MCP Servers ───────────────────────────────────────────
+# Backup & sync (file backup, cloud sync, snapshots)
+[[mcp_servers]]
+name = "backup-sync"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/devops/poc_backup_sync/mcp_server.py"]
+
+# ── Business MCP Servers ─────────────────────────────────────────
+# Pitch deck generator
+[[mcp_servers]]
+name = "pitch-deck"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/business/poc_pitch_deck/mcp_server.py"]
+
+# ── Security (additional) ────────────────────────────────────────
+# Website security verification (SSL, headers, CMS detection)
+[[mcp_servers]]
+name = "site-verifier"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_site_verifier/mcp_server.py"]
+
+# A2A Protocol — enables Bridge to discover and send tasks to agents
+[a2a]
+enabled = true
+listen_path = "/a2a"
+
+# Register Bridge as external A2A agent (optional)
+[[a2a.external_agents]]
+name = "brain-bridge"
+url = "http://localhost:5100"
