@@ -1,0 +1,42 @@
+[skill]
+name = "sec-forensics"
+version = "0.1.0"
+description = "Windows forensics — timeline from Prefetch, browser history, PowerShell history, USB devices, recent files"
+author = "vibemind"
+tags = ["security", "forensics", "timeline"]
+
+[runtime]
+type = "python"
+entry = "bridge.py"
+
+[[tools.provided]]
+name = "forensics_timeline"
+description = "Full forensics timeline: Prefetch, browser history, PowerShell history, USB history, recent files."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}
+
+[[tools.provided]]
+name = "browser_history"
+description = "Extract browser history (Chrome/Edge) with timestamps."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}
+
+[[tools.provided]]
+name = "usb_history"
+description = "List all USB devices ever connected (from Windows Registry)."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}
+
+[[tools.provided]]
+name = "powershell_history"
+description = "Extract PowerShell command history."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}

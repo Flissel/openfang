@@ -1,0 +1,29 @@
+[skill]
+name = "sec-vuln-scanner"
+version = "0.1.0"
+description = "Vulnerability scanner — inventories installed software, looks up CVEs via NIST NVD, checks Windows Updates"
+author = "vibemind"
+tags = ["security", "vulnerability", "cve"]
+
+[runtime]
+type = "python"
+entry = "bridge.py"
+
+[[tools.provided]]
+name = "scan_vulnerabilities"
+description = "Full vulnerability scan: inventory installed software from registry and look up known CVEs via NIST NVD API."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}
+
+[[tools.provided]]
+name = "lookup_cve"
+description = "Look up CVEs for a specific software name and version."
+
+[tools.provided.input_schema]
+type = "object"
+required = ["software_name", "version"]
+[tools.provided.input_schema.properties]
+software_name = { type = "string", description = "Software name, e.g. 'Python'" }
+version = { type = "string", description = "Version string, e.g. '3.11.0'" }

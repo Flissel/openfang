@@ -1,0 +1,42 @@
+# ============================================================
+# LLM Configuration — LangChain Code Reviewer Agent
+# ============================================================
+# Zentrale Config fuer den Code Reviewer.
+# Provider wechseln = nur hier aendern, kein Code anfassen.
+#
+# Reihenfolge: overrides[dir][role] > roles[role] > default
+# ============================================================
+
+keys:
+  openai: ${OPENAI_API_KEY}
+  deepseek: ${DEEPSEEK_API_KEY}
+  ollama: null
+
+providers:
+  openai:
+    type: openai
+    base_url: https://api.openai.com/v1
+    key_ref: openai
+  deepseek:
+    type: openai
+    base_url: https://api.deepseek.com
+    key_ref: deepseek
+  ollama:
+    type: openai
+    base_url: http://localhost:11434/v1
+    key_ref: null
+
+default:
+  provider: openai
+  model: gpt-4o-mini
+  temperature: 0.2
+
+roles:
+  ollama:
+    provider: ollama
+    model: qwen2.5
+    temperature: 0.2
+  deepseek:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.2

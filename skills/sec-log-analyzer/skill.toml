@@ -1,0 +1,37 @@
+[skill]
+name = "sec-log-analyzer"
+version = "0.1.0"
+description = "Windows security log analysis — brute force detection, privilege escalation, event timeline"
+author = "vibemind"
+tags = ["security", "logs", "analysis"]
+
+[runtime]
+type = "python"
+entry = "bridge.py"
+
+[[tools.provided]]
+name = "analyze_logs"
+description = "Analyze Windows Security/System logs for anomalies in the last N hours."
+
+[tools.provided.input_schema]
+type = "object"
+[tools.provided.input_schema.properties]
+hours = { type = "integer", description = "Hours to look back", default = 24 }
+
+[[tools.provided]]
+name = "detect_brute_force"
+description = "Detect brute force login attempts from Windows Security Event Log."
+
+[tools.provided.input_schema]
+type = "object"
+[tools.provided.input_schema.properties]
+hours = { type = "integer", description = "Hours to look back", default = 24 }
+
+[[tools.provided]]
+name = "build_timeline"
+description = "Build chronological event timeline from Windows logs."
+
+[tools.provided.input_schema]
+type = "object"
+[tools.provided.input_schema.properties]
+hours = { type = "integer", description = "Hours to look back", default = 24 }

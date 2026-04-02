@@ -131,16 +131,41 @@ technical terms in their original language.
 
 
 def _build_llm():
-    """Build the LLM based on environment configuration."""
-    use_ollama = os.getenv("USE_OLLAMA", "").lower() in ("1", "true", "yes")
+    """Build the LLM based on environment configuration or central llm_config.yml."""
+    # --- Zentrale Config via vibemind_shared ---
+    try:
+        from vibemind_shared import get_provider_info
+        _has_shared = True
+    except ImportError:
+        _has_shared = False
 
+    use_ollama = os.getenv("USE_OLLAMA", "").lower() in ("1", "true", "yes")
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+    role = "ollama" if use_ollama else ("deepseek" if provider == "deepseek" else "default")
+
+    # Try central config first
+    if _has_shared:
+        try:
+            info = get_provider_info(role)
+            base_url = info.get("base_url", "")
+            model = info.get("model", "gpt-4o-mini")
+            if "11434" in (base_url or ""):
+                from langchain_ollama import ChatOllama
+                return ChatOllama(model=model, base_url=base_url.replace("/v1", ""), temperature=0.2)
+            from langchain_openai import ChatOpenAI
+            kwargs = {"model": model, "temperature": 0.2, "max_tokens": 4096}
+            if base_url:
+                kwargs["base_url"] = base_url
+            return ChatOpenAI(**kwargs)
+        except Exception:
+            pass  # Fall through to legacy logic
+
+    # Legacy fallback
     if use_ollama:
         from langchain_ollama import ChatOllama
         model = os.getenv("OLLAMA_MODEL", "qwen2.5")
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         return ChatOllama(model=model, base_url=base_url, temperature=0.2)
-
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
 
     if provider == "deepseek":
         from langchain_openai import ChatOpenAI

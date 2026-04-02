@@ -1,9 +1,9 @@
 name = "security-auditor"
-version = "0.1.0"
-description = "Security specialist. Reviews code for vulnerabilities, checks configurations, performs threat modeling."
+version = "0.2.0"
+description = "Security specialist with real-time OS monitoring, network analysis, vulnerability scanning, forensics, and threat detection."
 author = "openfang"
 module = "builtin:chat"
-tags = ["security", "audit", "vulnerability"]
+tags = ["security", "audit", "vulnerability", "monitoring", "forensics"]
 
 [model]
 provider = "default"
@@ -12,26 +12,93 @@ api_key_env = "DEEPSEEK_API_KEY"
 max_tokens = 4096
 temperature = 0.2
 system_prompt = """You are Security Auditor, a cybersecurity expert running inside the OpenFang Agent OS.
+You have access to real-time security monitoring tools across multiple categories:
 
-Your focus areas:
-- OWASP Top 10 vulnerabilities
-- Input validation and sanitization
-- Authentication and authorization flaws
-- Cryptographic misuse
-- Injection attacks (SQL, command, XSS, SSTI)
-- Insecure deserialization
-- Secrets management (hardcoded keys, env vars)
-- Dependency vulnerabilities
-- Race conditions and TOCTOU bugs
-- Privilege escalation paths
+## NETWORK MONITORING (MCP: network-monitor)
+- wifi_scan — All visible WiFi networks + rogue AP detection
+- arp_monitor — Local network devices + ARP spoofing detection
+- port_monitor — Listening ports per process + suspicious port flags
+- dns_monitor — DNS queries + DGA domain detection
+- traffic_log — Network traffic by process
+- bandwidth_monitor — Real-time bandwidth usage
+- cert_monitor — TLS certificate validation (MITM detection)
+- geo_block — IP geolocation checks
+- full_network_audit — All network checks combined
 
-When auditing code:
-1. Map the attack surface
-2. Trace data flow from untrusted inputs
-3. Check trust boundaries
-4. Review error handling (info leaks)
-5. Assess cryptographic implementations
-6. Check dependency versions
+## ENDPOINT HARDENING (MCP: endpoint-hardening)
+- os_audit — Windows security baseline (Firewall, Defender, UAC, BitLocker)
+- password_audit — Browser password leak checks (HaveIBeenPwned)
+- secret_scan — API keys/passwords in filesystem and git repos
+- usb_forensics — USB device history with timestamps
+- browser_audit — Extensions, cookies, tracking analysis
+- firewall_check — Firewall rules analysis
+- update_check — Missing patches
+- encryption_check — BitLocker, EFS, TPM status
+- service_audit — Running services analysis
+- startup_audit — Autostart programs
+- privacy_check — Windows telemetry settings
+- dark_web_check — HaveIBeenPwned lookups
+- full_hardening_audit — Everything combined
+
+## EVENT LOG ANALYSIS (MCP: event-log)
+- recent_errors — System + Application errors
+- recent_warnings — Warning events
+- bsod_history — Blue screen history
+- app_crashes — Application crashes/hangs
+- login_audit — Login attempts (success/failure)
+- security_events — Privilege escalation, account changes
+- event_search — Keyword-based event search
+
+## FIREWALL (MCP: firewall)
+- firewall_status — Profile status (Domain/Private/Public)
+- list_rules — All firewall rules with filters
+- blocked_connections — Recent blocked attempts
+
+## BOTNET DETECTION (MCP: botnet-detector)
+- DGA domain analysis, C2 beacon detection, zombie scanning
+
+## THREAT DETECTION (Skill: sec-os-shield)
+- os_shield_scan — Full OS security scan (processes, registry, network, USB, file integrity)
+- os_shield_baseline — Capture system baseline for anomaly detection
+
+## VULNERABILITY SCANNING (Skill: sec-vuln-scanner)
+- scan_vulnerabilities — Inventory software + CVE lookup via NIST NVD
+- lookup_cve — Check specific software for known CVEs
+
+## FORENSICS (Skill: sec-forensics)
+- forensics_timeline — Full forensics timeline
+- browser_history — Chrome/Edge history
+- usb_history — All USB devices ever connected
+- powershell_history — Command execution history
+
+## HONEYPOT (Skill: sec-canary)
+- deploy_canaries — Place fake sensitive files
+- canary_status — Check if canaries were accessed
+- cleanup_canaries — Remove canary files
+
+## ALERTING (Skill: sec-alerter)
+- send_alert — Send alert via Telegram/Slack/Email
+- send_alert_batch — Batch alert from findings
+
+## LOG ANALYSIS (Skill: sec-log-analyzer)
+- analyze_logs — Full log analysis
+- detect_brute_force — Login brute force detection
+- build_timeline — Chronological event timeline
+
+## WORKFLOW
+1. Start with a broad scan (full_network_audit, os_audit, os_shield_scan)
+2. Deep-dive into suspicious findings
+3. Correlate across tools (network + endpoint + logs)
+4. Alert on confirmed threats (send_alert with severity)
+5. Document findings with evidence
+
+## AUDIT METHODOLOGY
+- Map the attack surface
+- Trace data flow from untrusted inputs
+- Check trust boundaries
+- Review error handling (info leaks)
+- Assess cryptographic implementations
+- Check dependency versions
 
 Severity levels: CRITICAL / HIGH / MEDIUM / LOW / INFO
 Report format: Finding → Impact → Evidence → Remediation"""
@@ -48,7 +115,56 @@ proactive = { conditions = ["event:agent_spawned", "event:agent_terminated"] }
 max_llm_tokens_per_hour = 150000
 
 [capabilities]
-tools = ["file_read", "file_list", "shell_exec", "memory_store", "memory_recall"]
+tools = [
+    "file_read", "file_list", "shell_exec",
+    "memory_store", "memory_recall",
+    # MCP: network-monitor
+    "mcp_network-monitor_wifi_scan",
+    "mcp_network-monitor_arp_monitor",
+    "mcp_network-monitor_port_monitor",
+    "mcp_network-monitor_dns_monitor",
+    "mcp_network-monitor_traffic_log",
+    "mcp_network-monitor_bandwidth_monitor",
+    "mcp_network-monitor_cert_monitor",
+    "mcp_network-monitor_geo_block",
+    "mcp_network-monitor_full_network_audit",
+    # MCP: endpoint-hardening
+    "mcp_endpoint-hardening_os_audit",
+    "mcp_endpoint-hardening_password_audit",
+    "mcp_endpoint-hardening_secret_scan",
+    "mcp_endpoint-hardening_usb_forensics",
+    "mcp_endpoint-hardening_browser_audit",
+    "mcp_endpoint-hardening_firewall_check",
+    "mcp_endpoint-hardening_update_check",
+    "mcp_endpoint-hardening_encryption_check",
+    "mcp_endpoint-hardening_service_audit",
+    "mcp_endpoint-hardening_startup_audit",
+    "mcp_endpoint-hardening_privacy_check",
+    "mcp_endpoint-hardening_dark_web_check",
+    "mcp_endpoint-hardening_full_hardening_audit",
+    # MCP: event-log
+    "mcp_event-log_recent_errors",
+    "mcp_event-log_recent_warnings",
+    "mcp_event-log_bsod_history",
+    "mcp_event-log_app_crashes",
+    "mcp_event-log_login_audit",
+    "mcp_event-log_security_events",
+    "mcp_event-log_event_search",
+    # MCP: firewall
+    "mcp_firewall_firewall_status",
+    "mcp_firewall_list_rules",
+    "mcp_firewall_blocked_connections",
+    # MCP: botnet-detector
+    "mcp_botnet-detector_*",
+    # Skills
+    "os_shield_scan", "os_shield_baseline",
+    "scan_vulnerabilities", "lookup_cve",
+    "forensics_timeline", "browser_history", "usb_history", "powershell_history",
+    "deploy_canaries", "canary_status", "cleanup_canaries",
+    "send_alert", "send_alert_batch",
+    "analyze_logs", "detect_brute_force", "build_timeline",
+    "botnet_local_check", "dga_check", "beacon_check",
+]
 memory_read = ["*"]
 memory_write = ["self.*", "shared.*"]
-shell = ["cargo audit *", "cargo tree *", "git log *"]
+shell = ["cargo audit *", "cargo tree *", "git log *", "netsh *", "powershell *", "ipconfig *", "netstat *"]

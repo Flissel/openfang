@@ -1,0 +1,33 @@
+[skill]
+name = "sec-alerter"
+version = "0.1.0"
+description = "Multi-channel security alerting — sends alerts via Telegram, Slack, and Email with deduplication"
+author = "vibemind"
+tags = ["security", "alerting", "notifications"]
+
+[runtime]
+type = "python"
+entry = "bridge.py"
+
+[[tools.provided]]
+name = "send_alert"
+description = "Send a security alert to all configured channels (Telegram, Slack, Email). Includes deduplication."
+
+[tools.provided.input_schema]
+type = "object"
+required = ["severity", "title"]
+[tools.provided.input_schema.properties]
+severity = { type = "string", description = "CRITICAL, HIGH, MEDIUM, LOW, or INFO" }
+title = { type = "string", description = "Alert title" }
+details = { type = "string", description = "Additional details", default = "" }
+
+[[tools.provided]]
+name = "send_alert_batch"
+description = "Send multiple alerts from a list of findings."
+
+[tools.provided.input_schema]
+type = "object"
+required = ["findings"]
+[tools.provided.input_schema.properties]
+findings = { type = "array", description = "List of {severity, title, details} objects" }
+source = { type = "string", description = "Source name", default = "Security Auditor" }

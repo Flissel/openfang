@@ -1,0 +1,36 @@
+[skill]
+name = "sec-botnet"
+version = "0.1.0"
+description = "Botnet detection — DGA domain analysis, C2 beacon detection, zombie endpoint checking"
+author = "vibemind"
+tags = ["security", "botnet", "threat-detection"]
+
+[runtime]
+type = "python"
+entry = "bridge.py"
+
+[[tools.provided]]
+name = "botnet_local_check"
+description = "Check local machine for botnet/zombie indicators: suspicious processes, crypto mining, malicious autoruns."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}
+
+[[tools.provided]]
+name = "dga_check"
+description = "Analyze domains for DGA (Domain Generation Algorithm) patterns. Returns suspicion score per domain."
+
+[tools.provided.input_schema]
+type = "object"
+required = ["domains"]
+[tools.provided.input_schema.properties]
+domains = { type = "array", description = "List of domain strings to analyze" }
+
+[[tools.provided]]
+name = "beacon_check"
+description = "Analyze network connections for C2 beacon patterns (periodic connections, jitter analysis)."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}

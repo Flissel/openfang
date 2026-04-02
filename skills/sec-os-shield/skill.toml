@@ -1,0 +1,26 @@
+[skill]
+name = "sec-os-shield"
+version = "0.1.0"
+description = "Autonomous OS threat detection — scans processes, registry, network, file integrity, USB devices"
+author = "vibemind"
+tags = ["security", "threat-detection", "windows"]
+
+[runtime]
+type = "python"
+entry = "bridge.py"
+
+[[tools.provided]]
+name = "os_shield_scan"
+description = "Run a full OS security scan. Captures baseline, checks processes, registry autoruns, network connections, USB devices, file integrity. Returns threat findings with severity levels."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}
+
+[[tools.provided]]
+name = "os_shield_baseline"
+description = "Capture current system baseline (processes, IPs, autoruns, USB). Used for anomaly detection."
+
+[tools.provided.input_schema]
+type = "object"
+properties = {}

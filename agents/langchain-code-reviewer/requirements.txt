@@ -1,3 +1,6 @@
+# VibeMind Shared LLM Config
+vibemind-shared>=0.1.0
+
 langchain>=0.3
 langchain-openai>=0.3
 langchain-core>=0.3
