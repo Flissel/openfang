@@ -1,0 +1,59 @@
+[skill]
+name = "devops-git-agents"
+version = "0.1.0"
+description = "AI-powered GitHub repo management — triage issues, review PRs, check CI/CD, generate board overview"
+author = "vibemind"
+tags = ["devops", "github", "automation", "ci-cd"]
+
+[runtime]
+type = "python"
+entry = "bridge.py"
+
+[[tools.provided]]
+name = "git_triage"
+description = "Triage open GitHub issues: auto-label (bug/feature/question), set priority, detect duplicates."
+
+[tools.provided.input_schema]
+type = "object"
+[tools.provided.input_schema.properties]
+repo = { type = "string", description = "Target repo (e.g. 'Flissel/vibemind-os'). Empty = scan all repos." }
+dry_run = { type = "boolean", description = "Preview only, no writes", default = true }
+
+[[tools.provided]]
+name = "git_review"
+description = "AI-powered code review of open pull requests."
+
+[tools.provided.input_schema]
+type = "object"
+[tools.provided.input_schema.properties]
+repo = { type = "string", description = "Target repo. Empty = scan all repos." }
+dry_run = { type = "boolean", description = "Preview only, no writes", default = true }
+
+[[tools.provided]]
+name = "git_cicd"
+description = "Check CI/CD pipeline status, analyze failures, suggest fixes."
+
+[tools.provided.input_schema]
+type = "object"
+[tools.provided.input_schema.properties]
+repo = { type = "string", description = "Target repo. Empty = scan all repos." }
+dry_run = { type = "boolean", description = "Preview only, no writes", default = true }
+
+[[tools.provided]]
+name = "git_board"
+description = "Generate project board overview across all repos (issues, PRs, milestones)."
+
+[tools.provided.input_schema]
+type = "object"
+[tools.provided.input_schema.properties]
+dry_run = { type = "boolean", description = "Preview only", default = true }
+
+[[tools.provided]]
+name = "git_all"
+description = "Run all 4 agents (triage + review + cicd + board) across repos."
+
+[tools.provided.input_schema]
+type = "object"
+[tools.provided.input_schema.properties]
+repo = { type = "string", description = "Target repo. Empty = scan all repos." }
+dry_run = { type = "boolean", description = "Preview only, no writes", default = true }

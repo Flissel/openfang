@@ -51,13 +51,22 @@ impl AgentRegistry {
     }
 
     /// Update agent state.
+    ///
+    /// Note: recovery transitions (Crashed → Running) intentionally do NOT
+    /// bump `last_active`. This preserves the idle-agent detection in
+    /// `heartbeat::check_agents()`: an agent that was never sent a real
+    /// message should keep `last_active ≈ created_at` so the heartbeat
+    /// skips it instead of entering an infinite crash-recover loop.
     pub fn set_state(&self, id: AgentId, state: AgentState) -> OpenFangResult<()> {
         let mut entry = self
             .agents
             .get_mut(&id)
             .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        let is_recovery = entry.state == AgentState::Crashed && state == AgentState::Running;
         entry.state = state;
-        entry.last_active = chrono::Utc::now();
+        if !is_recovery {
+            entry.last_active = chrono::Utc::now();
+        }
         Ok(())
     }
 

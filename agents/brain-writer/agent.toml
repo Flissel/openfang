@@ -36,3 +36,12 @@ tools = ["file_read", "file_write", "file_list", "web_search", "web_fetch", "mem
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
+
+[mcp_allowed]
+servers = [
+  "filesystem",
+  "memory",
+  "context7",
+  "tavily",
+  "brain"
+]

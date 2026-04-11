@@ -36,3 +36,16 @@ tools = ["web_search", "web_fetch", "file_read", "file_write", "file_list", "mem
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
+
+[mcp_allowed]
+servers = [
+  "tavily",
+  "brave-search",
+  "fetch",
+  "playwright",
+  "context7",
+  "filesystem",
+  "memory",
+  "qdrant",
+  "brain"
+]

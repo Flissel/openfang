@@ -37,3 +37,13 @@ network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 agent_message = ["*"]
+
+[mcp_allowed]
+servers = [
+  "taskmanager",
+  "memory",
+  "qdrant",
+  "filesystem",
+  "time",
+  "brain"
+]

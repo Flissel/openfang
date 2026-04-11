@@ -41,3 +41,20 @@ network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 shell = ["*"]
+
+[mcp_allowed]
+servers = [
+  "docker",
+  "redis",
+  "postgres",
+  "filesystem",
+  "git",
+  "process-manager",
+  "driver-manager",
+  "power-manager",
+  "scheduled-tasks",
+  "registry",
+  "env-manager",
+  "brain",
+  "issue-detector"
+]

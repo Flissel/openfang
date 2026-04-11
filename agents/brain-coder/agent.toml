@@ -38,3 +38,15 @@ network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 shell = ["cargo *", "git *", "npm *", "python *", "pip *", "pytest *"]
+
+[mcp_allowed]
+servers = [
+  "filesystem",
+  "git",
+  "github",
+  "context7",
+  "qdrant",
+  "fetch",
+  "brain",
+  "issue-detector"
+]
