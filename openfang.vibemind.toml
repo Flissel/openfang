@@ -332,6 +332,19 @@ command = "npx"
 args = ["-y", "@kazuph/mcp-taskmanager"]
 
 # ═══════════════════════════════════════════════════════════════════
+# VibeMind Database MCP (Supabase PostgREST)
+# ═══════════════════════════════════════════════════════════════════
+
+# Full CRUD for all 22 VibeMind tables via Supabase PostgREST
+[[mcp_servers]]
+name = "vibemind-db"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_mcp.py"]
+
+# ═══════════════════════════════════════════════════════════════════
 # A2A Protocol
 # ═══════════════════════════════════════════════════════════════════
 

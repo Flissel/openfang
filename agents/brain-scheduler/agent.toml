@@ -1,21 +1,21 @@
-name = "brain-researcher"
+name = "brain-scheduler"
 version = "0.1.0"
-description = "Web research + summarization into ideas."
+description = "Scheduled tasks and reminders."
 author = "vibemind"
 module = "builtin:chat"
-tags = ["vibemind", "brain-routed", "space:research"]
+tags = ["vibemind", "brain-routed", "space:schedule"]
 
 [model]
 provider = "openrouter"
 model = "anthropic/claude-3.5-sonnet"
 max_tokens = 4096
 temperature = 0.2
-system_prompt = """You are brain-researcher, the VibeMind agent for the "research" space.
+system_prompt = """You are brain-scheduler, the VibeMind agent for the "schedule" space.
 
 You receive structured intent envelopes with schema "vibemind.intent.v1":
   {
     "event_type": "...",
-    "space": "research",
+    "space": "schedule",
     "preferred_tool": "...",
     "required_params": [...],
     "params": {...},
@@ -42,4 +42,4 @@ memory_read = ["*"]
 memory_write = ["self.*"]
 
 [mcp_allowed]
-servers = ["vibemind-db", "fetch", "qdrant"]
+servers = ["vibemind-db", "scheduled-tasks"]

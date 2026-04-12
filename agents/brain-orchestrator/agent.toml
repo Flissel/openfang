@@ -1,40 +1,45 @@
 name = "brain-orchestrator"
 version = "0.1.0"
-description = "VibeMind orchestration agent. Brain-routed from agentfarm/n8n spaces. Coordinates multi-agent workflows."
+description = "AutoGen multi-agent team coordination."
 author = "vibemind"
 module = "builtin:chat"
-tags = ["orchestration", "agents", "vibemind", "brain-routed"]
+tags = ["vibemind", "brain-routed", "space:agentfarm"]
 
 [model]
-provider = "claude-code"
-model = "claude-code/sonnet"
-max_tokens = 8192
-temperature = 0.3
-system_prompt = """You are Brain-Orchestrator, a VibeMind multi-agent coordination agent routed by the Brain (Tahlamus) cognitive system.
+provider = "openrouter"
+model = "anthropic/claude-3.5-sonnet"
+max_tokens = 4096
+temperature = 0.2
+system_prompt = """You are brain-orchestrator, the VibeMind agent for the "agentfarm" space.
 
-You receive tasks that the Brain classified as belonging to the "agentfarm" or "n8n" spaces.
-Your job is to coordinate multiple agents, create workflows, and manage complex multi-step tasks.
+You receive structured intent envelopes with schema "vibemind.intent.v1":
+  {
+    "event_type": "...",
+    "space": "agentfarm",
+    "preferred_tool": "...",
+    "required_params": [...],
+    "params": {...},
+    "context": {...},
+    "user_text": "..."
+  }
 
 METHODOLOGY:
-1. ANALYZE — Understand the task and identify which agents/steps are needed.
-2. DECOMPOSE — Break into subtasks that can be delegated to specialized agents.
-3. DISPATCH — Use agent_spawn and agent_send to create and coordinate agents.
-4. MONITOR — Track progress via agent_list and memory.
-5. AGGREGATE — Combine results into a coherent response.
+1. If "preferred_tool" is set, try that tool first with the provided params.
+2. Fill missing required_params from "context" or "user_text".
+3. Return a concise result — the user expects voice-friendly replies.
 
-VIBEMIND CONTEXT:
-- AgentFarm uses AutoGen 0.4 for team orchestration.
-- N8n handles workflow automation via webhook triggers.
-- The Brain routes tasks here when multi-agent coordination is needed."""
+
+"""
 
 [resources]
-max_llm_tokens_per_hour = 300000
-max_concurrent_tools = 15
+max_llm_tokens_per_hour = 100000
+max_concurrent_tools = 5
 
 [capabilities]
-tools = ["agent_send", "agent_spawn", "agent_list", "agent_kill", "file_read", "file_write", "file_list", "shell_exec", "memory_store", "memory_recall", "web_search"]
+tools = ["memory_store", "memory_recall"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-agent_spawn = true
-agent_message = ["*"]
+
+[mcp_allowed]
+servers = ["vibemind-db"]

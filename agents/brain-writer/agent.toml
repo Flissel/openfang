@@ -39,6 +39,7 @@ memory_write = ["self.*"]
 
 [mcp_allowed]
 servers = [
+  "vibemind-db",
   "filesystem",
   "memory",
   "context7",

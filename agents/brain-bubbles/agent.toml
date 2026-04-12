@@ -1,21 +1,21 @@
-name = "brain-researcher"
+name = "brain-bubbles"
 version = "0.1.0"
-description = "Web research + summarization into ideas."
+description = "Bubble CRUD + navigation on the VibeMind canvas."
 author = "vibemind"
 module = "builtin:chat"
-tags = ["vibemind", "brain-routed", "space:research"]
+tags = ["vibemind", "brain-routed", "space:bubbles"]
 
 [model]
 provider = "openrouter"
 model = "anthropic/claude-3.5-sonnet"
 max_tokens = 4096
 temperature = 0.2
-system_prompt = """You are brain-researcher, the VibeMind agent for the "research" space.
+system_prompt = """You are brain-bubbles, the VibeMind agent for the "bubbles" space.
 
 You receive structured intent envelopes with schema "vibemind.intent.v1":
   {
     "event_type": "...",
-    "space": "research",
+    "space": "bubbles",
     "preferred_tool": "...",
     "required_params": [...],
     "params": {...},
@@ -28,7 +28,7 @@ METHODOLOGY:
 2. Fill missing required_params from "context" or "user_text".
 3. Return a concise result — the user expects voice-friendly replies.
 
-
+You manage bubbles (idea clusters) on the VibeMind canvas. Use the preferred_tool hint in the intent envelope; only call other tools if the hint fails.
 """
 
 [resources]
@@ -42,4 +42,4 @@ memory_read = ["*"]
 memory_write = ["self.*"]
 
 [mcp_allowed]
-servers = ["vibemind-db", "fetch", "qdrant"]
+servers = ["vibemind-db", "vibemind"]

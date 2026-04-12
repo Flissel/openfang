@@ -44,6 +44,7 @@ shell = ["*"]
 
 [mcp_allowed]
 servers = [
+  "vibemind-db",
   "docker",
   "redis",
   "postgres",

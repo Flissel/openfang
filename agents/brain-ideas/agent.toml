@@ -1,21 +1,21 @@
-name = "brain-researcher"
+name = "brain-ideas"
 version = "0.1.0"
-description = "Web research + summarization into ideas."
+description = "Idea notes inside bubbles — create, update, link, format."
 author = "vibemind"
 module = "builtin:chat"
-tags = ["vibemind", "brain-routed", "space:research"]
+tags = ["vibemind", "brain-routed", "space:ideas"]
 
 [model]
 provider = "openrouter"
 model = "anthropic/claude-3.5-sonnet"
 max_tokens = 4096
 temperature = 0.2
-system_prompt = """You are brain-researcher, the VibeMind agent for the "research" space.
+system_prompt = """You are brain-ideas, the VibeMind agent for the "ideas" space.
 
 You receive structured intent envelopes with schema "vibemind.intent.v1":
   {
     "event_type": "...",
-    "space": "research",
+    "space": "ideas",
     "preferred_tool": "...",
     "required_params": [...],
     "params": {...},
@@ -42,4 +42,4 @@ memory_read = ["*"]
 memory_write = ["self.*"]
 
 [mcp_allowed]
-servers = ["vibemind-db", "fetch", "qdrant"]
+servers = ["vibemind-db"]

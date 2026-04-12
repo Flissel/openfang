@@ -41,6 +41,7 @@ shell = ["cargo *", "git *", "npm *", "python *", "pip *", "pytest *"]
 
 [mcp_allowed]
 servers = [
+  "vibemind-db",
   "filesystem",
   "git",
   "github",

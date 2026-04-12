@@ -51,6 +51,7 @@ memory_write = ["self.*"]
 
 [mcp_allowed]
 servers = [
+  "vibemind-db",
   "docker",
   "process-manager",
   "event-log",

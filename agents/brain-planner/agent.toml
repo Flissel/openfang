@@ -40,6 +40,7 @@ agent_message = ["*"]
 
 [mcp_allowed]
 servers = [
+  "vibemind-db",
   "taskmanager",
   "memory",
   "qdrant",
