@@ -9,6 +9,19 @@
 # API server port (top-level field, NOT under [network])
 api_listen = "127.0.0.1:4200"
 
+# ── Telegram Channel ─────────────────────────────────────────────
+# Enables polling for the @VibeMind_agent_bot bot. Without this block
+# OpenFang starts without a Telegram consumer and incoming messages pile
+# up as pending updates on Telegram's servers.
+[channels.telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+allowed_users = ["1092040975"]
+# Telegram routes to the dedicated `desktop` agent which has an MCP
+# allowlist of only the desktop-automation server (~20 tools, not 368).
+# This avoids the 60s heartbeat timeout caused by 368-tool tool-loops
+# and keeps replies focused on what the user actually wants from the bot.
+default_agent = "desktop"
+
 [default_model]
 provider = "claude-code"
 model = "claude-code/sonnet"
@@ -343,6 +356,23 @@ timeout_secs = 10
 type = "stdio"
 command = "python"
 args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_mcp.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Desktop Automation (handoff multi-agent system)
+# ═══════════════════════════════════════════════════════════════════
+# Exposes the eyeTerm/handoff toolset (handoff_action, handoff_describe_screen,
+# handoff_excel_*, etc.) to any agent that connects to OpenFang. Replaces the
+# previous per-agent stdio entry (e.g. OpenClaw's acpx config) so all
+# consumers — OpenClaw ACP sessions, coding-engine, brain — share one
+# warm process instead of paying the SentenceTransformer/Torch cold-start
+# 10–30 s per agent.
+[[mcp_servers]]
+name = "desktop-automation"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_handoff.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # A2A Protocol
