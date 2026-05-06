@@ -256,13 +256,37 @@ struct ClaudeStreamEvent {
     usage: Option<ClaudeUsage>,
 }
 
+/// Build a `tokio::process::Command` for the Claude Code CLI.
+///
+/// On Windows, npm-installed CLIs are shipped as `.cmd` shims that wrap a
+/// nodejs script (`node node_modules/.../cli.js "$@"`). When tokio invokes a
+/// `.cmd`/`.bat` directly, Windows' batch-file argument parser rejects long
+/// prompts containing newlines or `"`, producing the spurious error
+/// "batch file arguments are invalid". Routing through `cmd.exe /C` preserves
+/// the args correctly because cmd.exe quotes them itself.
+///
+/// On non-Windows platforms (or when the CLI path is not a `.cmd`/`.bat`),
+/// fall back to spawning the binary directly.
+fn build_cli_command(cli_path: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let lower = cli_path.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            let mut cmd = tokio::process::Command::new("cmd.exe");
+            cmd.arg("/C").arg(cli_path);
+            return cmd;
+        }
+    }
+    tokio::process::Command::new(cli_path)
+}
+
 #[async_trait]
 impl LlmDriver for ClaudeCodeDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
 
-        let mut cmd = tokio::process::Command::new(&self.cli_path);
+        let mut cmd = build_cli_command(&self.cli_path);
         cmd.arg("-p")
             .arg(&prompt)
             .arg("--output-format")
@@ -457,7 +481,7 @@ impl LlmDriver for ClaudeCodeDriver {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
 
-        let mut cmd = tokio::process::Command::new(&self.cli_path);
+        let mut cmd = build_cli_command(&self.cli_path);
         cmd.arg("-p")
             .arg(&prompt)
             .arg("--output-format")

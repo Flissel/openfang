@@ -368,11 +368,43 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_
 # 10–30 s per agent.
 [[mcp_servers]]
 name = "desktop-automation"
-timeout_secs = 60
+# 180s so handoff_approval_request can block for up to ~150s waiting for
+# the user to click Approve/Decline before the MCP bridge times out.
+# (Most other tools complete in <5s; this only matters for blocking ones.)
+timeout_secs = 180
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
 args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_handoff.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 11.A — Spaces MCP Servers
+# Bubble + Idea tools as MCP for brain-bubbles and brain-ideas agents.
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "spaces-ideas"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/ideas/mcp_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 11.B — Multiverse Navigation (Smart 3-layer resolver)
+# Maps natural-language queries to one of 14 spaces and broadcasts
+# navigation events to the Electron UI. Layers: alias → Qwen3 embedding
+# → LLM tiebreaker.
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "space-navigator"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/_navigator/mcp_server.py"]
+env = { OPENROUTER_API_KEY = "${OPENROUTER_API_KEY}", NAVIGATOR_LLM_MODEL = "openai/gpt-4o-mini", NAVIGATOR_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B" }
 
 # ═══════════════════════════════════════════════════════════════════
 # A2A Protocol

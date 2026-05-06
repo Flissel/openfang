@@ -45,3 +45,12 @@ Thumbs.db
 *.swo
 *~
 .serena/
+
+# === Windows cmd typo artifact ===
+%ProgramData%/
+
+# === MCP / runtime caches ===
+.playwright-mcp/
+
+# === Phase R Phi3-Klone (generated) ===
+agents-phi3/

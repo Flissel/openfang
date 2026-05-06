@@ -75,6 +75,37 @@ These ship with VibeMind and only need Python:
 | `env-manager` | Environment variables | `system/poc_env_manager/` |
 | `backup-sync` | Backup, cloud sync | `devops/poc_backup_sync/` |
 | `pitch-deck` | Pitch deck generator | `business/poc_pitch_deck/` |
+| `space-navigator` | 14-space multiverse navigation (Qwen3 + LLM) | `spaces/_navigator/` |
+
+#### space-navigator (Phase 11.B)
+
+Smart 3-layer resolver mapping natural-language queries to one of the 14 VibeMind spaces (autogen, brain, coding, desktop, flowzen, ideas, minibook, mirofish, n8n, research, rowboat, schedule, shuttles, video). Each call broadcasts a `navigate_to_space` event so the Electron UI can react.
+
+**Tools (12):**
+
+| Tool | Smart? | Purpose |
+|------|--------|---------|
+| `space_list` | – | All 14 spaces with metadata |
+| `space_current` | – | Active space + history |
+| `space_goto(space)` | – | Direct jump (alias-aware) |
+| `space_next(direction)` | – | Cycle next/prev |
+| `space_back` | – | History pop |
+| `space_home` | – | Reset to `ideas` |
+| `space_resolve(query)` | ✓ | Lookup-only, no jump |
+| `space_navigate_intent(query)` | ✓ | Resolve + jump in one call |
+| `space_suggest(query)` | ✓ | Top-k candidates with reasoning |
+| `space_recent(limit)` | ✓ | Most-visited spaces |
+| `space_info(space)` | – | Metadata + capabilities |
+| `space_index_status` | – | Embedding/LLM diagnostics |
+
+**Layers (fallback chain):**
+1. **alias** — exact id/label/alias match (instant)
+2. **embed** — Qwen3-Embedding-0.6B cosine similarity over 14 corpus blobs
+3. **llm** — gpt-4o-mini tiebreaker when top-2 within 0.05
+
+**State:** `vibemind-os/spaces/_navigator/state.json` (gitignored — current space + history + visit counts).
+
+**Required env:** `OPENROUTER_API_KEY` (for layer 3 only — layers 1+2 work offline).
 
 ### Installed On Demand (npm / uvx / pip)
 
