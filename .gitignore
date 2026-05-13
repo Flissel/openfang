@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Runtime logs
+logs/
+*.log
+
 # Environment & secrets
 .env
 .env.*
