@@ -8,6 +8,11 @@
 .env.*
 !.env.example
 
+# Generated from .tmpl by scripts/render_agent_tomls.py — contains rendered
+# memory blocks (user identity, project context) and must NOT be committed.
+# The template (agent.toml.tmpl) is the source of truth.
+agents/brain-coder/agent.toml
+
 # Database
 *.db
 *.db-shm
@@ -45,3 +50,12 @@ Thumbs.db
 *.swo
 *~
 .serena/
+
+# === Windows cmd typo artifact ===
+%ProgramData%/
+
+# === MCP / runtime caches ===
+.playwright-mcp/
+
+# === Phase R Phi3-Klone (generated) ===
+agents-phi3/

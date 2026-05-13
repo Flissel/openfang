@@ -42,4 +42,4 @@ memory_read = ["*"]
 memory_write = ["self.*"]
 
 [mcp_allowed]
-servers = ["vibemind-db"]
+servers = ["vibemind-db", "spaces-ideas"]
