@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use openfang_types::message::{ContentBlock, Role, StopReason, TokenUsage};
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 /// Environment variable names (and suffixes) to strip from the subprocess
@@ -256,6 +256,32 @@ struct ClaudeStreamEvent {
     usage: Option<ClaudeUsage>,
 }
 
+/// Write `bytes` to a fresh tempfile under the system temp dir and return the
+/// path. Used to ferry long system prompts (>8191 chars on Windows) to the
+/// Claude Code CLI via `--system-prompt-file <path>` instead of argv.
+///
+/// The caller is responsible for cleanup; we deliberately don't auto-delete
+/// because the subprocess reads the file lazily after spawn returns. Files
+/// land in `%TEMP%` which Windows cleans periodically.
+fn write_temp_file(
+    bytes: &[u8],
+    prefix: &str,
+    suffix: &str,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("{prefix}{nanos:x}{suffix}"));
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(bytes)?;
+    f.flush()?;
+    Ok(path)
+}
+
 /// Build a `tokio::process::Command` for the Claude Code CLI.
 ///
 /// On Windows, npm-installed CLIs are shipped as `.cmd` shims that wrap a
@@ -287,14 +313,34 @@ impl LlmDriver for ClaudeCodeDriver {
         let model_flag = Self::model_flag(&request.model);
 
         let mut cmd = build_cli_command(&self.cli_path);
+        // Prompt is fed via stdin (`--input-format text`) instead of `-p <prompt>`
+        // argv. Windows enforces a ~8191 char command-line limit; voice/agent
+        // prompts with conversation history blow past it easily. Stdin has no
+        // such cap and works identically on all platforms.
         cmd.arg("-p")
-            .arg(&prompt)
+            .arg("--input-format")
+            .arg("text")
             .arg("--output-format")
             .arg("json");
 
-        if let Some(ref sys) = request.system {
-            cmd.arg("--system-prompt").arg(sys);
-        }
+        // System prompt is routed through a tempfile (`--system-prompt-file`)
+        // so it doesn't compete with the user prompt for argv length. Tool
+        // definitions easily push system prompts past the Windows 8191 cap.
+        let sys_prompt_tempfile = if let Some(ref sys) = request.system {
+            match write_temp_file(sys.as_bytes(), "openfang-sysprompt-", ".txt") {
+                Ok(path) => {
+                    cmd.arg("--system-prompt-file").arg(&path);
+                    Some(path)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to write system-prompt tempfile, falling back to argv");
+                    cmd.arg("--system-prompt").arg(sys);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         if self.skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
@@ -311,12 +357,12 @@ impl LlmDriver for ClaudeCodeDriver {
         if let Some(home) = home_dir() {
             cmd.env("HOME", &home);
         }
-        // Detach stdin so the CLI does not block waiting for interactive input.
-        cmd.stdin(std::process::Stdio::null());
+        // Pipe stdin so we can write the prompt into the subprocess.
+        cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        debug!(cli = %self.cli_path, skip_permissions = self.skip_permissions, "Spawning Claude Code CLI");
+        debug!(cli = %self.cli_path, skip_permissions = self.skip_permissions, prompt_bytes = prompt.len(), sys_tempfile = ?sys_prompt_tempfile, "Spawning Claude Code CLI");
 
         // Spawn child process instead of cmd.output() so we can track PID and timeout
         let mut child = cmd.spawn().map_err(|e| {
@@ -326,6 +372,17 @@ impl LlmDriver for ClaudeCodeDriver {
                 e
             ))
         })?;
+
+        // Write the prompt to the child's stdin and close it (EOF signals end of input).
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                warn!(error = %e, "Failed to write prompt to Claude Code CLI stdin");
+                return Err(LlmError::Http(format!(
+                    "Failed to write prompt to Claude Code CLI stdin: {e}"
+                )));
+            }
+            drop(stdin);
+        }
 
         // Track the PID using the model name as label (best identifier available)
         let pid_label = request.model.clone();
@@ -482,15 +539,30 @@ impl LlmDriver for ClaudeCodeDriver {
         let model_flag = Self::model_flag(&request.model);
 
         let mut cmd = build_cli_command(&self.cli_path);
+        // See `complete()` above for why prompt is routed via stdin instead of argv.
         cmd.arg("-p")
-            .arg(&prompt)
+            .arg("--input-format")
+            .arg("text")
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose");
 
-        if let Some(ref sys) = request.system {
-            cmd.arg("--system-prompt").arg(sys);
-        }
+        // System prompt via tempfile — see `complete()` above for rationale.
+        let _sys_prompt_tempfile = if let Some(ref sys) = request.system {
+            match write_temp_file(sys.as_bytes(), "openfang-sysprompt-", ".txt") {
+                Ok(path) => {
+                    cmd.arg("--system-prompt-file").arg(&path);
+                    Some(path)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to write system-prompt tempfile, falling back to argv");
+                    cmd.arg("--system-prompt").arg(sys);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         if self.skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
@@ -506,11 +578,11 @@ impl LlmDriver for ClaudeCodeDriver {
         if let Some(home) = home_dir() {
             cmd.env("HOME", &home);
         }
-        cmd.stdin(std::process::Stdio::null());
+        cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        debug!(cli = %self.cli_path, "Spawning Claude Code CLI (streaming)");
+        debug!(cli = %self.cli_path, prompt_bytes = prompt.len(), "Spawning Claude Code CLI (streaming)");
 
         let mut child = cmd.spawn().map_err(|e| {
             LlmError::Http(format!(
@@ -519,6 +591,17 @@ impl LlmDriver for ClaudeCodeDriver {
                 e
             ))
         })?;
+
+        // Feed prompt via stdin, then close.
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                warn!(error = %e, "Failed to write prompt to Claude Code CLI stdin (streaming)");
+                return Err(LlmError::Http(format!(
+                    "Failed to write prompt to Claude Code CLI stdin: {e}"
+                )));
+            }
+            drop(stdin);
+        }
 
         // Track PID
         let pid_label = format!("{}-stream", request.model);

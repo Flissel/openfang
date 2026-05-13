@@ -15,7 +15,7 @@ use std::time::Instant;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Daemon info written to `~/.openfang/daemon.json` so the CLI can find us.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -824,6 +824,18 @@ pub async fn run_daemon(
     )?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+    // Enable TCP keepalive so the OS keeps the listener "warm" during long idle
+    // periods. Without this, Windows can lose the socket after ~2h of no traffic
+    // (process stays alive but stops accepting connections). The TcpKeepalive
+    // settings here are intentionally aggressive for a local dev daemon: 30s
+    // idle before first probe, 10s between probes. On Linux/macOS we also set
+    // retries=5; on Windows that param is silently ignored (registry-controlled).
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(30))
+        .with_interval(std::time::Duration::from_secs(10));
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+        warn!(error = %e, "Failed to enable TCP keepalive on listener socket — daemon may go silent after long idle on Windows");
+    }
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     let listener = tokio::net::TcpListener::from_std(std::net::TcpListener::from(socket))?;

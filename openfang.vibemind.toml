@@ -368,10 +368,11 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_
 # 10–30 s per agent.
 [[mcp_servers]]
 name = "desktop-automation"
-# 180s so handoff_approval_request can block for up to ~150s waiting for
-# the user to click Approve/Decline before the MCP bridge times out.
-# (Most other tools complete in <5s; this only matters for blocking ones.)
-timeout_secs = 180
+# 300s so handoff_approval_request can block up to ~240s, plus headroom
+# for slow gpt-5.5 coordinator iterations on big tool-loops. Bumped
+# 180->300 (2026-05-08) — smart-skill loops were aborting with
+# "MCP-Tool-Timeout" because the 180s ceiling was too tight.
+timeout_secs = 300
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
