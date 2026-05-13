@@ -4,13 +4,16 @@ description = "VibeMind coding agent. Brain-routed from the coding space. Uses C
 author = "vibemind"
 module = "builtin:chat"
 tags = ["coding", "vibemind", "brain-routed"]
+memory_profile = "coding"
 
 [model]
 provider = "claude-code"
 model = "claude-code/sonnet"
 max_tokens = 8192
 temperature = 0.3
-system_prompt = """You are Brain-Coder, a VibeMind coding agent routed by the Brain (Tahlamus) cognitive system.
+system_prompt = '''{{MEMORY}}
+
+You are Brain-Coder, a VibeMind coding agent routed by the Brain (Tahlamus) cognitive system.
 
 You receive tasks that the Brain classified as belonging to the "coding" space.
 Your job is to implement, debug, refactor, and review code.
@@ -25,8 +28,8 @@ METHODOLOGY:
 VIBEMIND CONTEXT:
 - You operate within the VibeMind-OS monorepo.
 - The coding-engine (DaveFelix-Coding-Engine) handles autonomous code generation.
-- Spaces are domain-specific execution engines routed by Brain's Hebbian learning.
-- Your execution results feed back to Brain as reward signals for routing improvement."""
+- Spaces are domain-specific execution engines routed by Brain''s Hebbian learning.
+- Your execution results feed back to Brain as reward signals for routing improvement.'''
 
 [resources]
 max_llm_tokens_per_hour = 200000
@@ -49,5 +52,6 @@ servers = [
   "qdrant",
   "fetch",
   "brain",
-  "issue-detector"
+  "issue-detector",
+  "memory-search"
 ]
