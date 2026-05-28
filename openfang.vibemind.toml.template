@@ -1,0 +1,420 @@
+# OpenFang — VibeMind Integration Config
+# Merged with ~/.openfang/config.toml at startup.
+#
+# This config enables:
+# - Brain (Tahlamus) as MCP server for cognitive state queries
+# - A2A protocol for inter-service task routing
+# - 30+ MCP servers for agent tooling
+
+# API server port (top-level field, NOT under [network])
+api_listen = "127.0.0.1:4200"
+
+# ── Telegram Channel ─────────────────────────────────────────────
+# Enables polling for the @VibeMind_agent_bot bot. Without this block
+# OpenFang starts without a Telegram consumer and incoming messages pile
+# up as pending updates on Telegram's servers.
+[channels.telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+allowed_users = ["1092040975"]
+# Telegram routes to the dedicated `desktop` agent which has an MCP
+# allowlist of only the desktop-automation server (~20 tools, not 368).
+# This avoids the 60s heartbeat timeout caused by 368-tool tool-loops
+# and keeps replies focused on what the user actually wants from the bot.
+default_agent = "desktop"
+
+[default_model]
+provider = "claude-code"
+model = "claude-code/sonnet"
+
+# ── Brain MCP Server ────────────────────────────────────────────
+# Gives agents access to cognitive state via SSE
+[[mcp_servers]]
+name = "brain"
+timeout_secs = 5
+[mcp_servers.transport]
+type = "sse"
+url = "http://localhost:8900"
+
+# ── Self-Healing Loop ────────────────────────────────────────────
+[[mcp_servers]]
+name = "issue-detector"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/issue-detector/mcp_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# SECURITY PoC MCP Servers (vibemind-os/security/)
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "network-monitor"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_network_monitor/mcp_server.py"]
+
+[[mcp_servers]]
+name = "endpoint-hardening"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_endpoint_hardening/mcp_server.py"]
+
+[[mcp_servers]]
+name = "event-log"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_event_log/mcp_server.py"]
+
+[[mcp_servers]]
+name = "firewall"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_firewall/mcp_server.py"]
+
+[[mcp_servers]]
+name = "botnet-detector"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_botnet_detector/mcp_server.py"]
+
+[[mcp_servers]]
+name = "site-verifier"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_site_verifier/mcp_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# SYSTEM PoC MCP Servers (vibemind-os/system/)
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "driver-manager"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/system/poc_driver_manager/mcp_server.py"]
+
+[[mcp_servers]]
+name = "power-manager"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/system/poc_power_manager/mcp_server.py"]
+
+[[mcp_servers]]
+name = "display-audio"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/system/poc_display_audio/mcp_server.py"]
+
+[[mcp_servers]]
+name = "process-manager"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/system/poc_process_manager/mcp_server.py"]
+
+[[mcp_servers]]
+name = "registry"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/system/poc_registry/mcp_server.py"]
+
+[[mcp_servers]]
+name = "scheduled-tasks"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/system/poc_scheduled_tasks/mcp_server.py"]
+
+[[mcp_servers]]
+name = "update-manager"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/system/poc_update_manager/mcp_server.py"]
+
+[[mcp_servers]]
+name = "env-manager"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/system/poc_env_manager/mcp_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# DEVOPS PoC MCP Servers (vibemind-os/devops/)
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "backup-sync"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/devops/poc_backup_sync/mcp_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# BUSINESS PoC MCP Servers (vibemind-os/business/)
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "pitch-deck"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/business/poc_pitch_deck/mcp_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Web & Research MCP Servers (npm/npx)
+# ═══════════════════════════════════════════════════════════════════
+
+# Tavily — web search, extraction, crawling
+[[mcp_servers]]
+name = "tavily"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "tavily-mcp"
+args = []
+# NOTE: Requires TAVILY_API_KEY env var
+
+# Brave Search — privacy-focused web search
+# NOTE: Requires BRAVE_API_KEY env var. Disabled until key is set.
+# [[mcp_servers]]
+# name = "brave-search"
+# timeout_secs = 15
+# [mcp_servers.transport]
+# type = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-brave-search"]
+
+# Context7 — up-to-date library documentation
+[[mcp_servers]]
+name = "context7"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@upstash/context7-mcp@latest"]
+
+# Playwright — browser automation for SPAs, forms
+[[mcp_servers]]
+name = "playwright"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Code & Development MCP Servers
+# ═══════════════════════════════════════════════════════════════════
+
+# Filesystem — sandboxed file operations
+[[mcp_servers]]
+name = "filesystem"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "${VIBEMIND_ROOT}"]
+
+# GitHub — PRs, issues, collaboration
+# NOTE: Requires GITHUB_PERSONAL_ACCESS_TOKEN env var. Disabled until key is set.
+# [[mcp_servers]]
+# name = "github"
+# timeout_secs = 30
+# [mcp_servers.transport]
+# type = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-github"]
+
+# ═══════════════════════════════════════════════════════════════════
+# uvx-installed MCP Servers (full path to .exe)
+# ═══════════════════════════════════════════════════════════════════
+
+# Fetch — lightweight HTTP requests
+[[mcp_servers]]
+name = "fetch"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/mcp-server-fetch.exe"
+args = []
+
+# Git — version control operations
+[[mcp_servers]]
+name = "git"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/mcp-server-git.exe"
+args = ["--repository", "${VIBEMIND_ROOT}/vibemind-os"]
+
+# Docker — container management
+[[mcp_servers]]
+name = "docker"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/docker-mcp.exe"
+args = []
+
+# Time — scheduling, timezone conversions
+[[mcp_servers]]
+name = "time"
+timeout_secs = 5
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/mcp-server-time.exe"
+args = []
+
+# Qdrant — vector search
+[[mcp_servers]]
+name = "qdrant"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/mcp-server-qdrant.exe"
+args = []
+env = { QDRANT_URL = "http://localhost:6340" }
+
+# ═══════════════════════════════════════════════════════════════════
+# Memory & Productivity MCP Servers (npm)
+# ═══════════════════════════════════════════════════════════════════
+
+# Memory — knowledge graph with entities and relations
+[[mcp_servers]]
+name = "memory"
+timeout_secs = 15
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+
+# Redis — event bus monitoring, locks, cache
+[[mcp_servers]]
+name = "redis"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-redis", "redis://localhost:6379"]
+
+# Postgres — SQL queries, schema inspection
+# NOTE: Requires POSTGRES_CONNECTION_STRING env var. Disabled until set.
+# [[mcp_servers]]
+# name = "postgres"
+# timeout_secs = 15
+# [mcp_servers.transport]
+# type = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-postgres"]
+
+# Task manager — persistent task tracking
+[[mcp_servers]]
+name = "taskmanager"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@kazuph/mcp-taskmanager"]
+
+# ═══════════════════════════════════════════════════════════════════
+# VibeMind Database MCP (Supabase PostgREST)
+# ═══════════════════════════════════════════════════════════════════
+
+# Full CRUD for all 22 VibeMind tables via Supabase PostgREST
+[[mcp_servers]]
+name = "vibemind-db"
+timeout_secs = 10
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/voice/python/vibemind_db_mcp.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Desktop Automation (handoff multi-agent system)
+# ═══════════════════════════════════════════════════════════════════
+# Exposes the eyeTerm/handoff toolset (handoff_action, handoff_describe_screen,
+# handoff_excel_*, etc.) to any agent that connects to OpenFang. Replaces the
+# previous per-agent stdio entry (e.g. OpenClaw's acpx config) so all
+# consumers — OpenClaw ACP sessions, coding-engine, brain — share one
+# warm process instead of paying the SentenceTransformer/Torch cold-start
+# 10–30 s per agent.
+[[mcp_servers]]
+name = "desktop-automation"
+# 300s so handoff_approval_request can block up to ~240s, plus headroom
+# for slow gpt-5.5 coordinator iterations on big tool-loops. Bumped
+# 180->300 (2026-05-08) — smart-skill loops were aborting with
+# "MCP-Tool-Timeout" because the 180s ceiling was too tight.
+timeout_secs = 300
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_handoff.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 11.A — Spaces MCP Servers
+# Bubble + Idea tools as MCP for brain-bubbles and brain-ideas agents.
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "spaces-ideas"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/ideas/mcp_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 11.B — Multiverse Navigation (Smart 3-layer resolver)
+# Maps natural-language queries to one of 14 spaces and broadcasts
+# navigation events to the Electron UI. Layers: alias → Qwen3 embedding
+# → LLM tiebreaker.
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "space-navigator"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/_navigator/mcp_server.py"]
+env = { OPENROUTER_API_KEY = "${OPENROUTER_API_KEY}", NAVIGATOR_LLM_MODEL = "openai/gpt-4o-mini", NAVIGATOR_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B" }
+
+# ═══════════════════════════════════════════════════════════════════
+# A2A Protocol
+# ═══════════════════════════════════════════════════════════════════
+
+[a2a]
+enabled = true
+listen_path = "/a2a"
+
+[[a2a.external_agents]]
+name = "brain-bridge"
+url = "http://localhost:5100"

@@ -17,6 +17,12 @@ logs/
 # The template (agent.toml.tmpl) is the source of truth.
 agents/brain-coder/agent.toml
 
+# Generated from openfang.vibemind.toml.template by
+# scripts/render_openfang_config.py — contains machine-specific absolute
+# paths (VIBEMIND_ROOT, HOME substituted). The .template is the source of
+# truth; the rendered .toml must NOT be committed.
+openfang.vibemind.toml
+
 # Database
 *.db
 *.db-shm
