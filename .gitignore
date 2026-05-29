@@ -61,8 +61,15 @@ Thumbs.db
 *~
 .serena/
 
-# === Windows cmd typo artifact ===
+# === Windows cmd typo artifacts ===
+# Scripts that ran `echo %ENVVAR%\path` in PowerShell instead of `$env:ENVVAR\path`
+# end up creating literal folders with the unexpanded variable name.
 %ProgramData%/
+%SystemDrive%/
+%LOCALAPPDATA%/
+%APPDATA%/
+%USERPROFILE%/
+%TEMP%/
 
 # === MCP / runtime caches ===
 .playwright-mcp/
