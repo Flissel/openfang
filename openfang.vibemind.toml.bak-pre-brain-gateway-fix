@@ -9,21 +9,6 @@
 # API server port (top-level field, NOT under [network])
 api_listen = "127.0.0.1:4200"
 
-# ── Heartbeat ───────────────────────────────────────────────────
-# 2026-05-29: raised from default 60s. brain-gateway routes Telegram
-# messages through Brain multihop_execute + visible browser
-# (openclaw-visible), which can legitimately take 30-300s. At 60s the
-# kernel marked agents "Crashed" mid-request — Brain.multihop_execute
-# returned response: "" because openclaw-visible was killed at the
-# 60s heartbeat *during* its Chrome-navigation call (~50s).
-# 360s > the claude_code driver's 300s subprocess timeout, so the
-# driver's own kill is the real ceiling. Without this block the
-# openclaw gateway over Telegram bot does not work.
-# Rollback: remove this block (default 60s, but agents will spuriously
-# crash on every long-running browser task).
-[heartbeat]
-default_timeout_secs = 360
-
 # ── Telegram Channel ─────────────────────────────────────────────
 # Enables polling for the @VibeMind_agent_bot bot. Without this block
 # OpenFang starts without a Telegram consumer and incoming messages pile
@@ -31,21 +16,11 @@ default_timeout_secs = 360
 [channels.telegram]
 bot_token_env = "TELEGRAM_BOT_TOKEN"
 allowed_users = ["1092040975"]
-# 2026-05-29: routed to brain-gateway so every Telegram message flows
-# through Brain's /api/multihop/execute capability pipeline
-# (browser_automation -> openclaw-visible, coding_task -> openclaude-coder,
-# desktop_skill -> ...). brain-gateway is a deterministic bridge agent
-# whose model.base_url points at scripts/openfang_brain_gateway_wrapper.cmd
-# — no intermediate LLM decision, no 368-tool tool-loop.
-#
-# Previous: default_agent = "desktop" (see .bak-pre-brain-gateway-fix).
-# That bypassed Brain capability routing — openclaw browser tasks did not
-# reach openclaw-visible.
-#
-# Note: ~/.openfang/config.toml already had default_agent = "brain-gateway"
-# but this file (--config openfang.vibemind.toml) takes precedence and
-# was still overriding it back to "desktop". Both now agree.
-default_agent = "brain-gateway"
+# Telegram routes to the dedicated `desktop` agent which has an MCP
+# allowlist of only the desktop-automation server (~20 tools, not 368).
+# This avoids the 60s heartbeat timeout caused by 368-tool tool-loops
+# and keeps replies focused on what the user actually wants from the bot.
+default_agent = "desktop"
 
 [default_model]
 provider = "claude-code"
@@ -391,77 +366,17 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_
 # consumers — OpenClaw ACP sessions, coding-engine, brain — share one
 # warm process instead of paying the SentenceTransformer/Torch cold-start
 # 10–30 s per agent.
-# DECOMMISSIONED 2026-06-02 — superseded by the 4-way split below
-# (data/document/perception/messenger). No agent references "desktop" anymore
-# (skill-coordinator, desktop, openclaude-coder all migrated). Kept commented
-# for trivial rollback: uncomment this block + revert the three agents'
-# mcp_servers to ["desktop"] + restart. See plans/pure-wishing-starlight.md.
-# [[mcp_servers]]
-# name = "desktop-automation"
-# timeout_secs = 300
-# [mcp_servers.transport]
-# type = "stdio"
-# command = "python"
-# args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_handoff.py"]
-
-# ═══════════════════════════════════════════════════════════════════
-# 4-way split of desktop-automation (2026-06-02) — see
-# plans/pure-wishing-starlight.md. Each is a thin entrypoint over the
-# shared mcp_server_handoff library (no logic duplicated). desktop-automation
-# is kept above for parallel run during transition. Plain names → clean LLM
-# tool prefixes mcp_data_* / mcp_document_* / mcp_perception_* / mcp_messenger_*.
-# ═══════════════════════════════════════════════════════════════════
-
-# Knowledge / data-interpretation: rowboat_*, roarboot_*, file_evaluate.
 [[mcp_servers]]
-name = "data"
-timeout_secs = 120
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_data.py"]
-
-# Deterministic data->file with dynamic in-tool approval: xlsx/docx/csv create,
-# verify, paste, maximize. 300s so the internal approval poll can block.
-[[mcp_servers]]
-name = "document"
+name = "desktop-automation"
+# 300s so handoff_approval_request can block up to ~240s, plus headroom
+# for slow gpt-5.5 coordinator iterations on big tool-loops. Bumped
+# 180->300 (2026-05-08) — smart-skill loops were aborting with
+# "MCP-Tool-Timeout" because the 180s ceiling was too tight.
 timeout_secs = 300
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_document.py"]
-
-# Perception / desktop automation: handoff_*, vision_analyze, app_*, skill_*,
-# claude_cli_*. The only split with the heavy lazy singletons + DPI awareness.
-[[mcp_servers]]
-name = "perception"
-timeout_secs = 300
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_perception.py"]
-
-# Channels + human-in-the-loop: clawdbot_*, send_to_channel, clarify/approval.
-# 300s so handoff_approval_request can block up to ~240s.
-[[mcp_servers]]
-name = "messenger"
-timeout_secs = 300
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_messenger.py"]
-
-# rowboat-ui (2026-06-08) — talk to the Rowboat chat inside the VibeMind
-# Multiverse Electron app via CDP :9223 (rowboat_chat_send / rowboat_chat_read).
-# Needs websocket-client → explicit repo .venv python (PATH python may lack it).
-# Requires the Multiverse app open on the Rowboat space at runtime.
-[[mcp_servers]]
-name = "rowboat-ui"
-timeout_secs = 90
-[mcp_servers.transport]
-type = "stdio"
-command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_server_rowboat_ui.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_handoff.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # Phase 11.A — Spaces MCP Servers

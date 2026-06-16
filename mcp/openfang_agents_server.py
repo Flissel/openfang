@@ -30,6 +30,15 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+# Agent lifecycle hooks (pre/post around spawn). Optional — degrade gracefully
+# if the module is missing so the core CRUD surface always works.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from agent_hooks import extract_hooks, run_hook
+    _HAS_HOOKS = True
+except ImportError:  # pragma: no cover
+    _HAS_HOOKS = False
+
 # ── config ───────────────────────────────────────────────────────────────────
 
 DEFAULT_URL = "http://127.0.0.1:4200"
@@ -104,6 +113,79 @@ def _http(method: str, path: str, json_body: dict | None = None) -> list[TextCon
         return _ok(resp.text)
 
 
+def _hook_env(template: str | None, manifest_toml: str | None) -> dict:
+    """Environment exposed to hook commands."""
+    env = {}
+    name = (template or "").strip()
+    if not name and manifest_toml:
+        # cheap name sniff so $AGENT_NAME works for raw-TOML spawns too
+        for line in manifest_toml.splitlines():
+            s = line.strip()
+            if s.startswith("name") and "=" in s:
+                env["AGENT_NAME"] = s.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    elif name:
+        env["AGENT_NAME"] = name
+    url, _ = _cfg()
+    env["OPENFANG_URL"] = url
+    return env
+
+
+def _template_manifest_toml(template: str) -> str:
+    """Best-effort read of ~/.openfang/agents/{template}/agent.toml for hooks.
+
+    Returns "" if not found — hooks simply won't fire, spawn still proceeds.
+    """
+    path = os.path.join(
+        os.path.expanduser("~"), ".openfang", "agents", template, "agent.toml"
+    )
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _spawn_with_hooks(spawn_body: dict, manifest_toml: str, template: str | None):
+    """Run pre-hook → spawn → post-hook. pre non-zero blocks the spawn.
+
+    Hook output is folded into the MCP response so the caller can see it.
+    If hooks are unavailable, this is a plain spawn.
+    """
+    if not _HAS_HOOKS:
+        return _http("POST", "/api/agents", spawn_body)
+
+    hooks = extract_hooks(manifest_toml or "")
+    env = _hook_env(template, manifest_toml)
+    notes: list[str] = []
+
+    if hooks["pre"]:
+        pre = run_hook(hooks["pre"], env=env)
+        if pre.exit_code != 0:
+            detail = pre.output.strip()[:500]
+            reason = "timed out" if pre.timed_out else f"exit {pre.exit_code}"
+            return _err(
+                f"pre-hook {reason} — spawn aborted. hook output: {detail or '(none)'}"
+            )
+        notes.append(f"pre-hook ok: {pre.output.strip()[:200]}")
+
+    spawned = _http("POST", "/api/agents", spawn_body)
+
+    # Detect spawn failure (the _http error convention) and skip post-hook.
+    spawn_text = spawned[0].text if spawned else ""
+    if spawn_text.startswith("error:"):
+        return spawned
+
+    if hooks["post"]:
+        post = run_hook(hooks["post"], env=env)
+        status = "ok" if post.exit_code == 0 else f"exit {post.exit_code}"
+        notes.append(f"post-hook {status}: {post.output.strip()[:200]}")
+
+    if notes:
+        return [TextContent(type="text", text=spawn_text + "\n\n" + "\n".join(notes))]
+    return spawned
+
+
 # ── tool registry ────────────────────────────────────────────────────────────
 
 @server.list_tools()
@@ -169,7 +251,11 @@ async def list_tools() -> list[Tool]:
                 "(when you need custom config not covered by a template). The "
                 "manifest_toml must include at minimum [agent] name, [model] "
                 "provider+model, and is parsed as openfang_types::AgentManifest. "
-                "Prefer spawn_from_template + patch unless you know the schema."
+                "Prefer spawn_from_template + patch unless you know the schema. "
+                "Optional [hooks] block: pre = \"<shell>\" runs before spawn "
+                "(non-zero exit aborts the spawn), post = \"<shell>\" runs after "
+                "a successful spawn. $AGENT_NAME and $OPENFANG_URL are exported "
+                "to the hook environment."
             ),
             inputSchema={
                 "type": "object",
@@ -295,13 +381,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         template = (args.get("template") or "").strip()
         if not template:
             return _err("template is required (e.g. 'brain-coder')")
-        return _http("POST", "/api/agents", {"template": template})
+        manifest_toml = _template_manifest_toml(template) if _HAS_HOOKS else ""
+        return _spawn_with_hooks({"template": template}, manifest_toml, template)
 
     if name == "openfang_agent_spawn_from_toml":
         manifest_toml = args.get("manifest_toml") or ""
         if not manifest_toml.strip():
             return _err("manifest_toml is required (full agent manifest as TOML string)")
-        return _http("POST", "/api/agents", {"manifest_toml": manifest_toml})
+        return _spawn_with_hooks({"manifest_toml": manifest_toml}, manifest_toml, None)
 
     if name == "openfang_agent_patch":
         agent_id = (args.get("agent_id") or "").strip()
