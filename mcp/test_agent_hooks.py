@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from agent_hooks import HookResult, extract_hooks, run_hook  # noqa: E402
+from agent_hooks import HookResult, _safe_hook_env, extract_hooks, run_hook  # noqa: E402
 
 
 # ─── extract_hooks ─────────────────────────────────────────────────────────
@@ -90,3 +90,36 @@ def test_run_hook_empty_command_is_noop():
     res = run_hook("", env={}, timeout=10)
     assert res.exit_code == 0
     assert res.skipped is True
+
+
+# ─── _safe_hook_env (loader-hijack defense) ────────────────────────────────
+
+def test_safe_hook_env_passes_normal_vars():
+    out = _safe_hook_env({"AGENT_NAME": "x", "OPENFANG_URL": "http://127.0.0.1:4200"})
+    assert out == {"AGENT_NAME": "x", "OPENFANG_URL": "http://127.0.0.1:4200"}
+
+
+@pytest.mark.parametrize("key", [
+    "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONPATH", "PYTHONSTARTUP",
+    "NODE_OPTIONS", "BASH_ENV", "PATH", "IFS", "GIT_SSH_COMMAND",
+])
+def test_safe_hook_env_blocks_loader_vars(key):
+    out = _safe_hook_env({key: "/evil", "AGENT_NAME": "ok"})
+    assert key not in out
+    assert out == {"AGENT_NAME": "ok"}
+
+
+def test_safe_hook_env_blocking_is_case_insensitive():
+    out = _safe_hook_env({"ld_preload": "/evil", "Path": "/evil"})
+    assert out == {}
+
+
+def test_run_hook_cannot_override_path(tmp_path):
+    # A hook env that tries to hijack PATH must not affect the spawned shell:
+    # python (resolved via the real PATH) still runs and reports the REAL,
+    # non-hijacked PATH back.
+    marker = tmp_path / "p.txt"
+    cmd = f"python -c \"open(r'{marker}','w').write(__import__('os').environ.get('PATH',''))\""
+    res = run_hook(cmd, env={"PATH": "/totally/bogus"}, timeout=10)
+    assert res.exit_code == 0
+    assert marker.read_text() != "/totally/bogus"

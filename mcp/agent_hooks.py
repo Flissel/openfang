@@ -33,6 +33,34 @@ from typing import Dict, Optional
 
 DEFAULT_HOOK_TIMEOUT_S = 30
 
+# Env vars that change how the dynamic loader / interpreters bootstrap and are a
+# classic privilege-escalation / code-injection vector. A hook's [hooks] env
+# block may NOT override these — even though hooks come from local trusted TOML,
+# this is cheap defense-in-depth: it means a hook env can never silently inject
+# LD_PRELOAD / NODE_OPTIONS / BASH_ENV etc. into the spawned shell or its
+# children. PATH is included so a hook cannot redirect bare command lookups.
+_BLOCKED_ENV_KEYS = frozenset({"PATH", "IFS", "ENV", "BASH_ENV"})
+_BLOCKED_ENV_PREFIXES = (
+    "LD_", "DYLD_", "PYTHON", "NODE_OPTIONS", "NODE_PATH", "RUBYOPT",
+    "PERL5OPT", "GCONV_PATH", "GIT_SSH", "GIT_EXTERNAL_DIFF",
+)
+
+
+def _safe_hook_env(env: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Filter a hook-supplied env mapping, dropping loader-hijack keys.
+
+    Blocked keys are skipped silently (logged once) rather than raising — a hook
+    that tries to set PATH/LD_PRELOAD just doesn't get it; the spawn proceeds.
+    """
+    safe: Dict[str, str] = {}
+    for k, v in (env or {}).items():
+        ku = k.upper()
+        if ku in _BLOCKED_ENV_KEYS or any(ku.startswith(p) for p in _BLOCKED_ENV_PREFIXES):
+            _log(f"refused to set loader-sensitive hook env var: {k}")
+            continue
+        safe[k] = str(v)
+    return safe
+
 
 @dataclass
 class HookResult:
@@ -81,13 +109,20 @@ def run_hook(
 
     import os
 
+    # Trust boundary: `command` comes from a local agent.toml that the operator
+    # placed in ~/.openfang/agents/ — same trust level as the manifest the
+    # kernel already executes. Hooks are DESIGNED to run shell syntax (pipes,
+    # $VAR expansion — see module docstring), so shell=True is intentional, not
+    # an oversight. Do NOT pass attacker-controlled TOML to the spawn tools.
+    # We still filter the hook-supplied env (loader-hijack defense, see above);
+    # the inherited process env is trusted as-is.
     merged_env = dict(os.environ)
-    merged_env.update({k: str(v) for k, v in (env or {}).items()})
+    merged_env.update(_safe_hook_env(env))
 
     try:
         proc = subprocess.run(
             command,
-            shell=True,
+            shell=True,  # noqa: S602 — intentional; see trust-boundary note above
             env=merged_env,
             capture_output=True,
             text=True,
