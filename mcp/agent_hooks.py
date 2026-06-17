@@ -10,8 +10,17 @@ run the shell commands around the spawn HTTP call — no Rust rebuild needed.
 Manifest addition (optional, additive, ignored by the kernel):
 
     [hooks]
-    pre  = "echo spawning $AGENT_NAME"        # runs BEFORE spawn; non-zero blocks
-    post = "python scripts/notify.py up"      # runs AFTER successful spawn
+    pre  = "python scripts/notify.py up"      # runs BEFORE spawn; non-zero blocks
+    post = "python scripts/notify.py done"    # runs AFTER successful spawn
+
+The hook env (AGENT_NAME, OPENFANG_URL) is always set in the child process, so
+reading it from inside an interpreter (os.environ / process.env) works on every
+platform. SHELL variable expansion in the command string itself is platform-
+specific because the command runs via the OS shell: use ``$AGENT_NAME`` on
+POSIX (bash/sh) and ``%AGENT_NAME%`` on Windows (cmd.exe). A ``$AGENT_NAME``
+literal will NOT expand under cmd.exe (verified live 2026-06-17). Prefer a
+script that reads the env var over relying on shell expansion if hooks must be
+cross-platform.
 
 Scope / honesty: these fire only when an agent is spawned via the MCP tools
 (openfang_agent_spawn_from_template / _from_toml). Agents loaded directly by the
