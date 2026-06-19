@@ -24,6 +24,16 @@ api_listen = "127.0.0.1:4200"
 [heartbeat]
 default_timeout_secs = 360
 
+# ── Approval Policy ──────────────────────────────────────────────
+# 2026-06-17: VibeMind Marketing approval-gate needs 5min click-window
+# for human review. OpenFang's MAX_TIMEOUT_SECS is hard-capped at 300 in
+# crates/openfang-types/src/approval.rs — this is the max allowed value.
+# Default was 60 → operator couldn't reach the UI in time.
+# Used by: POST /api/approvals (marketing curator + bridge), shell_exec
+# Without this block, broadcast/reply approvals expire after 60s.
+[approval]
+timeout_secs = 300
+
 # ── Telegram Channel ─────────────────────────────────────────────
 # Enables polling for the @VibeMind_agent_bot bot. Without this block
 # OpenFang starts without a Telegram consumer and incoming messages pile
