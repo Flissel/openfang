@@ -9,9 +9,10 @@ tags = ["self-healing", "vibemind", "routing", "capability-gap"]
 # Cloud LLM (no GPU) — a self-healing gap-filer must not depend on local ollama/CUDA
 # ("unable to allocate CUDA0 buffer"). Groq: key present in ~/.openfang/secrets.env,
 # tool-capable + fast. (OpenFang lacks OPENROUTER_API_KEY, so not openrouter.)
-provider = "groq"
-model = "llama-3.1-8b-instant"
-api_key_env = "GROQ_API_KEY"
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
 max_tokens = 4096
 temperature = 0.2
 # NB: scope tools to issue-detector via `PUT /api/agents/{id}/tools` (allowlist
