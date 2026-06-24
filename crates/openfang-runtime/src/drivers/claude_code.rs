@@ -224,6 +224,11 @@ struct ClaudeMessageBlock {
     block_type: String,
     #[serde(default)]
     text: String,
+    /// For `type=tool_use` blocks: the tool/skill name the model invoked on its
+    /// own. Empty for text blocks. Used for observability logging so we can see
+    /// which skills/commands Claude picks up without explicit specification.
+    #[serde(default)]
+    name: String,
 }
 
 /// Nested `message` object carried by `type=assistant` stream-json events.
@@ -317,11 +322,17 @@ impl LlmDriver for ClaudeCodeDriver {
         // argv. Windows enforces a ~8191 char command-line limit; voice/agent
         // prompts with conversation history blow past it easily. Stdin has no
         // such cap and works identically on all platforms.
+        // stream-json (not plain `json`) so the per-event tool_use blocks are
+        // visible — the flat `json` output only carries the final summarised
+        // text, which hid whether the model invoked any skills/tools. We still
+        // return only the final text (behaviour preserved); the tool_use blocks
+        // are logged for observability. --verbose is required by stream-json.
         cmd.arg("-p")
             .arg("--input-format")
             .arg("text")
             .arg("--output-format")
-            .arg("json");
+            .arg("stream-json")
+            .arg("--verbose");
 
         // System prompt is routed through a tempfile (`--system-prompt-file`)
         // so it doesn't compete with the user prompt for argv length. Tool
@@ -492,30 +503,73 @@ impl LlmDriver for ClaudeCodeDriver {
 
         let stdout = String::from_utf8_lossy(&stdout_bytes);
 
-        // Try JSON parse first
-        if let Ok(parsed) = serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
-            let text = parsed
-                .result
-                .or(parsed.content)
-                .or(parsed.text)
-                .unwrap_or_default();
-            let usage = parsed.usage.unwrap_or_default();
-            return Ok(CompletionResponse {
-                content: vec![ContentBlock::Text {
-                    text: text.clone(),
-                    provider_metadata: None,
-                }],
-                stop_reason: StopReason::EndTurn,
-                tool_calls: Vec::new(),
-                usage: TokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                },
-            });
+        // Parse the stream-json output line by line. We accumulate the final
+        // text (assistant text blocks + the `result` event) AND — for
+        // OBSERVABILITY — collect every tool_use block's name, so we can see
+        // which skills/tools the model invoked on its own. The old flat `json`
+        // output discarded this entirely (tool usage was invisible; that's why
+        // usage_events.tool_calls was always 0). Final-text behaviour preserved;
+        // a fallback handles any non-stream-json output (legacy CLI / fork).
+        let mut text = String::new();
+        let mut usage = ClaudeUsage::default();
+        let mut tool_uses: Vec<String> = Vec::new();
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<ClaudeStreamEvent>(line) {
+                if let Some(msg) = event.message.as_ref() {
+                    for block in &msg.content {
+                        match block.block_type.as_str() {
+                            "text" => text.push_str(&block.text),
+                            "tool_use" if !block.name.is_empty() => {
+                                tool_uses.push(block.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(ref result) = event.result {
+                    if text.is_empty() {
+                        text = result.clone();
+                    }
+                }
+                if let Some(u) = event.usage {
+                    usage = u;
+                }
+            }
         }
 
-        // Fallback: treat entire stdout as plain text
-        let text = stdout.trim().to_string();
+        if tool_uses.is_empty() {
+            info!(model = %pid_label, "Claude Code CLI invoked no tools/skills");
+        } else {
+            info!(
+                model = %pid_label,
+                count = tool_uses.len(),
+                tools = %tool_uses.join(","),
+                "Claude Code CLI invoked tools/skills"
+            );
+        }
+
+        // Fallback: output wasn't line-delimited stream-json (legacy single
+        // json object, or plain text). Preserves the previous behaviour exactly.
+        if text.is_empty() {
+            if let Ok(parsed) = serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
+                text = parsed
+                    .result
+                    .or(parsed.content)
+                    .or(parsed.text)
+                    .unwrap_or_default();
+                if let Some(u) = parsed.usage {
+                    usage = u;
+                }
+            }
+            if text.is_empty() {
+                text = stdout.trim().to_string();
+            }
+        }
+
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
                 text,
@@ -524,8 +578,8 @@ impl LlmDriver for ClaudeCodeDriver {
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
             usage: TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
             },
         })
     }
