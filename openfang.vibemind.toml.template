@@ -188,11 +188,101 @@ type = "stdio"
 command = "python"
 args = ["${VIBEMIND_ROOT}/vibemind-os/business/poc_pitch_deck/mcp_server.py"]
 
-# ═══════════════════════════════════════════════════════════════════
-# Web & Research MCP Servers (npm/npx)
-# ═══════════════════════════════════════════════════════════════════
+# ====================================================================
+# Generic Tool MCP Servers - GENERATED from servers.json (host invocations)
+# by tools/mcp_sync. Edit servers.json then: python tools/mcp_sync/mcp_sync.py --write
+# ====================================================================
 
-# Tavily — web search, extraction, crawling
+# >>> generated:tools (mcp_sync.py — do not edit by hand)
+[[mcp_servers]]
+name = "playwright"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@playwright/mcp@latest"]
+
+[[mcp_servers]]
+name = "docker"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/docker-mcp.exe"
+args = []
+
+[[mcp_servers]]
+name = "context7"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@upstash/context7-mcp@latest"]
+
+[[mcp_servers]]
+name = "redis"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-redis", "redis://localhost:6379"]
+
+[[mcp_servers]]
+name = "time"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/mcp-server-time.exe"
+args = []
+
+[[mcp_servers]]
+name = "taskmanager"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@kazuph/mcp-taskmanager"]
+
+[[mcp_servers]]
+name = "memory"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+
+[[mcp_servers]]
+name = "filesystem"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "${VIBEMIND_ROOT}"]
+
+[[mcp_servers]]
+name = "fetch"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/mcp-server-fetch.exe"
+args = []
+
+[[mcp_servers]]
+name = "git"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/mcp-server-git.exe"
+args = ["--repository", "${VIBEMIND_ROOT}/vibemind-os"]
+
+[[mcp_servers]]
+name = "qdrant"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "${HOME}/.local/bin/mcp-server-qdrant.exe"
+args = []
+env = { QDRANT_URL = "http://localhost:6340" }
+
 [[mcp_servers]]
 name = "tavily"
 timeout_secs = 30
@@ -200,149 +290,7 @@ timeout_secs = 30
 type = "stdio"
 command = "tavily-mcp"
 args = []
-# NOTE: Requires TAVILY_API_KEY env var
-
-# Brave Search — privacy-focused web search
-# NOTE: Requires BRAVE_API_KEY env var. Disabled until key is set.
-# [[mcp_servers]]
-# name = "brave-search"
-# timeout_secs = 15
-# [mcp_servers.transport]
-# type = "stdio"
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-brave-search"]
-
-# Context7 — up-to-date library documentation
-[[mcp_servers]]
-name = "context7"
-timeout_secs = 15
-[mcp_servers.transport]
-type = "stdio"
-command = "npx"
-args = ["-y", "@upstash/context7-mcp@latest"]
-
-# Playwright — browser automation for SPAs, forms
-[[mcp_servers]]
-name = "playwright"
-timeout_secs = 60
-[mcp_servers.transport]
-type = "stdio"
-command = "npx"
-args = ["-y", "@playwright/mcp@latest"]
-
-# ═══════════════════════════════════════════════════════════════════
-# Code & Development MCP Servers
-# ═══════════════════════════════════════════════════════════════════
-
-# Filesystem — sandboxed file operations
-[[mcp_servers]]
-name = "filesystem"
-timeout_secs = 10
-[mcp_servers.transport]
-type = "stdio"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "${VIBEMIND_ROOT}"]
-
-# GitHub — PRs, issues, collaboration
-# NOTE: Requires GITHUB_PERSONAL_ACCESS_TOKEN env var. Disabled until key is set.
-# [[mcp_servers]]
-# name = "github"
-# timeout_secs = 30
-# [mcp_servers.transport]
-# type = "stdio"
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-github"]
-
-# ═══════════════════════════════════════════════════════════════════
-# uvx-installed MCP Servers (full path to .exe)
-# ═══════════════════════════════════════════════════════════════════
-
-# Fetch — lightweight HTTP requests
-[[mcp_servers]]
-name = "fetch"
-timeout_secs = 15
-[mcp_servers.transport]
-type = "stdio"
-command = "${HOME}/.local/bin/mcp-server-fetch.exe"
-args = []
-
-# Git — version control operations
-[[mcp_servers]]
-name = "git"
-timeout_secs = 15
-[mcp_servers.transport]
-type = "stdio"
-command = "${HOME}/.local/bin/mcp-server-git.exe"
-args = ["--repository", "${VIBEMIND_ROOT}/vibemind-os"]
-
-# Docker — container management
-[[mcp_servers]]
-name = "docker"
-timeout_secs = 30
-[mcp_servers.transport]
-type = "stdio"
-command = "${HOME}/.local/bin/docker-mcp.exe"
-args = []
-
-# Time — scheduling, timezone conversions
-[[mcp_servers]]
-name = "time"
-timeout_secs = 5
-[mcp_servers.transport]
-type = "stdio"
-command = "${HOME}/.local/bin/mcp-server-time.exe"
-args = []
-
-# Qdrant — vector search
-[[mcp_servers]]
-name = "qdrant"
-timeout_secs = 15
-[mcp_servers.transport]
-type = "stdio"
-command = "${HOME}/.local/bin/mcp-server-qdrant.exe"
-args = []
-env = { QDRANT_URL = "http://localhost:6340" }
-
-# ═══════════════════════════════════════════════════════════════════
-# Memory & Productivity MCP Servers (npm)
-# ═══════════════════════════════════════════════════════════════════
-
-# Memory — knowledge graph with entities and relations
-[[mcp_servers]]
-name = "memory"
-timeout_secs = 15
-[mcp_servers.transport]
-type = "stdio"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-memory"]
-
-# Redis — event bus monitoring, locks, cache
-[[mcp_servers]]
-name = "redis"
-timeout_secs = 10
-[mcp_servers.transport]
-type = "stdio"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-redis", "redis://localhost:6379"]
-
-# Postgres — SQL queries, schema inspection
-# NOTE: Requires POSTGRES_CONNECTION_STRING env var. Disabled until set.
-# [[mcp_servers]]
-# name = "postgres"
-# timeout_secs = 15
-# [mcp_servers.transport]
-# type = "stdio"
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-postgres"]
-
-# Task manager — persistent task tracking
-[[mcp_servers]]
-name = "taskmanager"
-timeout_secs = 10
-[mcp_servers.transport]
-type = "stdio"
-command = "npx"
-args = ["-y", "@kazuph/mcp-taskmanager"]
+# <<< generated:tools
 
 # ═══════════════════════════════════════════════════════════════════
 # VibeMind Database MCP (Supabase PostgREST)
