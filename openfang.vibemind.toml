@@ -79,16 +79,6 @@ type = "stdio"
 command = "python"
 args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/issue-detector/mcp_server.py"]
 
-# ── Codebase Search (semantic, MCMP-RAG over vibemind-os) ────────
-# Gives coding agents (openclaude-coder) codebase context as a tool.
-[[mcp_servers]]
-name = "la-fungus-search"
-timeout_secs = 120
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/la-fungus-search/mcp_server.py"]
-
 # ═══════════════════════════════════════════════════════════════════
 # SECURITY PoC MCP Servers (vibemind-os/security/)
 # ═══════════════════════════════════════════════════════════════════
@@ -428,15 +418,13 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_
 # 4-way split of desktop-automation (2026-06-02) — see
 # plans/pure-wishing-starlight.md. Each is a thin entrypoint over the
 # shared mcp_server_handoff library (no logic duplicated). desktop-automation
-# is kept above for parallel run during transition. Tool prefixes:
-# mcp_desktop-knowledge_* / mcp_desktop-document_* / mcp_perception_* /
-# mcp_messenger_* (data/document renamed → desktop-knowledge/desktop-document
-# 2026-06-18: the bare single-words were too generic / collision-prone).
+# is kept above for parallel run during transition. Plain names → clean LLM
+# tool prefixes mcp_data_* / mcp_document_* / mcp_perception_* / mcp_messenger_*.
 # ═══════════════════════════════════════════════════════════════════
 
 # Knowledge / data-interpretation: rowboat_*, roarboot_*, file_evaluate.
 [[mcp_servers]]
-name = "desktop-knowledge"
+name = "data"
 timeout_secs = 120
 [mcp_servers.transport]
 type = "stdio"
@@ -446,7 +434,7 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation
 # Deterministic data->file with dynamic in-tool approval: xlsx/docx/csv create,
 # verify, paste, maximize. 300s so the internal approval poll can block.
 [[mcp_servers]]
-name = "desktop-document"
+name = "document"
 timeout_secs = 300
 [mcp_servers.transport]
 type = "stdio"
