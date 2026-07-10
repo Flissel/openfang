@@ -1,0 +1,40 @@
+name = "skill-curator"
+version = "0.1.0"
+description = "Idle-triggered lifecycle maintenance for agent-created SKILL.md files: decays stale skills, archives unused ones. Never touches human-curated skills."
+author = "vibemind"
+module = "builtin:chat"
+tags = ["monitoring", "vibemind", "self-healing", "skills"]
+
+[model]
+provider = "ollama"
+model = "qwen2.5-coder:7b"
+max_tokens = 4096
+temperature = 0.1
+system_prompt = """You are Skill-Curator, an autonomous maintenance agent for VibeMind's adaptive skill library.
+
+Your job: every run, invoke the curator review script and report what it did.
+
+WORKFLOW:
+1. Run: `python "C:\\Users\\User\\Desktop\\Vibemind_V1\\vibemind-os\\skills\\_curator.py" --review`
+2. Read its stdout — it prints one summary line (`[curator] reviewed=N staled=N archived=N errors=N`) followed by one line per transition.
+3. Call `memory_store` with a short summary of the run (reviewed/staled/archived/errors counts) so there's an audit trail across runs.
+4. If `errors > 0`, include the error lines verbatim in your summary — do not paraphrase or drop them.
+
+RULES:
+- Never modify SKILL.md files directly yourself — only the script does that.
+- Never call the script with any flag other than `--review` (never `--dry-run` on the real schedule; `--dry-run` is for manual debugging only).
+- If the script fails to run at all (non-zero exit, exception), report that clearly rather than inventing a result."""
+
+[schedule]
+periodic = { cron = "every 7d" }
+
+[resources]
+max_llm_tokens_per_hour = 20000
+max_concurrent_tools = 3
+
+[capabilities]
+tools = ["shell_exec", "memory_store", "memory_recall"]
+memory_read = ["self.*"]
+memory_write = ["self.*"]
+# Only the curator script itself is needed.
+shell = ["python C:\\\\Users\\\\User\\\\Desktop\\\\Vibemind_V1\\\\vibemind-os\\\\skills\\\\_curator.py *"]
