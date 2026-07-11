@@ -17,6 +17,25 @@ pub fn create_session_token(username: &str, secret: &str, ttl_hours: u64) -> Str
     base64::engine::general_purpose::STANDARD.encode(format!("{payload}:{signature}"))
 }
 
+/// Extract the `openfang_session` cookie value from a `Cookie` header string.
+///
+/// Returns `None` if the header is absent or the cookie is not present.
+/// Used by both the HTTP auth middleware and the WebSocket upgrade handler so
+/// that browser sessions established via `sessionLogin()` are honored on both
+/// surfaces (issue #1085).
+pub fn extract_session_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|c| {
+                c.trim()
+                    .strip_prefix("openfang_session=")
+                    .map(|v| v.to_string())
+            })
+        })
+}
+
 /// Verify a session token. Returns the username if valid and not expired.
 pub fn verify_session_token(token: &str, secret: &str) -> Option<String> {
     use base64::Engine;
@@ -55,20 +74,27 @@ pub fn verify_session_token(token: &str, secret: &str) -> Option<String> {
     }
 }
 
-/// Hash a password with SHA256 for config storage.
+/// Hash a password with Argon2id for config storage.
+///
+/// Returns a PHC-format string (e.g. `$argon2id$v=19$m=19456,t=2,p=1$...`).
 pub fn hash_password(password: &str) -> String {
-    use sha2::Digest;
-    hex::encode(Sha256::digest(password.as_bytes()))
+    use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+    let salt = SaltString::generate(&mut rand::thread_rng());
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("Argon2 hashing should not fail with valid inputs")
+        .to_string()
 }
 
-/// Verify a password against a stored SHA256 hash (constant-time).
+/// Verify a password against a stored Argon2id hash (PHC string format).
 pub fn verify_password(password: &str, stored_hash: &str) -> bool {
-    let computed = hash_password(password);
-    use subtle::ConstantTimeEq;
-    if computed.len() != stored_hash.len() {
+    use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
+    let Ok(parsed) = PasswordHash::new(stored_hash) else {
         return false;
-    }
-    computed.as_bytes().ct_eq(stored_hash.as_bytes()).into()
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -78,8 +104,29 @@ mod tests {
     #[test]
     fn test_hash_and_verify_password() {
         let hash = hash_password("secret123");
+        assert!(
+            hash.starts_with("$argon2id$"),
+            "should produce Argon2id PHC string"
+        );
         assert!(verify_password("secret123", &hash));
         assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn test_hash_produces_unique_salts() {
+        let h1 = hash_password("same");
+        let h2 = hash_password("same");
+        assert_ne!(h1, h2, "each hash should use a unique salt");
+        assert!(verify_password("same", &h1));
+        assert!(verify_password("same", &h2));
+    }
+
+    #[test]
+    fn test_rejects_non_argon2_hash() {
+        // A plain SHA256 hex string should no longer be accepted.
+        use sha2::Digest;
+        let sha256_hash = hex::encode(sha2::Sha256::digest(b"password"));
+        assert!(!verify_password("password", &sha256_hash));
     }
 
     #[test]
@@ -103,7 +150,46 @@ mod tests {
     }
 
     #[test]
-    fn test_password_hash_length_mismatch() {
+    fn test_rejects_garbage_input() {
         assert!(!verify_password("x", "short"));
+        assert!(!verify_password("x", ""));
+    }
+
+    #[test]
+    fn test_verify_malformed_argon2_hash() {
+        // Starts with $argon2 but is not a valid PHC string.
+        assert!(!verify_password("x", "$argon2id$garbage"));
+    }
+
+    #[test]
+    fn test_extract_session_cookie_present() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "cookie",
+            "foo=bar; openfang_session=abc.def.ghi; baz=qux"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(extract_session_cookie(&h).as_deref(), Some("abc.def.ghi"));
+    }
+
+    #[test]
+    fn test_extract_session_cookie_absent() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("cookie", "foo=bar; baz=qux".parse().unwrap());
+        assert_eq!(extract_session_cookie(&h), None);
+    }
+
+    #[test]
+    fn test_extract_session_cookie_no_header() {
+        let h = axum::http::HeaderMap::new();
+        assert_eq!(extract_session_cookie(&h), None);
+    }
+
+    #[test]
+    fn test_extract_session_cookie_only_value() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("cookie", "openfang_session=lonely".parse().unwrap());
+        assert_eq!(extract_session_cookie(&h).as_deref(), Some("lonely"));
     }
 }

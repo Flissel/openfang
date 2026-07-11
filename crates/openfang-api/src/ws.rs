@@ -19,17 +19,19 @@ use axum::response::IntoResponse;
 use dashmap::DashMap;
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
+use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::llm_driver::StreamEvent;
 use openfang_runtime::llm_errors;
 use openfang_types::agent::AgentId;
+use openfang_types::commands::{self, Surfaces};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Per-IP WebSocket connection tracker.
@@ -97,6 +99,62 @@ fn ws_tracker() -> &'static DashMap<IpAddr, AtomicUsize> {
     TRACKER.get_or_init(DashMap::new)
 }
 
+/// Per-agent WebSocket sender entry.
+struct WsSender {
+    sender: Arc<Mutex<SplitSink<WebSocket, Message>>>,
+}
+
+/// Global registry: agent_id → active WebSocket senders.
+/// Uses RwLock for fine-grained read/write access to the sender list.
+fn ws_agent_connections() -> &'static DashMap<AgentId, RwLock<Vec<WsSender>>> {
+    static REGISTRY: std::sync::OnceLock<DashMap<AgentId, RwLock<Vec<WsSender>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(DashMap::new)
+}
+
+/// Register a WebSocket connection for an agent (async).
+pub async fn register_ws_connection(
+    agent_id: AgentId,
+    sender: Arc<Mutex<SplitSink<WebSocket, Message>>>,
+) {
+    let entry = ws_agent_connections().entry(agent_id).or_default();
+    let mut senders = entry.value().write().await;
+    senders.push(WsSender { sender });
+}
+
+/// Deregister a WebSocket connection for an agent.
+/// Returns the number of remaining connections for this agent.
+pub async fn deregister_ws_connection(
+    agent_id: AgentId,
+    sender: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
+) -> usize {
+    let entry = match ws_agent_connections().get(&agent_id) {
+        Some(e) => e,
+        None => return 0,
+    };
+    let mut senders = entry.value().write().await;
+    senders.retain(|s| !Arc::ptr_eq(&s.sender, sender));
+    senders.len()
+}
+
+/// Broadcast a JSON message to all active WebSocket connections for an agent.
+/// Returns the number of connections the message was sent to.
+pub async fn broadcast_to_ws(agent_id: AgentId, msg: serde_json::Value) -> usize {
+    let entry = match ws_agent_connections().get(&agent_id) {
+        Some(e) => e,
+        None => return 0,
+    };
+    let senders = entry.value().read().await;
+    let mut success_count = 0;
+    for ws_sender in senders.iter() {
+        let sender = &ws_sender.sender;
+        if send_json(sender, &msg).await.is_ok() {
+            success_count += 1;
+        }
+    }
+    success_count
+}
+
 /// RAII guard that decrements the connection count on drop.
 struct WsConnectionGuard {
     ip: IpAddr,
@@ -132,11 +190,121 @@ fn try_acquire_ws_slot(ip: IpAddr) -> Option<WsConnectionGuard> {
 // WS Upgrade Handler
 // ---------------------------------------------------------------------------
 
+/// Parameters for [`check_ws_auth`]. Kept as a struct so the auth gate stays
+/// pure and unit-testable without an `AppState` or live socket.
+pub(crate) struct WsAuthCtx<'a> {
+    /// Trimmed API key from kernel config. Empty string means no key configured.
+    pub api_key: &'a str,
+    /// Whether dashboard session login is enabled in config.
+    pub auth_enabled: bool,
+    /// Secret used to verify session cookies (api_key when set, else password hash).
+    pub session_secret: &'a str,
+    /// Whether the request originated from a loopback address.
+    pub is_loopback: bool,
+    /// True iff `OPENFANG_ALLOW_NO_AUTH=1` is set (loose mode for LAN binds).
+    pub allow_no_auth: bool,
+    pub headers: &'a axum::http::HeaderMap,
+    pub uri: &'a axum::http::Uri,
+}
+
+/// Pure auth gate for WebSocket upgrades.
+///
+/// Returns `Ok(())` if the request should be allowed through, or
+/// `Err(StatusCode::UNAUTHORIZED)` otherwise. Accepts:
+///   1. `Authorization: Bearer <api_key>` header
+///   2. `?token=<api_key>` query parameter
+///   3. `openfang_session=<token>` cookie when dashboard auth is enabled
+///   4. Loopback origin when no api_key is configured
+///   5. Any origin when `OPENFANG_ALLOW_NO_AUTH=1`
+///
+/// Fix for issue #1085: previously only (1), (2), and (4) were honored, so
+/// dashboard users logged in via session cookie saw "No active connection"
+/// because the WS upgrade rejected them even though HTTP requests succeeded.
+pub(crate) fn check_ws_auth(ctx: &WsAuthCtx<'_>) -> Result<(), axum::http::StatusCode> {
+    use axum::http::StatusCode;
+
+    // No api_key configured: behavior depends on whether dashboard auth is on.
+    //
+    // Issue #1189: previously this path allowed any loopback request through
+    // when api_key was empty, EVEN IF dashboard auth was enabled. That diverged
+    // from the HTTP middleware (which only opens the loopback no-auth path
+    // when api_key is empty AND auth.enabled is false). A local attacker with
+    // loopback access could chat with agents over WS even when the operator
+    // had configured dashboard credentials. Now mirror HTTP exactly.
+    if ctx.api_key.is_empty() {
+        // When dashboard auth is configured, require a valid session cookie
+        // regardless of bind address. Loopback no longer bypasses login.
+        if ctx.auth_enabled {
+            if !ctx.session_secret.is_empty() {
+                if let Some(token) = crate::session_auth::extract_session_cookie(ctx.headers) {
+                    if crate::session_auth::verify_session_token(&token, ctx.session_secret)
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        // No api_key AND dashboard auth disabled: keep the dev convenience
+        // path (loopback or explicit OPENFANG_ALLOW_NO_AUTH=1).
+        if ctx.is_loopback || ctx.allow_no_auth {
+            return Ok(());
+        }
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // SECURITY: constant-time comparison to prevent timing attacks on API key.
+    let ct_eq = |token: &str, key: &str| -> bool {
+        use subtle::ConstantTimeEq;
+        if token.len() != key.len() {
+            return false;
+        }
+        token.as_bytes().ct_eq(key.as_bytes()).into()
+    };
+
+    let header_auth = ctx
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|token| ct_eq(token, ctx.api_key))
+        .unwrap_or(false);
+    if header_auth {
+        return Ok(());
+    }
+
+    let query_auth = ctx
+        .uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
+        .map(crate::percent_decode)
+        .map(|token| ct_eq(&token, ctx.api_key))
+        .unwrap_or(false);
+    if query_auth {
+        return Ok(());
+    }
+
+    // Dashboard session cookie (issue #1085). When auth_enabled is on the
+    // session_secret is set by server.rs to either the api_key or the
+    // configured password hash, mirroring the HTTP auth middleware.
+    if ctx.auth_enabled && !ctx.session_secret.is_empty() {
+        if let Some(token) = crate::session_auth::extract_session_cookie(ctx.headers) {
+            if crate::session_auth::verify_session_token(&token, ctx.session_secret).is_some() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(StatusCode::UNAUTHORIZED)
+}
+
 /// GET /api/agents/:id/ws — Upgrade to WebSocket for real-time chat.
 ///
-/// SECURITY: Authenticates via Bearer token in Authorization header
-/// or `?token=` query parameter (for browser WebSocket clients that
-/// cannot set custom headers).
+/// SECURITY: Authenticates via Bearer token in Authorization header,
+/// `?token=` query parameter (for browser WebSocket clients that cannot
+/// set custom headers), or the `openfang_session` cookie set by the
+/// dashboard's session login flow (issue #1085).
 pub async fn agent_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -145,37 +313,43 @@ pub async fn agent_ws(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
-    // SECURITY: Authenticate WebSocket upgrades (bypasses middleware).
-    // Trim whitespace so empty/whitespace-only api_key disables auth.
+    // SECURITY: Authenticate WebSocket upgrades (bypasses HTTP middleware).
+    // Trim whitespace so empty/whitespace-only api_key still triggers the
+    // fail-closed path for non-loopback origins (see issue #1034 B2).
     let api_key_raw = &state.kernel.config.api_key;
     let api_key = api_key_raw.trim();
-    if !api_key.is_empty() {
-        // SECURITY: Use constant-time comparison to prevent timing attacks on API key
-        let ct_eq = |token: &str, key: &str| -> bool {
-            use subtle::ConstantTimeEq;
-            if token.len() != key.len() {
-                return false;
-            }
-            token.as_bytes().ct_eq(key.as_bytes()).into()
-        };
+    let is_loopback = addr.ip().is_loopback();
+    let allow_no_auth = std::env::var("OPENFANG_ALLOW_NO_AUTH")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false);
 
-        let header_auth = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|token| ct_eq(token, api_key))
-            .unwrap_or(false);
+    // Mirror the session_secret derivation in server.rs::AuthState so cookies
+    // issued by /api/auth/login verify the same way over HTTP and WS.
+    let auth_enabled = state.kernel.config.auth.enabled;
+    let session_secret_owned: String = if !api_key.is_empty() {
+        api_key.to_string()
+    } else if auth_enabled {
+        state.kernel.config.auth.password_hash.clone()
+    } else {
+        String::new()
+    };
 
-        let query_auth = uri
-            .query()
-            .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
-            .map(|token| ct_eq(token, api_key))
-            .unwrap_or(false);
+    let auth_ctx = WsAuthCtx {
+        api_key,
+        auth_enabled,
+        session_secret: &session_secret_owned,
+        is_loopback,
+        allow_no_auth,
+        headers: &headers,
+        uri: &uri,
+    };
 
-        if !header_auth && !query_auth {
-            warn!("WebSocket upgrade rejected: invalid auth");
-            return axum::http::StatusCode::UNAUTHORIZED.into_response();
-        }
+    if let Err(status) = check_ws_auth(&auth_ctx) {
+        warn!(
+            ip = %addr.ip(),
+            "WebSocket upgrade rejected: no valid Bearer token, ?token=, or openfang_session cookie"
+        );
+        return status.into_response();
     }
 
     // SECURITY: Enforce per-IP WebSocket connection limit
@@ -196,9 +370,29 @@ pub async fn agent_ws(
         }
     };
 
-    // Verify agent exists
-    if state.kernel.registry.get(agent_id).is_none() {
-        return axum::http::StatusCode::NOT_FOUND.into_response();
+    // Verify agent exists.
+    // Retry up to 5 times with 200ms backoff to handle a timing race where
+    // the client connects before the agent finishes registering (#804).
+    {
+        let mut found = state.kernel.registry.get(agent_id).is_some();
+        if !found {
+            for attempt in 1..=4 {
+                debug!(
+                    agent_id = %id,
+                    attempt,
+                    "Agent not found yet, retrying in 200ms"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if state.kernel.registry.get(agent_id).is_some() {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            warn!(agent_id = %id, "Agent not found after 5 lookup attempts");
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
     }
 
     let id_str = id.clone();
@@ -225,6 +419,9 @@ async fn handle_agent_ws(
 
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
+
+    // Register this connection in the global agent-WS registry
+    register_ws_connection(agent_id, Arc::clone(&sender)).await;
 
     // Per-connection verbose level (default: Full)
     let verbose = Arc::new(AtomicU8::new(VerboseLevel::Full as u8));
@@ -378,7 +575,8 @@ async fn handle_agent_ws(
         }
     }
 
-    // Cleanup
+    // Cleanup: deregister from agent-WS registry and abort background tasks
+    deregister_ws_connection(agent_id, &sender).await;
     update_handle.abort();
     info!(agent_id = %id_str, "WebSocket disconnected");
 }
@@ -816,8 +1014,17 @@ async fn handle_command(
     args: &str,
     verbose: &Arc<AtomicU8>,
 ) -> serde_json::Value {
-    match cmd {
-        "new" | "reset" => match state.kernel.reset_session(agent_id) {
+    // Canonicalise through the unified command registry. This resolves aliases
+    // (e.g. `reset` -> `new`) and is case-insensitive. If the command is not
+    // registered on the WEB surface, fall through to the existing match so any
+    // legacy/un-registered handlers still work byte-identically.
+    let canonical: &str = commands::resolve(cmd)
+        .filter(|def| def.surfaces.contains(Surfaces::WEB))
+        .map(|def| def.name)
+        .unwrap_or(cmd);
+
+    match canonical {
+        "new" => match state.kernel.reset_session(agent_id) {
             Ok(()) => {
                 serde_json::json!({"type": "command_result", "command": cmd, "message": "Session reset. Chat history cleared."})
             }
@@ -831,15 +1038,34 @@ async fn handle_command(
                 serde_json::json!({"type": "error", "content": format!("Compaction failed: {e}")})
             }
         },
-        "stop" => match state.kernel.stop_agent_run(agent_id) {
-            Ok(true) => {
-                serde_json::json!({"type": "command_result", "command": cmd, "message": "Run cancelled."})
+        "stop" => {
+            // If this agent is owned by an active hand instance, deactivate the
+            // hand entirely so the user can re-activate it (issue #1164).
+            if let Some(instance) = state.kernel.hand_registry.find_by_agent(agent_id) {
+                match state.kernel.deactivate_hand(instance.instance_id) {
+                    Ok(()) => serde_json::json!({
+                        "type": "command_result",
+                        "command": cmd,
+                        "message": format!("Hand '{}' deactivated.", instance.hand_id),
+                    }),
+                    Err(e) => {
+                        serde_json::json!({"type": "error", "content": format!("Stop failed: {e}")})
+                    }
+                }
+            } else {
+                match state.kernel.stop_agent_run(agent_id) {
+                    Ok(true) => {
+                        serde_json::json!({"type": "command_result", "command": cmd, "message": "Run cancelled."})
+                    }
+                    Ok(false) => {
+                        serde_json::json!({"type": "command_result", "command": cmd, "message": "No active run to cancel."})
+                    }
+                    Err(e) => {
+                        serde_json::json!({"type": "error", "content": format!("Stop failed: {e}")})
+                    }
+                }
             }
-            Ok(false) => {
-                serde_json::json!({"type": "command_result", "command": cmd, "message": "No active run to cancel."})
-            }
-            Err(e) => serde_json::json!({"type": "error", "content": format!("Stop failed: {e}")}),
-        },
+        }
         "model" => {
             if args.is_empty() {
                 if let Some(entry) = state.kernel.registry.get(agent_id) {
@@ -986,7 +1212,20 @@ async fn handle_command(
             };
             serde_json::json!({"type": "command_result", "command": cmd, "message": msg})
         }
-        _ => serde_json::json!({"type": "error", "content": format!("Unknown command: {cmd}")}),
+        "help" => {
+            serde_json::json!({
+                "type": "command_result",
+                "command": cmd,
+                "message": commands::render_help(Surfaces::WEB),
+            })
+        }
+        _ => serde_json::json!({
+            "type": "error",
+            "content": format!(
+                "Unknown command: /{cmd}\n\n{}",
+                commands::render_help(Surfaces::WEB)
+            ),
+        }),
     }
 }
 
@@ -1003,7 +1242,9 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             "id": id,
             "tool": name,
         })),
-        StreamEvent::ToolUseEnd { id, name, input, .. } if name == "canvas_present" => {
+        StreamEvent::ToolUseEnd {
+            id, name, input, ..
+        } if name == "canvas_present" => {
             let html = input.get("html").and_then(|v| v.as_str()).unwrap_or("");
             let title = input
                 .get("title")
@@ -1017,7 +1258,9 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 "title": title,
             }))
         }
-        StreamEvent::ToolUseEnd { id, name, input, .. } => match verbose {
+        StreamEvent::ToolUseEnd {
+            id, name, input, ..
+        } => match verbose {
             VerboseLevel::Off => None,
             VerboseLevel::On => {
                 let input_preview: String = serde_json::to_string(input)
@@ -1270,6 +1513,110 @@ pub fn strip_think_tags(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Cron Job WS Broadcasting
+// ---------------------------------------------------------------------------
+
+/// Start a background task that subscribes to the kernel's event bus and
+/// broadcasts cron job results to all connected WebSocket clients for the
+/// relevant agent.
+///
+/// This runs independently of the channel bridge — it uses the kernel's
+/// event bus to receive `CronJobExecuted` events and pushes them to WS.
+pub fn start_ws_cron_broadcaster(kernel: Arc<OpenFangKernel>) {
+    tokio::spawn(async move {
+        let mut rx = kernel.event_bus.subscribe_all();
+        loop {
+            let event = rx.recv().await;
+            match event {
+                Ok(event) => {
+                    if let openfang_types::event::EventPayload::System(
+                        openfang_types::event::SystemEvent::CronJobExecuted {
+                            agent_id,
+                            job_id,
+                            job_name,
+                            trigger_message,
+                            response,
+                            delivered_to_channel: _,
+                        },
+                    ) = event.payload
+                    {
+                        // Build the trigger message (synthetic user message from cron)
+                        let trigger_msg = serde_json::json!({
+                            "type": "message",
+                            "content": trigger_message,
+                            "source": "cron",
+                            "job_id": job_id,
+                            "job_name": job_name
+                        });
+                        let _ = broadcast_to_ws(agent_id, trigger_msg).await;
+
+                        // Send typing start
+                        let _ = broadcast_to_ws(
+                            agent_id,
+                            serde_json::json!({"state": "start", "type": "typing"}),
+                        )
+                        .await;
+
+                        // Send streaming phase
+                        let _ = broadcast_to_ws(
+                            agent_id,
+                            serde_json::json!({"detail": null, "phase": "streaming", "type": "phase"}),
+                        )
+                        .await;
+
+                        // Send text delta (full response since we don't have streaming chunks)
+                        let text_delta = serde_json::json!({
+                            "content": response,
+                            "type": "text_delta"
+                        });
+                        let _ = broadcast_to_ws(agent_id, text_delta).await;
+
+                        // Send done phase
+                        let _ = broadcast_to_ws(
+                            agent_id,
+                            serde_json::json!({"detail": null, "phase": "done", "type": "phase"}),
+                        )
+                        .await;
+
+                        // Send typing stop
+                        let _ = broadcast_to_ws(
+                            agent_id,
+                            serde_json::json!({"state": "stop", "type": "typing"}),
+                        )
+                        .await;
+
+                        // Send final response (mimics the format from agent_loop)
+                        let response_msg = serde_json::json!({
+                            "type": "response",
+                            "content": response,
+                            "context_pressure": "low",
+                            "cost_usd": null,
+                            "input_tokens": 0,
+                            "iterations": 0,
+                            "output_tokens": 0
+                        });
+                        let _ = broadcast_to_ws(agent_id, response_msg).await;
+
+                        info!(
+                            agent_id = %agent_id,
+                            job_id = %job_id,
+                            "Cron job result broadcast to WS"
+                        );
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(lagged_messages = n, "WS cron broadcaster lagged, skipping");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    info!("WS cron broadcaster channel closed, stopping");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1367,5 +1714,315 @@ mod tests {
         );
         assert_eq!(strip_think_tags("No thinking here"), "No thinking here");
         assert_eq!(strip_think_tags("<think>all thinking</think>"), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // WebSocket auth gate (issue #1085)
+    // -----------------------------------------------------------------------
+
+    fn empty_uri() -> axum::http::Uri {
+        "/api/agents/x/ws".parse().unwrap()
+    }
+
+    fn uri_with_token(tok: &str) -> axum::http::Uri {
+        format!("/api/agents/x/ws?token={tok}").parse().unwrap()
+    }
+
+    #[test]
+    fn ws_auth_accepts_bearer_token() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "secret",
+            auth_enabled: false,
+            session_secret: "secret",
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert!(check_ws_auth(&ctx).is_ok());
+    }
+
+    #[test]
+    fn ws_auth_accepts_query_token() {
+        let headers = axum::http::HeaderMap::new();
+        let uri = uri_with_token("secret");
+        let ctx = WsAuthCtx {
+            api_key: "secret",
+            auth_enabled: false,
+            session_secret: "secret",
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert!(check_ws_auth(&ctx).is_ok());
+    }
+
+    #[test]
+    fn ws_auth_accepts_session_cookie() {
+        // Issue #1085: the dashboard logs in via cookie, so WS must accept it.
+        let secret = "shared-secret";
+        let token = crate::session_auth::create_session_token("alice", secret, 1);
+        let cookie = format!("foo=bar; openfang_session={token}");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("cookie", cookie.parse().unwrap());
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: secret,
+            auth_enabled: true,
+            session_secret: secret,
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert!(
+            check_ws_auth(&ctx).is_ok(),
+            "valid session cookie should authorize WS upgrade"
+        );
+    }
+
+    #[test]
+    fn ws_auth_session_cookie_rejected_when_auth_disabled() {
+        // If dashboard auth is off, cookies must not grant access.
+        let secret = "shared-secret";
+        let token = crate::session_auth::create_session_token("alice", secret, 1);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("openfang_session={token}").parse().unwrap(),
+        );
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: secret,
+            auth_enabled: false,
+            session_secret: secret,
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert_eq!(
+            check_ws_auth(&ctx).unwrap_err(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn ws_auth_rejects_wrong_session_cookie() {
+        // Cookie signed with the wrong secret must fail.
+        let bad = crate::session_auth::create_session_token("alice", "other-secret", 1);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("cookie", format!("openfang_session={bad}").parse().unwrap());
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "secret",
+            auth_enabled: true,
+            session_secret: "secret",
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert_eq!(
+            check_ws_auth(&ctx).unwrap_err(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn ws_auth_rejects_when_no_credentials() {
+        let headers = axum::http::HeaderMap::new();
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "secret",
+            auth_enabled: true,
+            session_secret: "secret",
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert_eq!(
+            check_ws_auth(&ctx).unwrap_err(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn ws_auth_rejects_wrong_bearer() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "secret",
+            auth_enabled: false,
+            session_secret: "secret",
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert_eq!(
+            check_ws_auth(&ctx).unwrap_err(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn ws_auth_empty_key_loopback_ok() {
+        let headers = axum::http::HeaderMap::new();
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "",
+            auth_enabled: false,
+            session_secret: "",
+            is_loopback: true,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert!(check_ws_auth(&ctx).is_ok());
+    }
+
+    #[test]
+    fn ws_auth_empty_key_non_loopback_rejected() {
+        // Issue #1034 B2 regression guard.
+        let headers = axum::http::HeaderMap::new();
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "",
+            auth_enabled: false,
+            session_secret: "",
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert_eq!(
+            check_ws_auth(&ctx).unwrap_err(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn ws_auth_empty_key_allow_no_auth_opens() {
+        let headers = axum::http::HeaderMap::new();
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "",
+            auth_enabled: false,
+            session_secret: "",
+            is_loopback: false,
+            allow_no_auth: true,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert!(check_ws_auth(&ctx).is_ok());
+    }
+
+    #[test]
+    fn ws_auth_empty_key_session_cookie_grants_non_loopback() {
+        // When only dashboard login is configured (no api_key, auth_enabled=true),
+        // a valid session cookie must allow non-loopback WS upgrades.
+        let secret = "password-hash-style-secret";
+        let token = crate::session_auth::create_session_token("admin", secret, 1);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("openfang_session={token}").parse().unwrap(),
+        );
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "",
+            auth_enabled: true,
+            session_secret: secret,
+            is_loopback: false,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert!(check_ws_auth(&ctx).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1189: WS auth must mirror HTTP middleware. When dashboard auth
+    // is enabled, loopback + empty api_key + no cookie must NOT bypass.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ws_auth_dashboard_on_loopback_empty_key_no_cookie_rejected() {
+        // Issue #1189 regression guard: previously this returned Ok(()) because
+        // the empty-api_key branch allowed any loopback request through, even
+        // when dashboard credentials were configured. HTTP middleware rejects
+        // this path; WS must too.
+        let secret = "password-hash-style-secret";
+        let headers = axum::http::HeaderMap::new();
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "",
+            auth_enabled: true,
+            session_secret: secret,
+            is_loopback: true,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert_eq!(
+            check_ws_auth(&ctx).unwrap_err(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "loopback must not bypass dashboard auth when api_key is empty"
+        );
+    }
+
+    #[test]
+    fn ws_auth_dashboard_on_loopback_valid_cookie_accepted() {
+        // With dashboard auth on, a valid session cookie is the supported
+        // credential and must upgrade successfully from loopback too.
+        let secret = "password-hash-style-secret";
+        let token = crate::session_auth::create_session_token("admin", secret, 1);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("openfang_session={token}").parse().unwrap(),
+        );
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "",
+            auth_enabled: true,
+            session_secret: secret,
+            is_loopback: true,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert!(
+            check_ws_auth(&ctx).is_ok(),
+            "valid session cookie should authorize loopback WS upgrade"
+        );
+    }
+
+    #[test]
+    fn ws_auth_dashboard_off_loopback_empty_key_accepted() {
+        // Preserve the development convenience path: when dashboard auth is
+        // NOT configured AND api_key is empty, loopback still upgrades.
+        let headers = axum::http::HeaderMap::new();
+        let uri = empty_uri();
+        let ctx = WsAuthCtx {
+            api_key: "",
+            auth_enabled: false,
+            session_secret: "",
+            is_loopback: true,
+            allow_no_auth: false,
+            headers: &headers,
+            uri: &uri,
+        };
+        assert!(
+            check_ws_auth(&ctx).is_ok(),
+            "loopback dev path must work when dashboard auth is disabled"
+        );
     }
 }

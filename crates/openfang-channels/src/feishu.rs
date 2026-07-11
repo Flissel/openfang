@@ -42,8 +42,8 @@ const MAX_MESSAGE_LEN: usize = 4000;
 /// Token refresh buffer — refresh 5 minutes before actual expiry.
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
-/// Feishu websocket endpoint discovery API.
-const FEISHU_WS_ENDPOINT_URL: &str = "https://open.feishu.cn/callback/ws/endpoint";
+/// WebSocket endpoint path (appended to the region domain).
+const FEISHU_WS_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -160,7 +160,14 @@ impl DedupCache {
 
     /// Returns `true` if the ID was already seen (duplicate).
     fn check_and_insert(&self, id: &str) -> bool {
-        let mut ids = self.ids.lock().unwrap();
+        let mut ids = match self.ids.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Recover from a poisoned mutex rather than panicking.
+                warn!("Dedup cache mutex was poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         if ids.iter().any(|s| s == id) {
             return true;
         }
@@ -262,13 +269,24 @@ impl FeishuAdapter {
     ///
     /// WebSocket mode does not require a public IP or webhook configuration.
     pub fn new_websocket(app_id: String, app_secret: String) -> Self {
+        Self::new_websocket_with_region(app_id, app_secret, FeishuRegion::Cn)
+    }
+
+    /// Create a new Feishu adapter in WebSocket mode with an explicit region.
+    ///
+    /// Use this when the app is registered on Lark international (`open.larksuite.com`).
+    pub fn new_websocket_with_region(
+        app_id: String,
+        app_secret: String,
+        region: FeishuRegion,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             app_id,
             app_secret: Zeroizing::new(app_secret),
             connection_mode: FeishuConnectionMode::WebSocket,
             webhook_port: 0,
-            region: FeishuRegion::Cn,
+            region,
             webhook_path: String::new(),
             verification_token: None,
             encrypt_key: None,
@@ -911,9 +929,10 @@ struct FeishuAdapterClone {
 impl FeishuAdapterClone {
     /// Get WebSocket endpoint from Feishu API.
     async fn get_websocket_endpoint(&self) -> Result<FeishuWsEndpoint, Box<dyn std::error::Error>> {
+        let url = format!("{}{}", self.region.domain(), FEISHU_WS_ENDPOINT_PATH);
         let resp = self
             .client
-            .post(FEISHU_WS_ENDPOINT_URL)
+            .post(&url)
             .json(&serde_json::json!({
                 "AppID": self.app_id,
                 "AppSecret": self.app_secret.as_str(),
@@ -1030,7 +1049,10 @@ fn combine_payload(
         *entry = vec![Vec::new(); sum];
     }
 
-    entry[seq] = payload;
+    match entry.get_mut(seq) {
+        Some(slot) => *slot = payload,
+        None => return None,
+    }
 
     if entry.iter().any(|part| part.is_empty()) {
         return None;
@@ -1105,7 +1127,10 @@ fn extract_text_from_post(content: &serde_json::Value) -> Option<String> {
     let mut text_parts = Vec::new();
 
     for paragraph in paragraphs {
-        let elements = paragraph.as_array()?;
+        let elements = match paragraph.as_array() {
+            Some(elems) => elems,
+            None => continue,
+        };
         for element in elements {
             let tag = element["tag"].as_str().unwrap_or("");
             match tag {
@@ -1165,8 +1190,10 @@ fn should_respond_in_group(text: &str, mentions: &serde_json::Value, bot_names: 
 
 /// Strip @mention placeholders from text (`@_user_N` format).
 fn strip_mention_placeholders(text: &str) -> String {
-    let re = regex_lite::Regex::new(r"@_user_\d+\s*").unwrap();
-    re.replace_all(text, "").trim().to_string()
+    match regex_lite::Regex::new(r"@_user_\d+\s*") {
+        Ok(re) => re.replace_all(text, "").trim().to_string(),
+        Err(_) => text.trim().to_string(),
+    }
 }
 
 /// Decrypt an AES-256-CBC encrypted event payload.
@@ -1792,10 +1819,8 @@ mod tests {
 
     #[test]
     fn test_feishu_websocket_adapter_creation() {
-        let adapter = FeishuAdapter::new_websocket(
-            "cli_abc123".to_string(),
-            "app-secret-456".to_string(),
-        );
+        let adapter =
+            FeishuAdapter::new_websocket("cli_abc123".to_string(), "app-secret-456".to_string());
         assert_eq!(adapter.name(), "feishu");
         assert_eq!(adapter.connection_mode, FeishuConnectionMode::WebSocket);
         assert_eq!(adapter.webhook_port, 0); // not used in WS mode
@@ -1803,8 +1828,7 @@ mod tests {
 
     #[test]
     fn test_connection_mode_default_is_webhook() {
-        let adapter =
-            FeishuAdapter::new("cli_abc123".to_string(), "secret".to_string(), 9000);
+        let adapter = FeishuAdapter::new("cli_abc123".to_string(), "secret".to_string(), 9000);
         assert_eq!(adapter.connection_mode, FeishuConnectionMode::Webhook);
     }
 
@@ -1836,14 +1860,32 @@ mod tests {
     #[test]
     fn test_combine_payload_multi_part() {
         let headers_seq0 = vec![
-            FeishuWsHeader { key: "sum".to_string(), value: "2".to_string() },
-            FeishuWsHeader { key: "seq".to_string(), value: "0".to_string() },
-            FeishuWsHeader { key: "message_id".to_string(), value: "msg1".to_string() },
+            FeishuWsHeader {
+                key: "sum".to_string(),
+                value: "2".to_string(),
+            },
+            FeishuWsHeader {
+                key: "seq".to_string(),
+                value: "0".to_string(),
+            },
+            FeishuWsHeader {
+                key: "message_id".to_string(),
+                value: "msg1".to_string(),
+            },
         ];
         let headers_seq1 = vec![
-            FeishuWsHeader { key: "sum".to_string(), value: "2".to_string() },
-            FeishuWsHeader { key: "seq".to_string(), value: "1".to_string() },
-            FeishuWsHeader { key: "message_id".to_string(), value: "msg1".to_string() },
+            FeishuWsHeader {
+                key: "sum".to_string(),
+                value: "2".to_string(),
+            },
+            FeishuWsHeader {
+                key: "seq".to_string(),
+                value: "1".to_string(),
+            },
+            FeishuWsHeader {
+                key: "message_id".to_string(),
+                value: "msg1".to_string(),
+            },
         ];
         let mut parts = HashMap::new();
         // First part — not yet complete
@@ -1856,10 +1898,14 @@ mod tests {
 
     #[test]
     fn test_ws_header_lookup() {
-        let headers = vec![
-            FeishuWsHeader { key: "service_id".to_string(), value: "svc_123".to_string() },
-        ];
-        assert_eq!(ws_header(&headers, "service_id"), Some("svc_123".to_string()));
+        let headers = vec![FeishuWsHeader {
+            key: "service_id".to_string(),
+            value: "svc_123".to_string(),
+        }];
+        assert_eq!(
+            ws_header(&headers, "service_id"),
+            Some("svc_123".to_string())
+        );
         assert_eq!(ws_header(&headers, "missing"), None);
     }
 
@@ -1881,8 +1927,14 @@ mod tests {
             service: 1,
             method: 2,
             headers: vec![
-                FeishuWsHeader { key: "log_id".to_string(), value: "log_abc".to_string() },
-                FeishuWsHeader { key: "type".to_string(), value: "event".to_string() },
+                FeishuWsHeader {
+                    key: "log_id".to_string(),
+                    value: "log_abc".to_string(),
+                },
+                FeishuWsHeader {
+                    key: "type".to_string(),
+                    value: "event".to_string(),
+                },
             ],
             payload: Some(vec![]),
             payload_encoding: None,

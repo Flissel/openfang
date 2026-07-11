@@ -321,7 +321,39 @@ fn convert_messages(
                                 },
                             });
                         }
-                        ContentBlock::Thinking { .. } => {}
+                        ContentBlock::Thinking {
+                            thinking,
+                            provider_metadata,
+                            ..
+                        } => {
+                            // Issue #1098: preserve Gemini 2.5+ thought parts
+                            // when the upstream model originally emitted them.
+                            // Most Gemini state actually rides on the
+                            // thoughtSignature attached to text/tool_use
+                            // parts above, but we round-trip the visible
+                            // thinking text + sig as a `Thought` part too
+                            // so the model's internal state is fully
+                            // preserved.  Other providers' thinking blocks
+                            // are dropped here (they have their own
+                            // outbound paths in the OpenAI/Anthropic
+                            // drivers).
+                            let format = provider_metadata
+                                .as_ref()
+                                .and_then(|m| m.get("format"))
+                                .and_then(|v| v.as_str());
+                            if format == Some("gemini_thought") && !thinking.is_empty() {
+                                let sig = provider_metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("thought_signature"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                parts.push(GeminiPart::Thought {
+                                    text: thinking.clone(),
+                                    thought: true,
+                                    thought_signature: sig,
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -370,7 +402,11 @@ fn sanitize_gemini_turns(contents: Vec<GeminiContent>) -> Vec<GeminiContent> {
     }
 
     // Step 2: Drop orphaned functionCall parts from model turns.
-    // A model turn with functionCall must be followed by a user turn with functionResponse.
+    // A model turn with functionCall must be:
+    //   (a) followed by a user turn with functionResponse, AND
+    //   (b) preceded by a user turn (i.e. not at position 0).
+    // Gemini rejects with INVALID_ARGUMENT if a functionCall turn is at
+    // position 0 with no preceding user turn, even when (a) is satisfied.
     let len = merged.len();
     for i in 0..len {
         let is_model = merged[i].role.as_deref() == Some("model");
@@ -394,7 +430,9 @@ fn sanitize_gemini_turns(contents: Vec<GeminiContent>) -> Vec<GeminiContent> {
                 .iter()
                 .any(|p| matches!(p, GeminiPart::FunctionResponse { .. }));
 
-        if !next_has_response {
+        // After Step 1 merge, i > 0 guarantees a user turn precedes this model
+        // turn (alternating roles). i == 0 means no preceding user turn.
+        if i == 0 || !next_has_response {
             // Drop the functionCall parts from this model turn (keep text parts)
             merged[i]
                 .parts
@@ -555,12 +593,29 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
                             input: function_call.args,
                         });
                     }
-                    GeminiPart::Thought { text, .. } => {
+                    GeminiPart::Thought {
+                        text,
+                        thought_signature,
+                        ..
+                    } => {
                         // Gemini 2.5+ thinking parts — internal reasoning.
                         // Store as Thinking content block so the UI can
-                        // optionally display it (like <think> blocks).
+                        // optionally display it.  Issue #1098: preserve the
+                        // part-level `thoughtSignature` in `provider_metadata`
+                        // (and on subsequent text/tool_use parts) so the
+                        // model retains state across turns.
                         if !text.is_empty() {
-                            content.push(ContentBlock::Thinking { thinking: text });
+                            let provider_metadata = thought_signature.map(|sig| {
+                                serde_json::json!({
+                                    "format": "gemini_thought",
+                                    "thought_signature": sig,
+                                })
+                            });
+                            content.push(ContentBlock::Thinking {
+                                thinking: text,
+                                signature: None,
+                                provider_metadata,
+                            });
                         }
                     }
                     GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
@@ -782,6 +837,10 @@ impl LlmDriver for GeminiDriver {
             let mut text_content = String::new();
             // Thought signature for accumulated text content (last one wins)
             let mut text_thought_sig: Option<String> = None;
+            // Accumulated thought (Gemini 2.5+) text + signature, for
+            // round-tripping reasoning state across turns (issue #1098).
+            let mut thought_text = String::new();
+            let mut thought_sig: Option<String> = None;
             // Track function calls: (name, args_json, thought_signature)
             let mut fn_calls: Vec<(String, serde_json::Value, Option<String>)> = Vec::new();
             let mut finish_reason: Option<String> = None;
@@ -888,16 +947,25 @@ impl LlmDriver for GeminiDriver {
                                             thought_signature.clone(),
                                         ));
                                     }
-                                    GeminiPart::Thought { ref text, .. } => {
+                                    GeminiPart::Thought {
+                                        ref text,
+                                        ref thought_signature,
+                                        ..
+                                    } => {
                                         // Gemini 2.5+ thinking chunk — emit as
                                         // thinking delta so UIs can optionally
-                                        // show it; do NOT mix into text_content.
+                                        // show it; accumulate the text + sig
+                                        // for later persistence (issue #1098).
                                         if !text.is_empty() {
+                                            thought_text.push_str(text);
                                             let _ = tx
                                                 .send(StreamEvent::ThinkingDelta {
                                                     text: text.clone(),
                                                 })
                                                 .await;
+                                        }
+                                        if thought_signature.is_some() {
+                                            thought_sig = thought_signature.clone();
                                         }
                                     }
                                     GeminiPart::InlineData { .. }
@@ -979,13 +1047,23 @@ impl LlmDriver for GeminiDriver {
                                                     thought_signature.clone(),
                                                 ));
                                             }
-                                            GeminiPart::Thought { ref text, .. } => {
+                                            GeminiPart::Thought {
+                                                ref text,
+                                                ref thought_signature,
+                                                ..
+                                            } if !text.is_empty()
+                                                || thought_signature.is_some() =>
+                                            {
                                                 if !text.is_empty() {
+                                                    thought_text.push_str(text);
                                                     let _ = tx
                                                         .send(StreamEvent::ThinkingDelta {
                                                             text: text.clone(),
                                                         })
                                                         .await;
+                                                }
+                                                if thought_signature.is_some() {
+                                                    thought_sig = thought_signature.clone();
                                                 }
                                             }
                                             _ => {}
@@ -1027,6 +1105,25 @@ impl LlmDriver for GeminiDriver {
             // Build final response
             let mut content = Vec::new();
             let mut tool_calls = Vec::new();
+
+            // Issue #1098: persist any accumulated Thought parts (Gemini
+            // 2.5+ thinking) so reasoning state round-trips on the next
+            // turn.  The thoughtSignature also rides on text/tool_use
+            // parts below; this Thinking block carries the human-readable
+            // reasoning text for UI display + audit.
+            if !thought_text.is_empty() || thought_sig.is_some() {
+                let provider_metadata = thought_sig.as_ref().map(|sig| {
+                    serde_json::json!({
+                        "format": "gemini_thought",
+                        "thought_signature": sig,
+                    })
+                });
+                content.push(ContentBlock::Thinking {
+                    thinking: thought_text,
+                    signature: None,
+                    provider_metadata,
+                });
+            }
 
             if !text_content.is_empty() {
                 let provider_metadata =
@@ -1356,6 +1453,7 @@ mod tests {
             Message {
                 role: Role::System,
                 content: MessageContent::Text("System prompt here.".to_string()),
+                ..Default::default()
             },
             Message::user("Hi"),
         ];
@@ -1489,6 +1587,7 @@ mod tests {
                         "thought_signature": "sig_xyz789"
                     })),
                 }]),
+                ..Default::default()
             },
             Message {
                 role: Role::User,
@@ -1498,6 +1597,7 @@ mod tests {
                     content: "Results about Rust programming".to_string(),
                     is_error: false,
                 }]),
+                ..Default::default()
             },
         ];
 
@@ -1535,6 +1635,7 @@ mod tests {
                         "thought_signature": "text_sig_abc"
                     })),
                 }]),
+                ..Default::default()
             },
         ];
 
@@ -1606,6 +1707,7 @@ mod tests {
                     input: serde_json::json!({"path": "/tmp/test"}),
                     provider_metadata: None,
                 }]),
+                ..Default::default()
             },
             Message {
                 role: Role::User,
@@ -1615,6 +1717,7 @@ mod tests {
                     content: "file contents".to_string(),
                     is_error: false,
                 }]),
+                ..Default::default()
             },
         ];
 
@@ -1858,6 +1961,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: MessageContent::Blocks(completion.content),
+                ..Default::default()
             },
             Message {
                 role: Role::User,
@@ -1867,6 +1971,7 @@ mod tests {
                     content: "search results".to_string(),
                     is_error: false,
                 }]),
+                ..Default::default()
             },
         ];
         let (contents, _) = convert_messages(&messages, &None);
@@ -1988,7 +2093,7 @@ mod tests {
         // Should have a Thinking block and a Text block
         assert_eq!(completion.content.len(), 2);
         match &completion.content[0] {
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 assert_eq!(thinking, "Let me reason...");
             }
             _ => panic!("Expected Thinking block, got {:?}", completion.content[0]),

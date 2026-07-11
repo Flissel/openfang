@@ -42,6 +42,9 @@ pub struct SandboxConfig {
     /// Wall-clock timeout in seconds for epoch-based interruption.
     /// Defaults to 30 seconds if None.
     pub timeout_secs: Option<u64>,
+    /// Hosts allowed to bypass SSRF private-IP checks.
+    /// Forwarded from `[web.fetch] ssrf_allowed_hosts` in config.toml.
+    pub ssrf_allowed_hosts: Vec<String>,
 }
 
 impl Default for SandboxConfig {
@@ -51,6 +54,7 @@ impl Default for SandboxConfig {
             max_memory_bytes: 16 * 1024 * 1024,
             capabilities: Vec::new(),
             timeout_secs: None,
+            ssrf_allowed_hosts: Vec::new(),
         }
     }
 }
@@ -65,6 +69,8 @@ pub struct GuestState {
     pub agent_id: String,
     /// Tokio runtime handle for async operations in sync host functions.
     pub tokio_handle: tokio::runtime::Handle,
+    /// Hosts allowed to bypass SSRF private-IP checks (from config).
+    pub ssrf_allowed_hosts: Vec<String>,
 }
 
 /// Result of executing a WASM module.
@@ -164,6 +170,7 @@ impl WasmSandbox {
                 kernel,
                 agent_id: agent_id.to_string(),
                 tokio_handle,
+                ssrf_allowed_hosts: config.ssrf_allowed_hosts.clone(),
             },
         );
 
@@ -286,18 +293,18 @@ impl WasmSandbox {
                 |mut caller: Caller<'_, GuestState>,
                  request_ptr: i32,
                  request_len: i32|
-                 -> Result<i64, anyhow::Error> {
+                 -> Result<i64, Error> {
                     // Read request from guest memory
                     let memory = caller
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
-                        .ok_or_else(|| anyhow::anyhow!("no memory export"))?;
+                        .ok_or_else(|| format_err!("no memory export"))?;
 
                     let data = memory.data(&caller);
                     let start = request_ptr as usize;
                     let end = start + request_len as usize;
                     if end > data.len() {
-                        anyhow::bail!("host_call: request out of bounds");
+                        bail!("host_call: request out of bounds");
                     }
                     let request_bytes = data[start..end].to_vec();
 
@@ -324,7 +331,7 @@ impl WasmSandbox {
                     let alloc_fn = caller
                         .get_export("alloc")
                         .and_then(|e| e.into_func())
-                        .ok_or_else(|| anyhow::anyhow!("no alloc export"))?;
+                        .ok_or_else(|| format_err!("no alloc export"))?;
                     let alloc_typed = alloc_fn.typed::<i32, i32>(&caller)?;
                     let ptr = alloc_typed.call(&mut caller, len)?;
 
@@ -332,12 +339,12 @@ impl WasmSandbox {
                     let memory = caller
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
-                        .ok_or_else(|| anyhow::anyhow!("no memory export"))?;
+                        .ok_or_else(|| format_err!("no memory export"))?;
                     let mem_data = memory.data_mut(&mut caller);
                     let dest_start = ptr as usize;
                     let dest_end = dest_start + response_bytes.len();
                     if dest_end > mem_data.len() {
-                        anyhow::bail!("host_call: response exceeds memory bounds");
+                        bail!("host_call: response exceeds memory bounds");
                     }
                     mem_data[dest_start..dest_end].copy_from_slice(&response_bytes);
 
@@ -356,17 +363,17 @@ impl WasmSandbox {
                  level: i32,
                  msg_ptr: i32,
                  msg_len: i32|
-                 -> Result<(), anyhow::Error> {
+                 -> Result<(), Error> {
                     let memory = caller
                         .get_export("memory")
                         .and_then(|e| e.into_memory())
-                        .ok_or_else(|| anyhow::anyhow!("no memory export"))?;
+                        .ok_or_else(|| format_err!("no memory export"))?;
 
                     let data = memory.data(&caller);
                     let start = msg_ptr as usize;
                     let end = start + msg_len as usize;
                     if end > data.len() {
-                        anyhow::bail!("host_log: pointer out of bounds");
+                        bail!("host_log: pointer out of bounds");
                     }
                     let msg = std::str::from_utf8(&data[start..end]).unwrap_or("<invalid utf8>");
                     let agent_id = &caller.data().agent_id;

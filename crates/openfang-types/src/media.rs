@@ -75,6 +75,65 @@ pub struct MediaConfig {
     pub image_provider: Option<String>,
     /// Preferred audio transcription provider (auto-detect if None).
     pub audio_provider: Option<String>,
+    /// Optional override for the audio transcription endpoint base URL.
+    ///
+    /// When set, replaces the hardcoded provider URL with
+    /// `<audio_base_url>/v1/audio/transcriptions`. Use this to point to a
+    /// local OpenAI-compat Whisper service (e.g., speaches, faster-whisper-server,
+    /// LM Studio) while keeping the same multipart wire format and the
+    /// `audio_provider` semantics ("openai" or "groq" still selects which
+    /// `*_API_KEY` env var is used for the Authorization header).
+    ///
+    /// Closes <https://github.com/RightNow-AI/openfang/issues/1051>.
+    ///
+    /// Example:
+    /// ```toml
+    /// [media]
+    /// audio_provider = "openai"
+    /// audio_base_url = "http://127.0.0.1:8000"
+    /// # → POST http://127.0.0.1:8000/v1/audio/transcriptions
+    /// #   with Authorization: Bearer $OPENAI_API_KEY (any non-empty string
+    /// #   works for most local OpenAI-compat servers).
+    /// ```
+    pub audio_base_url: Option<String>,
+
+    /// Optional override for the OpenAI TTS endpoint base URL.
+    ///
+    /// When set, replaces `https://api.openai.com` with
+    /// `<tts_openai_base_url>/v1/audio/speech`. Use this to point at a
+    /// local OpenAI-compatible TTS service (Lemonade/Kokoro, LM Studio,
+    /// etc.) while keeping the same JSON wire format. The Authorization
+    /// header is still built from `OPENAI_API_KEY` (local services
+    /// usually accept any non-empty bearer token).
+    ///
+    /// Closes <https://github.com/RightNow-AI/openfang/issues/1051>.
+    #[serde(default)]
+    pub tts_openai_base_url: Option<String>,
+
+    /// Optional override for the ElevenLabs TTS endpoint base URL.
+    ///
+    /// When set, replaces `https://api.elevenlabs.io` with
+    /// `<tts_elevenlabs_base_url>/v1/text-to-speech/{voice_id}`. Use this
+    /// to route through a proxy or self-hosted ElevenLabs-compatible
+    /// gateway. The `xi-api-key` header still comes from
+    /// `ELEVENLABS_API_KEY`.
+    ///
+    /// Closes <https://github.com/RightNow-AI/openfang/issues/1051>.
+    #[serde(default)]
+    pub tts_elevenlabs_base_url: Option<String>,
+
+    /// Optional override for the OpenAI image generation endpoint base URL.
+    ///
+    /// When set, replaces `https://api.openai.com` with
+    /// `<image_gen_base_url>/v1/images/generations`. Use this to point at
+    /// a local OpenAI-compatible image generation service
+    /// (Lemonade/Flux, LM Studio, etc.) while keeping the same JSON wire
+    /// format. The Authorization header is still built from
+    /// `OPENAI_API_KEY`.
+    ///
+    /// Closes <https://github.com/RightNow-AI/openfang/issues/1051>.
+    #[serde(default)]
+    pub image_gen_base_url: Option<String>,
 }
 
 impl Default for MediaConfig {
@@ -86,6 +145,10 @@ impl Default for MediaConfig {
             max_concurrency: 2,
             image_provider: None,
             audio_provider: None,
+            audio_base_url: None,
+            tts_openai_base_url: None,
+            tts_elevenlabs_base_url: None,
+            image_gen_base_url: None,
         }
     }
 }
@@ -359,6 +422,104 @@ mod tests {
         assert!(!config.video_description);
         assert_eq!(config.max_concurrency, 2);
         assert!(config.image_provider.is_none());
+        assert!(config.audio_base_url.is_none());
+        assert!(config.tts_openai_base_url.is_none());
+        assert!(config.tts_elevenlabs_base_url.is_none());
+        assert!(config.image_gen_base_url.is_none());
+    }
+
+    #[test]
+    fn test_media_config_tts_openai_base_url_serde_roundtrip() {
+        let config = MediaConfig {
+            tts_openai_base_url: Some("http://127.0.0.1:8000".to_string()),
+            ..MediaConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: MediaConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.tts_openai_base_url.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+    }
+
+    #[test]
+    fn test_media_config_tts_elevenlabs_base_url_serde_roundtrip() {
+        let config = MediaConfig {
+            tts_elevenlabs_base_url: Some("http://127.0.0.1:9000".to_string()),
+            ..MediaConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: MediaConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.tts_elevenlabs_base_url.as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+    }
+
+    #[test]
+    fn test_media_config_image_gen_base_url_serde_roundtrip() {
+        let config = MediaConfig {
+            image_gen_base_url: Some("http://127.0.0.1:7000".to_string()),
+            ..MediaConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: MediaConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.image_gen_base_url.as_deref(),
+            Some("http://127.0.0.1:7000")
+        );
+    }
+
+    #[test]
+    fn test_media_config_backward_compat_no_tts_or_image_overrides() {
+        // Old TOML/JSON without the three new URL override fields must still
+        // parse with None, thanks to #[serde(default)] on the struct.
+        let legacy_json = r#"{
+            "image_description": true,
+            "audio_transcription": true,
+            "video_description": false,
+            "max_concurrency": 2,
+            "image_provider": null,
+            "audio_provider": "openai",
+            "audio_base_url": null
+        }"#;
+        let parsed: MediaConfig = serde_json::from_str(legacy_json).unwrap();
+        assert!(parsed.tts_openai_base_url.is_none());
+        assert!(parsed.tts_elevenlabs_base_url.is_none());
+        assert!(parsed.image_gen_base_url.is_none());
+    }
+
+    #[test]
+    fn test_media_config_audio_base_url_serde_roundtrip() {
+        let config = MediaConfig {
+            audio_base_url: Some("http://127.0.0.1:8000".to_string()),
+            audio_provider: Some("openai".to_string()),
+            ..MediaConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: MediaConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.audio_base_url.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        assert_eq!(parsed.audio_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn test_media_config_backward_compat_no_audio_base_url() {
+        // Old TOML/JSON without `audio_base_url` must still parse with None,
+        // thanks to #[serde(default)] on the struct.
+        let legacy_json = r#"{
+            "image_description": true,
+            "audio_transcription": true,
+            "video_description": false,
+            "max_concurrency": 2,
+            "image_provider": null,
+            "audio_provider": "openai"
+        }"#;
+        let parsed: MediaConfig = serde_json::from_str(legacy_json).unwrap();
+        assert!(parsed.audio_base_url.is_none());
+        assert_eq!(parsed.audio_provider.as_deref(), Some("openai"));
     }
 
     #[test]

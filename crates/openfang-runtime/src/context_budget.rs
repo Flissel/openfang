@@ -5,6 +5,7 @@
 //! - Layer 2: Context guard that scans all tool results before LLM calls
 //!   and compacts oldest results when total exceeds 75% headroom.
 
+use crate::str_utils::safe_truncate_str;
 use openfang_types::message::{ContentBlock, Message, MessageContent};
 use openfang_types::tool::ToolDefinition;
 use tracing::debug;
@@ -217,11 +218,14 @@ fn truncate_to(content: &str, max_chars: usize) -> String {
         .rfind('\n')
         .map(|pos| search_start + pos)
         .unwrap_or(keep);
+
+    // Use safe_truncate_str as an extra layer of safety
+    let safe_content = safe_truncate_str(content, break_point);
     format!(
         "{}\n\n[COMPACTED: {} → {} chars by context guard]",
-        &content[..break_point],
+        safe_content,
         content.len(),
-        break_point
+        safe_content.len()
     )
 }
 
@@ -286,6 +290,7 @@ mod tests {
                     content: big_result.clone(),
                     is_error: false,
                 }]),
+                ..Default::default()
             },
             Message {
                 role: openfang_types::message::Role::User,
@@ -295,6 +300,7 @@ mod tests {
                     content: big_result,
                     is_error: false,
                 }]),
+                ..Default::default()
             },
         ];
 
@@ -346,6 +352,7 @@ mod tests {
                 content: big_chinese,
                 is_error: false,
             }]),
+            ..Default::default()
         }];
         // Must not panic on multi-byte content
         let compacted = apply_context_guard(&mut messages, &budget, &[]);

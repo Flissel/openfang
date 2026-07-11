@@ -404,6 +404,7 @@ fn build_conversation_text(messages: &[Message], config: &CompactionConfig) -> S
                             conversation_text.push_str(&format!("[Image: {media_type}]\n\n"));
                         }
                         ContentBlock::Thinking { .. } => {}
+                        ContentBlock::RedactedThinking { .. } => {}
                         ContentBlock::Unknown => {}
                     }
                 }
@@ -435,10 +436,9 @@ async fn summarize_messages(
         let safe_start = if conversation_text.is_char_boundary(start) {
             start
         } else {
-            conversation_text[start..]
-                .char_indices()
-                .next()
-                .map(|(i, _)| start + i)
+            // Find the nearest valid character boundary moving upward
+            (start..conversation_text.len())
+                .find(|&i| conversation_text.is_char_boundary(i))
                 .unwrap_or(conversation_text.len())
         };
         conversation_text = conversation_text[safe_start..].to_string();
@@ -458,6 +458,7 @@ async fn summarize_messages(
                 text: summarize_prompt,
                 provider_metadata: None,
             }]),
+            ..Default::default()
         }],
         tools: vec![],
         max_tokens: config.max_summary_tokens,
@@ -576,6 +577,7 @@ async fn summarize_in_chunks(
                 text: merge_prompt,
                 provider_metadata: None,
             }]),
+            ..Default::default()
         }],
         tools: vec![],
         max_tokens: config.max_summary_tokens,
@@ -603,6 +605,49 @@ async fn summarize_in_chunks(
             // Fallback: just concatenate the chunk summaries
             Ok(summaries.join("\n\n"))
         }
+    }
+}
+
+/// Adjust a split index so it does not land between an assistant ToolUse message
+/// and the immediately following user ToolResult message.
+///
+/// If `split` points right after an assistant message that contains ToolUse blocks,
+/// and the message at `split` is a user message with matching ToolResult blocks,
+/// the split is pulled back by 1 so the pair stays in the "kept" portion.
+fn adjust_split_for_tool_pairs(messages: &[Message], split: usize) -> usize {
+    use openfang_types::message::{ContentBlock, Role};
+
+    if split == 0 || split >= messages.len() {
+        return split;
+    }
+
+    // Check if split - 1 is an assistant with ToolUse and split is a user with ToolResult
+    let prev = &messages[split - 1];
+    let curr = &messages[split];
+
+    if prev.role != Role::Assistant || curr.role != Role::User {
+        return split;
+    }
+
+    let prev_has_tool_use = match &prev.content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+        _ => false,
+    };
+
+    let curr_has_tool_result = match &curr.content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+        _ => false,
+    };
+
+    if prev_has_tool_use && curr_has_tool_result {
+        // Pull back so both stay in "kept"
+        split - 1
+    } else {
+        split
     }
 }
 
@@ -634,7 +679,11 @@ pub async fn compact_session(
         });
     }
 
-    let split_at = msg_count.saturating_sub(config.keep_recent);
+    let raw_split = msg_count.saturating_sub(config.keep_recent);
+    // Adjust split point to avoid cutting between a ToolUse assistant message
+    // and its ToolResult user message.  If the split lands right between them,
+    // pull back by 1 so the pair stays together in `kept`.
+    let split_at = adjust_split_for_tool_pairs(&session.messages, raw_split);
     let to_compact = &session.messages[..split_at];
     let kept = &session.messages[split_at..];
 
@@ -866,6 +915,7 @@ mod tests {
                 input: serde_json::json!({"query": "test"}),
                 provider_metadata: None,
             }]),
+            ..Default::default()
         };
         messages[2] = Message {
             role: Role::User,
@@ -875,6 +925,7 @@ mod tests {
                 content: "Search results here".to_string(),
                 is_error: false,
             }]),
+            ..Default::default()
         };
 
         let session = Session {
@@ -1205,6 +1256,7 @@ mod tests {
                         provider_metadata: None,
                     },
                 ]),
+                ..Default::default()
             },
             Message {
                 role: Role::User,
@@ -1214,6 +1266,7 @@ mod tests {
                     content: "Results found".to_string(),
                     is_error: false,
                 }]),
+                ..Default::default()
             },
             Message {
                 role: Role::User,
@@ -1221,6 +1274,7 @@ mod tests {
                     media_type: "image/png".to_string(),
                     data: "base64data".to_string(),
                 }]),
+                ..Default::default()
             },
         ];
 
@@ -1355,6 +1409,7 @@ mod tests {
                 content: tool_content,
                 is_error: false,
             }]),
+            ..Default::default()
         }];
         let text = build_conversation_text(&messages, &config);
         // The base64 blob should be stripped/replaced by session_repair
@@ -1375,6 +1430,7 @@ mod tests {
                 content: large_result,
                 is_error: false,
             }]),
+            ..Default::default()
         }];
         let text = build_conversation_text(&messages, &config);
         // Should be capped at ~2000 chars (plus the "..." suffix)
@@ -1399,8 +1455,66 @@ mod tests {
                 content: short_result.to_string(),
                 is_error: false,
             }]),
+            ..Default::default()
         }];
         let text = build_conversation_text(&messages, &config);
         assert!(text.contains(short_result));
+    }
+
+    #[test]
+    fn test_adjust_split_pulls_back_for_tool_pair() {
+        // Messages: [user, assistant(ToolUse), user(ToolResult), assistant("done")]
+        // Split at 2 would separate the ToolUse from its ToolResult.
+        let messages = vec![
+            Message::user("hello"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    tool_name: "read".to_string(),
+                    content: "file contents".to_string(),
+                    is_error: false,
+                }]),
+                ..Default::default()
+            },
+            Message::assistant("Done reading."),
+        ];
+        let adjusted = adjust_split_for_tool_pairs(&messages, 2);
+        assert_eq!(
+            adjusted, 1,
+            "Should pull back split to keep ToolUse + ToolResult together"
+        );
+    }
+
+    #[test]
+    fn test_adjust_split_no_change_for_text() {
+        let messages = vec![
+            Message::user("a"),
+            Message::assistant("b"),
+            Message::user("c"),
+        ];
+        let adjusted = adjust_split_for_tool_pairs(&messages, 1);
+        assert_eq!(
+            adjusted, 1,
+            "Should not change split for plain text messages"
+        );
+    }
+
+    #[test]
+    fn test_adjust_split_edge_cases() {
+        let messages = vec![Message::user("a")];
+        assert_eq!(adjust_split_for_tool_pairs(&messages, 0), 0);
+        assert_eq!(adjust_split_for_tool_pairs(&messages, 1), 1);
+        assert_eq!(adjust_split_for_tool_pairs(&messages, 5), 5);
     }
 }

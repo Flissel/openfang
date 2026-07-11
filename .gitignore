@@ -69,3 +69,6 @@ Thumbs.db
 
 # === Phase R Phi3-Klone (generated) ===
 agents-phi3/
+
+# Personal deploy scripts
+scripts/deploy-remote.sh

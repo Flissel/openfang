@@ -258,7 +258,8 @@ impl ChannelAdapter for WhatsAppAdapter {
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
                 );
-                let resp = self.client
+                let resp = self
+                    .client
                     .post(&api_url)
                     .bearer_auth(&*self.access_token)
                     .json(&body)
@@ -270,7 +271,7 @@ impl ChannelAdapter for WhatsAppAdapter {
                     return Err(format!("WhatsApp API error {status}: {body}").into());
                 }
             }
-            ChannelContent::File { url, filename } => {
+            ChannelContent::File { url, filename, .. } => {
                 let body = serde_json::json!({
                     "messaging_product": "whatsapp",
                     "to": user.platform_id,
@@ -284,7 +285,8 @@ impl ChannelAdapter for WhatsAppAdapter {
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
                 );
-                let resp = self.client
+                let resp = self
+                    .client
                     .post(&api_url)
                     .bearer_auth(&*self.access_token)
                     .json(&body)
@@ -310,7 +312,8 @@ impl ChannelAdapter for WhatsAppAdapter {
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
                 );
-                let resp = self.client
+                let resp = self
+                    .client
                     .post(&api_url)
                     .bearer_auth(&*self.access_token)
                     .json(&body)

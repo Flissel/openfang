@@ -42,6 +42,7 @@ async fn start_test_server() -> TestServer {
             model: "test-model".to_string(),
             api_key_env: "OLLAMA_API_KEY".to_string(),
             base_url: None,
+            subprocess_timeout_secs: None,
         },
         ..KernelConfig::default()
     };
@@ -59,6 +60,7 @@ async fn start_test_server() -> TestServer {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config: Arc::new(tokio::sync::RwLock::new(Default::default())),
     });
 
     let app = Router::new()

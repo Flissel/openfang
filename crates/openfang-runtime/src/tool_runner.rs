@@ -18,6 +18,16 @@ use tracing::{debug, warn};
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
 
+/// Check if a tool name refers to a shell execution tool.
+///
+/// Used to determine whether exec_policy settings should bypass the approval gate.
+/// SECURITY (#919): `process_start` is also a shell execution path — it spawns
+/// arbitrary subprocesses via the persistent process manager. It must be gated
+/// by the same approval rules as `shell_exec`.
+fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "shell_exec" | "process_start")
+}
+
 /// Check if a shell command should be blocked by taint tracking.
 ///
 /// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)
@@ -133,9 +143,28 @@ pub async fn execute_tool(
         }
     }
 
-    // Approval gate: check if this tool requires human approval before execution
+    // Approval gate: check if this tool requires human approval before execution.
+    //
+    // When exec_policy.mode = "full" (or allowlist with allowed_commands = ["*"]),
+    // the user has explicitly opted into unrestricted shell access. In that case,
+    // shell_exec should bypass the approval gate — requiring approval for commands
+    // the user already whitelisted is contradictory (GitHub issue #772).
+    let exec_policy_bypasses_approval = is_shell_tool(tool_name)
+        && exec_policy.is_some_and(|p| {
+            p.mode == openfang_types::config::ExecSecurityMode::Full
+                || (p.mode == openfang_types::config::ExecSecurityMode::Allowlist
+                    && p.allowed_commands.iter().any(|c| c == "*"))
+        });
+
+    if exec_policy_bypasses_approval {
+        debug!(
+            tool_name,
+            "Approval bypassed: exec_policy grants unrestricted shell access"
+        );
+    }
+
     if let Some(kh) = kernel {
-        if kh.requires_approval(tool_name) {
+        if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
             let input_str = input.to_string();
             let summary = format!(
@@ -176,6 +205,7 @@ pub async fn execute_tool(
         "file_read" => tool_file_read(input, workspace_root).await,
         "file_write" => tool_file_write(input, workspace_root).await,
         "file_list" => tool_file_list(input, workspace_root).await,
+        "create_directory" => tool_create_directory(input, workspace_root).await,
         "apply_patch" => tool_apply_patch(input, workspace_root).await,
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
@@ -270,6 +300,7 @@ pub async fn execute_tool(
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
+        "agent_activate" => tool_agent_activate(input, kernel),
 
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
@@ -284,8 +315,8 @@ pub async fn execute_tool(
         "event_publish" => tool_event_publish(input, kernel).await,
 
         // Scheduling tools
-        "schedule_create" => tool_schedule_create(input, kernel).await,
-        "schedule_list" => tool_schedule_list(kernel).await,
+        "schedule_create" => tool_schedule_create(input, kernel, caller_agent_id).await,
+        "schedule_list" => tool_schedule_list(kernel, caller_agent_id).await,
         "schedule_delete" => tool_schedule_delete(input, kernel).await,
 
         // Knowledge graph tools
@@ -301,7 +332,7 @@ pub async fn execute_tool(
         "media_transcribe" => tool_media_transcribe(input, media_engine).await,
 
         // Image generation tool
-        "image_generate" => tool_image_generate(input, workspace_root).await,
+        "image_generate" => tool_image_generate(input, workspace_root, media_engine).await,
 
         // TTS/STT tools
         "text_to_speech" => tool_text_to_speech(input, tts_engine, workspace_root).await,
@@ -327,7 +358,9 @@ pub async fn execute_tool(
         "channel_send" => tool_channel_send(input, kernel, workspace_root).await,
 
         // Persistent process tools
-        "process_start" => tool_process_start(input, process_manager, caller_agent_id).await,
+        "process_start" => {
+            tool_process_start(input, process_manager, caller_agent_id, exec_policy).await
+        }
         "process_poll" => tool_process_poll(input, process_manager).await,
         "process_write" => tool_process_write(input, process_manager).await,
         "process_kill" => tool_process_kill(input, process_manager).await,
@@ -444,6 +477,11 @@ pub async fn execute_tool(
                 Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string())
             }
         },
+
+        // Skill introspection tools (issue #1038)
+        "skill_list" => tool_skill_list(skill_registry),
+        "skill_describe" => tool_skill_describe(input, skill_registry),
+        "skill_execute" => tool_skill_execute(input, skill_registry).await,
 
         // Canvas / A2UI tool
         "canvas_present" => tool_canvas_present(input, workspace_root).await,
@@ -564,6 +602,17 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "create_directory".to_string(),
+            description: "Create a directory (and any missing parent directories) at the given path. Paths are relative to the agent workspace. Idempotent: succeeds if the directory already exists.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The directory path to create" }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
             name: "apply_patch".to_string(),
             description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites.".to_string(),
             input_schema: serde_json::json!({
@@ -659,6 +708,24 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The agent's UUID to kill" }
+                },
+                "required": ["agent_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "agent_activate".to_string(),
+            description: "Activate (wake up) an inactive agent so it can receive messages \
+                          and process events. Use this when agent_list shows an agent in a \
+                          Suspended, Crashed, or Created state and you want to delegate work \
+                          to it via agent_send. Terminated agents cannot be revived."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The target agent's UUID or human-readable name"
+                    }
                 },
                 "required": ["agent_id"]
             }),
@@ -1246,6 +1313,42 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["html"]
             }),
         },
+        // --- Skill introspection tools (issue #1038) ---
+        // These let the agent discover and read installed skills without
+        // touching the filesystem. Global skills live at ~/.openfang/skills/
+        // which is outside the workspace sandbox — file_read cannot reach them.
+        ToolDefinition {
+            name: "skill_list".to_string(),
+            description: "List all installed skills available to this agent. Returns name, version, description, runtime type, and provided tool names. Use this instead of file_list on the skills directory.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "skill_describe".to_string(),
+            description: "Read the full description (SKILL.md body / prompt context) of an installed skill by name. Use this instead of file_read on a skill's SKILL.md file — global skills live outside the workspace sandbox and cannot be read with file_read.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The skill name (as returned by skill_list)" }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_execute".to_string(),
+            description: "Execute a tool provided by an installed skill. For code-runtime skills (Python/Node/Shell) this invokes the underlying script. For prompt-only skills this returns the skill's instruction body so the agent can follow it using built-in tools.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill": { "type": "string", "description": "The skill name (as returned by skill_list)" },
+                    "tool": { "type": "string", "description": "Optional name of a tool the skill provides. Omit to invoke the skill's default behavior (returns SKILL.md body for prompt-only skills)." },
+                    "input": { "type": "object", "description": "Optional JSON input for the skill tool" }
+                },
+                "required": ["skill"]
+            }),
+        },
     ]
 }
 
@@ -1306,6 +1409,82 @@ async fn tool_file_write(
         content.len(),
         resolved.display()
     ))
+}
+
+/// Resolve a directory path for creation. Unlike `resolve_file_path`, this walks
+/// up the path to find the nearest existing ancestor, canonicalizes that, and
+/// re-appends the missing segments. This lets `create_directory` accept nested
+/// paths like `a/b/c/d` even when none of `a`, `b`, `c` exist yet.
+fn resolve_directory_path_for_create(
+    raw_path: &str,
+    workspace_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    // Reject `..` components regardless of workspace.
+    let _ = validate_path(raw_path)?;
+
+    let Some(root) = workspace_root else {
+        return Ok(PathBuf::from(raw_path));
+    };
+
+    let path = Path::new(raw_path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
+
+    // Walk up to find the nearest existing ancestor, canonicalize it, then
+    // re-append the missing tail.
+    let mut existing: PathBuf = candidate.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let parent = match existing.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return Err("Invalid path: no existing ancestor".to_string()),
+        };
+        let name = match existing.file_name() {
+            Some(n) => n.to_os_string(),
+            None => return Err("Invalid path: no filename component".to_string()),
+        };
+        tail.push(name);
+        existing = parent;
+    }
+
+    let canon_existing = existing
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve ancestor directory: {e}"))?;
+
+    let mut resolved = canon_existing;
+    for segment in tail.into_iter().rev() {
+        resolved.push(segment);
+    }
+
+    if !resolved.starts_with(&canon_root) {
+        return Err(format!(
+            "Access denied: path '{raw_path}' resolves outside workspace"
+        ));
+    }
+
+    Ok(resolved)
+}
+
+async fn tool_create_directory(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    if raw_path.is_empty() {
+        return Err("'path' parameter is empty".to_string());
+    }
+    let resolved = resolve_directory_path_for_create(raw_path, workspace_root)?;
+    tokio::fs::create_dir_all(&resolved)
+        .await
+        .map_err(|e| format!("Failed to create directory: {e}"))?;
+    Ok(format!("Created directory {}", resolved.display()))
 }
 
 async fn tool_file_list(
@@ -1529,7 +1708,18 @@ async fn tool_shell_exec(
 
     // SECURITY: Isolate environment to prevent credential leakage.
     // Hand settings may grant access to specific provider API keys.
-    crate::subprocess_sandbox::sandbox_command(&mut cmd, allowed_env);
+    //
+    // Operators can also forward additional vars via
+    // `exec_policy.shell_env_passthrough` (issue #1169). This is the path
+    // Docker users hit: their container env (TZ, GOG_*, etc.) is present
+    // in PID 1 but `env_clear()` strips it. Listing names (or `"*"`) here
+    // re-adds them to the child.
+    let policy_env_passthrough: &[String] = exec_policy
+        .map(|p| p.shell_env_passthrough.as_slice())
+        .unwrap_or(&[]);
+    let merged_env =
+        crate::subprocess_sandbox::merge_env_passthrough(allowed_env, policy_env_passthrough);
+    crate::subprocess_sandbox::sandbox_command(&mut cmd, &merged_env);
 
     // Ensure UTF-8 output on Windows
     #[cfg(windows)]
@@ -1663,6 +1853,20 @@ fn tool_agent_kill(
         .ok_or("Missing 'agent_id' parameter")?;
     kh.kill_agent(agent_id)?;
     Ok(format!("Agent {agent_id} killed successfully."))
+}
+
+fn tool_agent_activate(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .ok_or("Missing 'agent_id' parameter")?;
+    let name = kh.activate_agent(agent_id)?;
+    Ok(format!(
+        "Agent '{name}' activated. It is now Running and ready to receive messages."
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,11 +2264,65 @@ fn parse_time_to_hour(s: &str) -> Result<u32, String> {
     Ok(hour)
 }
 
-const SCHEDULES_KEY: &str = "__openfang_schedules";
+/// Sanitize a description into a valid `CronJob.name` (alphanumeric +
+/// space/hyphen/underscore, 1..=128 chars).
+fn sanitize_schedule_name(description: &str) -> String {
+    let filtered: String = description
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = filtered.trim();
+    if trimmed.is_empty() {
+        return "scheduled-task".to_string();
+    }
+    trimmed.chars().take(128).collect()
+}
+
+/// Resolve the `agent` field of `schedule_create` into an agent UUID string
+/// suitable for `KernelHandle::cron_create`.
+///
+/// - Empty / "self" → caller's agent ID.
+/// - Valid UUID → passed through.
+/// - Non-empty name → looked up via `find_agents`; an exact name match wins,
+///   a single fuzzy match is accepted, ambiguity is an error.
+fn resolve_schedule_target(
+    kh: &Arc<dyn KernelHandle>,
+    agent: &str,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let a = agent.trim();
+    if a.is_empty() || a.eq_ignore_ascii_case("self") {
+        return caller_agent_id.map(|s| s.to_string()).ok_or_else(|| {
+            "No caller agent available; specify 'agent' to target an agent by name or UUID"
+                .to_string()
+        });
+    }
+    if uuid::Uuid::parse_str(a).is_ok() {
+        return Ok(a.to_string());
+    }
+    let matches = kh.find_agents(a);
+    if let Some(m) = matches.iter().find(|m| m.name == a) {
+        return Ok(m.id.clone());
+    }
+    match matches.len() {
+        0 => Err(format!("Agent '{a}' not found")),
+        1 => Ok(matches[0].id.clone()),
+        n => Err(format!(
+            "Agent name '{a}' is ambiguous ({n} matches). Pass the agent UUID."
+        )),
+    }
+}
 
 async fn tool_schedule_create(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let description = input["description"]
@@ -2073,58 +2331,77 @@ async fn tool_schedule_create(
     let schedule_str = input["schedule"]
         .as_str()
         .ok_or("Missing 'schedule' parameter")?;
-    let agent = input["agent"].as_str().unwrap_or("");
+    let agent_input = input["agent"].as_str().unwrap_or("");
 
     let cron_expr = parse_schedule_to_cron(schedule_str)?;
-    let schedule_id = uuid::Uuid::new_v4().to_string();
+    let target_agent_id = resolve_schedule_target(kh, agent_input, caller_agent_id)?;
+    let name = sanitize_schedule_name(description);
 
-    let entry = serde_json::json!({
-        "id": schedule_id,
-        "description": description,
-        "schedule_input": schedule_str,
-        "cron": cron_expr,
-        "agent": agent,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "enabled": true,
+    let job_json = serde_json::json!({
+        "name": name,
+        "schedule": { "kind": "cron", "expr": cron_expr, "tz": null },
+        "action": {
+            "kind": "agent_turn",
+            "message": description,
+            "model_override": null,
+            "timeout_secs": null,
+        },
+        "delivery": { "kind": "none" },
+        "one_shot": false,
     });
 
-    // Load existing schedules from shared memory
-    let mut schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
-        Some(serde_json::Value::Array(arr)) => arr,
-        _ => Vec::new(),
+    let resp = kh.cron_create(&target_agent_id, job_json).await?;
+    // Kernel returns JSON `{ "job_id": "...", "status": "created" }`.
+    let job_id = serde_json::from_str::<serde_json::Value>(&resp)
+        .ok()
+        .and_then(|v| v["job_id"].as_str().map(str::to_string))
+        .unwrap_or_else(|| resp.clone());
+
+    let agent_display = if agent_input.trim().is_empty() {
+        "(self)".to_string()
+    } else {
+        agent_input.to_string()
     };
-
-    schedules.push(entry);
-    kh.memory_store(SCHEDULES_KEY, serde_json::Value::Array(schedules))?;
-
     Ok(format!(
-        "Schedule created:\n  ID: {schedule_id}\n  Description: {description}\n  Cron: {cron_expr}\n  Original: {schedule_str}"
+        "Schedule created:\n  ID: {job_id}\n  Description: {description}\n  Cron: {cron_expr}\n  Original: {schedule_str}\n  Agent: {agent_display}"
     ))
 }
 
-async fn tool_schedule_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String, String> {
+async fn tool_schedule_list(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
+    let agent_id =
+        caller_agent_id.ok_or("Agent ID required for schedule_list (no caller context)")?;
 
-    let schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
-        Some(serde_json::Value::Array(arr)) => arr,
-        _ => Vec::new(),
-    };
-
-    if schedules.is_empty() {
+    let jobs = kh.cron_list(agent_id).await?;
+    if jobs.is_empty() {
         return Ok("No scheduled tasks.".to_string());
     }
 
-    let mut output = format!("Scheduled tasks ({}):\n\n", schedules.len());
-    for s in &schedules {
-        let enabled = s["enabled"].as_bool().unwrap_or(true);
+    let mut output = format!("Scheduled tasks ({}):\n\n", jobs.len());
+    for job in &jobs {
+        let enabled = job["enabled"].as_bool().unwrap_or(true);
         let status = if enabled { "active" } else { "paused" };
+        let id = job["id"].as_str().unwrap_or("?");
+        let schedule_display = match job["schedule"]["kind"].as_str() {
+            Some("cron") => job["schedule"]["expr"].as_str().unwrap_or("?").to_string(),
+            Some("every") => format!(
+                "every {}s",
+                job["schedule"]["every_secs"].as_u64().unwrap_or(0)
+            ),
+            Some("at") => job["schedule"]["at"].as_str().unwrap_or("?").to_string(),
+            _ => "?".to_string(),
+        };
+        let description = job["action"]["message"]
+            .as_str()
+            .or_else(|| job["action"]["text"].as_str())
+            .unwrap_or_else(|| job["name"].as_str().unwrap_or("?"));
+        let created = job["created_at"].as_str().unwrap_or("?");
+        let agent = job["agent_id"].as_str().unwrap_or("(self)");
         output.push_str(&format!(
-            "  [{status}] {} — {}\n    Cron: {} | Agent: {}\n    Created: {}\n\n",
-            s["id"].as_str().unwrap_or("?"),
-            s["description"].as_str().unwrap_or("?"),
-            s["cron"].as_str().unwrap_or("?"),
-            s["agent"].as_str().unwrap_or("(self)"),
-            s["created_at"].as_str().unwrap_or("?"),
+            "  [{status}] {id} — {description}\n    Cron: {schedule_display} | Agent: {agent}\n    Created: {created}\n\n"
         ));
     }
 
@@ -2137,20 +2414,9 @@ async fn tool_schedule_delete(
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let id = input["id"].as_str().ok_or("Missing 'id' parameter")?;
-
-    let mut schedules: Vec<serde_json::Value> = match kh.memory_recall(SCHEDULES_KEY)? {
-        Some(serde_json::Value::Array(arr)) => arr,
-        _ => Vec::new(),
-    };
-
-    let before = schedules.len();
-    schedules.retain(|s| s["id"].as_str() != Some(id));
-
-    if schedules.len() == before {
-        return Err(format!("Schedule '{id}' not found."));
-    }
-
-    kh.memory_store(SCHEDULES_KEY, serde_json::Value::Array(schedules))?;
+    kh.cron_cancel(id)
+        .await
+        .map_err(|e| format!("Schedule '{id}' not found: {e}"))?;
     Ok(format!("Schedule '{id}' deleted."))
 }
 
@@ -2451,7 +2717,7 @@ async fn tool_a2a_discover(input: &serde_json::Value) -> Result<String, String> 
     let url = input["url"].as_str().ok_or("Missing 'url' parameter")?;
 
     // SSRF protection: block private/metadata IPs
-    if crate::web_fetch::check_ssrf(url).is_err() {
+    if crate::web_fetch::check_ssrf(url, &[]).is_err() {
         return Err("SSRF blocked: URL resolves to a private or metadata address".to_string());
     }
 
@@ -2474,7 +2740,7 @@ async fn tool_a2a_send(
     // Resolve agent URL: either directly provided or looked up by name
     let url = if let Some(url) = input["agent_url"].as_str() {
         // SSRF protection
-        if crate::web_fetch::check_ssrf(url).is_err() {
+        if crate::web_fetch::check_ssrf(url, &[]).is_err() {
             return Err("SSRF blocked: URL resolves to a private or metadata address".to_string());
         }
         url.to_string()
@@ -2821,6 +3087,7 @@ async fn tool_media_transcribe(
 async fn tool_image_generate(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
 ) -> Result<String, String> {
     let prompt = input["prompt"]
         .as_str()
@@ -2850,7 +3117,10 @@ async fn tool_image_generate(
         count,
     };
 
-    let result = crate::image_gen::generate_image(&request).await?;
+    // Closes #1051: route to a local OpenAI-compatible image generation
+    // service when `media.image_gen_base_url` is set.
+    let base_url_override = media_engine.and_then(|e| e.config().image_gen_base_url.as_deref());
+    let result = crate::image_gen::generate_image(&request, base_url_override).await?;
 
     // Save images to workspace if available
     let saved_paths = if let Some(workspace) = workspace_root {
@@ -3059,10 +3329,18 @@ async fn tool_docker_exec(
 // ---------------------------------------------------------------------------
 
 /// Start a long-running process (REPL, server, watcher).
+///
+/// SECURITY (#919): process_start previously spawned subprocesses with NO
+/// exec policy enforcement, allowing an LLM in Allowlist mode to bypass
+/// allowed_commands entirely. For example, process_start with command="rm"
+/// args=["/some/file"] would delete the file even though "rm" was not
+/// in the allowlist. This function now performs the same checks as
+/// shell_exec: metacharacter rejection plus exec_policy validation.
 async fn tool_process_start(
     input: &serde_json::Value,
     pm: Option<&crate::process_manager::ProcessManager>,
     caller_agent_id: Option<&str>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
 ) -> Result<String, String> {
     let pm = pm.ok_or("Process manager not available")?;
     let agent_id = caller_agent_id.unwrap_or("default");
@@ -3077,6 +3355,41 @@ async fn tool_process_start(
                 .collect()
         })
         .unwrap_or_default();
+
+    // SECURITY: Reject shell metacharacters in the command name itself.
+    // The command field must be a single binary token.
+    if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
+        return Err(format!(
+            "process_start blocked: command contains {reason}. \
+             Shell metacharacters are never allowed in the command field."
+        ));
+    }
+    // Also reject metacharacters anywhere in the arguments. While direct
+    // spawn does not interpret these, blocking them prevents an LLM from
+    // smuggling a chained command past the allowlist via an argument.
+    for arg in &args {
+        if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(arg) {
+            return Err(format!(
+                "process_start blocked: argument contains {reason}. \
+                 Shell metacharacters are not allowed in process arguments."
+            ));
+        }
+    }
+
+    // SECURITY (#919): Enforce exec policy against the base command. The
+    // shared validate_command_allowlist handles Deny / Full / Allowlist and
+    // falls through to allow commands listed in safe_bins or allowed_commands.
+    if let Some(policy) = exec_policy {
+        if let Err(reason) = crate::subprocess_sandbox::validate_command_allowlist(command, policy)
+        {
+            return Err(format!(
+                "process_start blocked: {reason}. Current exec_policy.mode = '{:?}'. \
+                 To allow this command, add it to exec_policy.allowed_commands or \
+                 set exec_policy.mode = 'full'.",
+                policy.mode
+            ));
+        }
+    }
 
     let proc_id = pm.start(agent_id, command, &args).await?;
     Ok(serde_json::json!({
@@ -3264,6 +3577,165 @@ async fn tool_canvas_present(
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Skill introspection tools (issue #1038)
+//
+// Global skills live at ~/.openfang/skills/ which is outside the agent
+// workspace sandbox. Without these tools the LLM falls back to file_read /
+// shell_exec to inspect SKILL.md files — which fail with path-resolution
+// errors because file_read is workspace-scoped. These tools surface the
+// already-loaded skill registry directly to the agent.
+// ---------------------------------------------------------------------------
+
+/// List all skills available to this agent, with their provided tool names.
+fn tool_skill_list(skill_registry: Option<&SkillRegistry>) -> Result<String, String> {
+    let registry = match skill_registry {
+        Some(r) => r,
+        None => return Ok("No skill registry available.".to_string()),
+    };
+    let skills = registry.list();
+    if skills.is_empty() {
+        return Ok("No skills installed. Install skills via the dashboard or `openfang skill install <name>`.".to_string());
+    }
+    let entries: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|s| {
+            let tool_names: Vec<String> = s
+                .manifest
+                .tools
+                .provided
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
+            serde_json::json!({
+                "name": s.manifest.skill.name,
+                "version": s.manifest.skill.version,
+                "description": s.manifest.skill.description,
+                "runtime": format!("{:?}", s.manifest.runtime.runtime_type),
+                "enabled": s.enabled,
+                "tools": tool_names,
+                "has_prompt_context": s.manifest.prompt_context.as_ref().is_some_and(|c| !c.is_empty()),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "count": entries.len(),
+        "skills": entries,
+    }))
+    .map_err(|e| format!("Serialize error: {e}"))
+}
+
+/// Return the full description (SKILL.md body) of a named skill.
+fn tool_skill_describe(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+) -> Result<String, String> {
+    let name = input["name"]
+        .as_str()
+        .ok_or("Missing 'name' parameter")?
+        .trim();
+    let registry = skill_registry.ok_or("No skill registry available")?;
+    let skill = registry.get(name).ok_or_else(|| {
+        format!("Skill '{name}' not found. Use skill_list to see installed skills.")
+    })?;
+    let body = skill
+        .manifest
+        .prompt_context
+        .clone()
+        .unwrap_or_else(|| "(No prompt context body — this skill provides executable tools only. Use skill_execute or call its tools directly.)".to_string());
+    let tool_names: Vec<String> = skill
+        .manifest
+        .tools
+        .provided
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    let response = serde_json::json!({
+        "name": skill.manifest.skill.name,
+        "version": skill.manifest.skill.version,
+        "description": skill.manifest.skill.description,
+        "runtime": format!("{:?}", skill.manifest.runtime.runtime_type),
+        "tools": tool_names,
+        "body": body,
+    });
+    serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
+}
+
+/// Execute a skill's tool, or for prompt-only skills return the description body.
+async fn tool_skill_execute(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+) -> Result<String, String> {
+    let skill_name = input["skill"]
+        .as_str()
+        .ok_or("Missing 'skill' parameter")?
+        .trim();
+    let registry = skill_registry.ok_or("No skill registry available")?;
+    let skill = registry.get(skill_name).ok_or_else(|| {
+        format!("Skill '{skill_name}' not found. Use skill_list to see installed skills.")
+    })?;
+
+    // If no tool name was given, default behavior depends on runtime.
+    // For prompt-only skills, return the SKILL.md body (most useful response
+    // for issue #1038's daily-journal style skills).
+    let tool_name = input["tool"].as_str().map(|s| s.trim());
+    let tool_input = input.get("input").cloned().unwrap_or(serde_json::json!({}));
+
+    let resolved_tool = match tool_name {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => {
+            // No tool specified — return SKILL.md body so the agent can act on it.
+            if let Some(ref body) = skill.manifest.prompt_context {
+                if !body.is_empty() {
+                    let response = serde_json::json!({
+                        "skill": skill.manifest.skill.name,
+                        "mode": "prompt_context",
+                        "body": body,
+                        "note": "This is a prompt-only skill. Follow the instructions in 'body' using your built-in tools.",
+                    });
+                    return serde_json::to_string_pretty(&response)
+                        .map_err(|e| format!("Serialize error: {e}"));
+                }
+            }
+            // Fall through: pick the first provided tool if any
+            skill
+                .manifest
+                .tools
+                .provided
+                .first()
+                .map(|t| t.name.clone())
+                .ok_or_else(|| {
+                    format!("Skill '{skill_name}' provides no tools and has no prompt body.")
+                })?
+        }
+    };
+
+    match openfang_skills::loader::execute_skill_tool(
+        &skill.manifest,
+        &skill.path,
+        &resolved_tool,
+        &tool_input,
+    )
+    .await
+    {
+        Ok(result) => {
+            let content = serde_json::to_string_pretty(&serde_json::json!({
+                "skill": skill.manifest.skill.name,
+                "tool": resolved_tool,
+                "output": result.output,
+                "is_error": result.is_error,
+            }))
+            .unwrap_or_else(|_| result.output.to_string());
+            if result.is_error {
+                Err(content)
+            } else {
+                Ok(content)
+            }
+        }
+        Err(e) => Err(format!("Skill execution failed: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3279,11 +3751,16 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         // Original 12
         assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"file_write"));
+        assert!(names.contains(&"file_list"));
+        assert!(names.contains(&"create_directory"));
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"agent_send"));
         assert!(names.contains(&"agent_spawn"));
         assert!(names.contains(&"agent_list"));
         assert!(names.contains(&"agent_kill"));
+        // Issue #890 — wake up inactive agents
+        assert!(names.contains(&"agent_activate"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
         // 6 collaboration tools
@@ -3332,6 +3809,67 @@ mod tests {
         assert!(names.contains(&"docker_exec"));
         // Canvas tool
         assert!(names.contains(&"canvas_present"));
+        // 3 skill introspection tools (issue #1038)
+        assert!(names.contains(&"skill_list"));
+        assert!(names.contains(&"skill_describe"));
+        assert!(names.contains(&"skill_execute"));
+    }
+
+    /// Issue #1038: skill_list, skill_describe, skill_execute work without
+    /// touching the filesystem so global skills (outside the workspace
+    /// sandbox) are reachable by the agent.
+    #[tokio::test]
+    async fn test_skill_tools_no_filesystem_access() {
+        use openfang_skills::registry::SkillRegistry;
+        use tempfile::TempDir;
+
+        // Build a skills directory containing one prompt-only SKILL.md skill
+        // (mirroring the user's daily-journal scenario from #1038).
+        let global_dir = TempDir::new().unwrap();
+        let skill_dir = global_dir.path().join("daily-journal");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: daily-journal\ndescription: Keep a daily journal\n---\n\
+             # Daily Journal\n\nWrite one paragraph per day about what you learned.",
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::new(global_dir.path().to_path_buf());
+        registry.load_all().unwrap();
+        assert_eq!(registry.count(), 1);
+
+        // skill_list returns the global skill without any filesystem call
+        let list_out = tool_skill_list(Some(&registry)).unwrap();
+        assert!(list_out.contains("daily-journal"));
+        assert!(list_out.contains("Keep a daily journal"));
+
+        // skill_describe returns the SKILL.md body — no file_read needed
+        let desc_out = tool_skill_describe(
+            &serde_json::json!({ "name": "daily-journal" }),
+            Some(&registry),
+        )
+        .unwrap();
+        assert!(desc_out.contains("Daily Journal"));
+        assert!(desc_out.contains("Write one paragraph"));
+
+        // skill_execute on a prompt-only skill returns the body in 'prompt_context' mode
+        let exec_out = tool_skill_execute(
+            &serde_json::json!({ "skill": "daily-journal" }),
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+        assert!(exec_out.contains("prompt_context"));
+        assert!(exec_out.contains("Daily Journal"));
+
+        // skill_describe on a missing skill returns a helpful error
+        let missing = tool_skill_describe(
+            &serde_json::json!({ "name": "no-such-skill" }),
+            Some(&registry),
+        );
+        assert!(missing.is_err());
+        assert!(missing.unwrap_err().contains("not found"));
     }
 
     #[test]
@@ -3446,6 +3984,98 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(result.content.contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_path_traversal_blocked() {
+        let result = execute_tool(
+            "test-id",
+            "create_directory",
+            &serde_json::json!({"path": "../../etc/evil"}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_creates_nested() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let result = tool_create_directory(&serde_json::json!({"path": "a/b/c"}), Some(root)).await;
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        let expected = root.join("a").join("b").join("c");
+        assert!(
+            expected.is_dir(),
+            "Expected directory to exist: {}",
+            expected.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // First create
+        let r1 = tool_create_directory(&serde_json::json!({"path": "data/logs"}), Some(root)).await;
+        assert!(r1.is_ok());
+        // Second create on existing dir should also succeed
+        let r2 = tool_create_directory(&serde_json::json!({"path": "data/logs"}), Some(root)).await;
+        assert!(r2.is_ok(), "Expected idempotent success, got: {:?}", r2);
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_missing_path_param() {
+        let result = tool_create_directory(&serde_json::json!({}), None).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("Missing 'path'"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_dispatch_via_execute_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let result = execute_tool(
+            "test-id",
+            "create_directory",
+            &serde_json::json!({"path": "nested/folder"}),
+            None,                 // kernel
+            None,                 // allowed_tools
+            None,                 // caller_agent_id
+            None,                 // skill_registry
+            None,                 // mcp_connections
+            None,                 // web_ctx
+            None,                 // browser_ctx
+            None,                 // allowed_env_vars
+            Some(root.as_path()), // workspace_root
+            None,                 // media_engine
+            None,                 // exec_policy
+            None,                 // tts_engine
+            None,                 // docker_config
+            None,                 // process_manager
+        )
+        .await;
+        assert!(
+            !result.is_error,
+            "Expected success, got: {}",
+            result.content
+        );
+        assert!(root.join("nested").join("folder").is_dir());
     }
 
     #[tokio::test]
@@ -3651,10 +4281,12 @@ mod tests {
             None, // process_manager
         )
         .await;
-        // Should NOT be "Permission denied" — it should normalize to file_write
-        // and pass the capability check. It will fail for other reasons (path validation).
+        // Should NOT be the capability-enforcement "Permission denied" — it should
+        // normalize to file_write and pass the capability check.  It may still fail
+        // for filesystem reasons (e.g. OS "Permission denied (os error 13)"), so we
+        // check specifically for the capability-gate message.
         assert!(
-            !result.content.contains("Permission denied"),
+            !result.content.contains("Permission denied: agent"),
             "fs-write should normalize to file_write and pass capability check, got: {}",
             result.content
         );
@@ -3988,5 +4620,395 @@ mod tests {
         assert_eq!(output["title"], "Test");
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Regression: GitHub issue #919 — rm bypass via process_start ──────
+    //
+    // Before the fix, an LLM in Allowlist mode could call process_start
+    // with command="rm" and args=["/some/file"] to delete files even though
+    // "rm" was not in exec_policy.allowed_commands. tool_process_start
+    // spawned the subprocess directly without ever consulting exec_policy.
+    //
+    // These tests pin down the new contract:
+    //   1. process_start with a non-allowlisted binary returns Err.
+    //   2. The Err message identifies allowlist rejection (so callers and
+    //      logs can distinguish it from a generic spawn failure).
+    //   3. process_start with an allowlisted binary still works.
+    //   4. is_shell_tool() now reports process_start as a shell tool so
+    //      the approval-gate path treats it the same as shell_exec.
+
+    #[tokio::test]
+    async fn test_issue_919_process_start_rm_blocked_in_allowlist() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let pm = crate::process_manager::ProcessManager::new(5);
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["ls".to_string(), "echo".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({
+            "command": "rm",
+            "args": ["/tmp/openfang_test_should_not_be_deleted.txt"],
+        });
+
+        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy)).await;
+
+        assert!(
+            result.is_err(),
+            "process_start must reject 'rm' when not in allowlist (issue #919). Got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not in the exec allowlist"),
+            "Error must indicate allowlist rejection, got: {err}"
+        );
+        assert!(
+            err.contains("process_start blocked"),
+            "Error must identify process_start as the blocking tool, got: {err}"
+        );
+        assert_eq!(
+            pm.count(),
+            0,
+            "No process must have been spawned when allowlist rejects the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_919_process_start_metachar_in_command_blocked() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let pm = crate::process_manager::ProcessManager::new(5);
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            ..ExecPolicy::default()
+        };
+        // Even in Full mode, smuggling shell metacharacters into the command
+        // field must be rejected — process_start does direct exec, not shell.
+        let input = serde_json::json!({
+            "command": "rm; cat /etc/passwd",
+            "args": [],
+        });
+        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("metacharacter") || pm.count() == 0);
+    }
+
+    #[tokio::test]
+    async fn test_issue_919_process_start_metachar_in_arg_blocked() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let pm = crate::process_manager::ProcessManager::new(5);
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["echo".to_string()],
+            ..ExecPolicy::default()
+        };
+        // Smuggling a chained command via an argument: echo "$(rm -rf /)"
+        let input = serde_json::json!({
+            "command": "echo",
+            "args": ["$(rm -rf /)"],
+        });
+        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy)).await;
+        assert!(
+            result.is_err(),
+            "process_start must reject metacharacters in args"
+        );
+        assert_eq!(pm.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_issue_919_process_start_deny_mode_blocks_everything() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let pm = crate::process_manager::ProcessManager::new(5);
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Deny,
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({
+            "command": "echo",
+            "args": ["hello"],
+        });
+        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy)).await;
+        assert!(result.is_err(), "Deny mode must block process_start");
+        assert!(result.unwrap_err().to_lowercase().contains("disabled"));
+        assert_eq!(pm.count(), 0);
+    }
+
+    #[test]
+    fn test_issue_919_is_shell_tool_includes_process_start() {
+        // process_start must be treated as a shell tool by the approval gate
+        // so #772 (full-mode approval bypass) and #919 (allowlist enforcement)
+        // both apply consistently.
+        assert!(is_shell_tool("shell_exec"));
+        assert!(is_shell_tool("process_start"));
+        assert!(!is_shell_tool("file_read"));
+        assert!(!is_shell_tool("web_fetch"));
+    }
+
+    // ----------------------------------------------------------------------
+    // Issue #1069: schedule_* tools route through the kernel cron scheduler
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_schedule_name_strips_punctuation() {
+        // Colons, commas, dots, and other punctuation are replaced with '-'.
+        let out = sanitize_schedule_name("Remind me: file report, please.");
+        assert!(!out.contains(':'));
+        assert!(!out.contains(','));
+        assert!(!out.contains('.'));
+        // Spaces, hyphens, and underscores survive.
+        assert!(out
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_'));
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_schedule_name_empty_fallback() {
+        assert_eq!(sanitize_schedule_name(""), "scheduled-task");
+        assert_eq!(sanitize_schedule_name("   "), "scheduled-task");
+    }
+
+    #[test]
+    fn test_sanitize_schedule_name_caps_length() {
+        let long = "a".repeat(500);
+        let out = sanitize_schedule_name(&long);
+        assert!(out.chars().count() <= 128);
+    }
+
+    // Minimal in-memory KernelHandle used to verify schedule_* tool wiring.
+    // Records every cron_* call so tests can assert what the tool pushed into
+    // the kernel, without booting a real OpenFangKernel.
+    struct FakeKernelHandle {
+        created: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+        cancelled: std::sync::Mutex<Vec<String>>,
+        jobs: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl FakeKernelHandle {
+        fn new() -> Self {
+            Self {
+                created: std::sync::Mutex::new(Vec::new()),
+                cancelled: std::sync::Mutex::new(Vec::new()),
+                jobs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_job(self, job: serde_json::Value) -> Self {
+            self.jobs.lock().unwrap().push(job);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kernel_handle::KernelHandle for FakeKernelHandle {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("not used".into())
+        }
+        async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
+            Err("not used".into())
+        }
+        fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn memory_store(&self, _key: &str, _value: serde_json::Value) -> Result<(), String> {
+            Ok(())
+        }
+        fn memory_recall(&self, _key: &str) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+        fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        async fn task_post(
+            &self,
+            _title: &str,
+            _description: &str,
+            _assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn task_claim(&self, _agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+        async fn task_complete(&self, _task_id: &str, _result: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn task_list(&self, _status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+            Ok(vec![])
+        }
+        async fn publish_event(
+            &self,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn knowledge_add_entity(
+            &self,
+            _entity: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn knowledge_add_relation(
+            &self,
+            _relation: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("not used".into())
+        }
+        async fn knowledge_query(
+            &self,
+            _pattern: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            Ok(vec![])
+        }
+
+        async fn cron_create(
+            &self,
+            agent_id: &str,
+            job_json: serde_json::Value,
+        ) -> Result<String, String> {
+            let id = format!("job-{}", self.created.lock().unwrap().len());
+            self.created
+                .lock()
+                .unwrap()
+                .push((agent_id.to_string(), job_json.clone()));
+            // Mirror what the real kernel returns (see cron_create in
+            // openfang-kernel): `{ "job_id": "...", "status": "created" }`.
+            let resp = serde_json::json!({ "job_id": id, "status": "created" });
+            Ok(resp.to_string())
+        }
+
+        async fn cron_list(&self, _agent_id: &str) -> Result<Vec<serde_json::Value>, String> {
+            Ok(self.jobs.lock().unwrap().clone())
+        }
+
+        async fn cron_cancel(&self, job_id: &str) -> Result<(), String> {
+            self.cancelled.lock().unwrap().push(job_id.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schedule_create_routes_to_cron_scheduler() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let caller = "11111111-1111-1111-1111-111111111111";
+
+        let input = serde_json::json!({
+            "description": "Daily report",
+            "schedule": "daily at 9am",
+            "agent": "self",
+        });
+
+        let out = tool_schedule_create(&input, Some(&handle), Some(caller))
+            .await
+            .expect("tool_schedule_create should succeed with a valid schedule");
+
+        // User-facing response shape is preserved.
+        assert!(out.starts_with("Schedule created:"));
+        assert!(out.contains("Daily report"));
+        assert!(out.contains("Cron: "));
+
+        // The fake kernel received a cron_create for the caller agent with a
+        // well-formed job_json. This is the whole point of #1069: the tool
+        // must call into the cron scheduler, not just write to shared memory.
+        let created = fake.created.lock().unwrap();
+        assert_eq!(created.len(), 1, "cron_create must be called exactly once");
+        assert_eq!(created[0].0, caller, "target agent must be the caller");
+        let job = &created[0].1;
+        assert_eq!(job["schedule"]["kind"], "cron");
+        assert_eq!(job["action"]["kind"], "agent_turn");
+        assert_eq!(job["action"]["message"], "Daily report");
+        assert!(job["schedule"]["expr"].is_string());
+        assert_eq!(job["one_shot"], false);
+    }
+
+    #[tokio::test]
+    async fn test_schedule_create_rejects_missing_description() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let input = serde_json::json!({ "schedule": "every hour" });
+        let err = tool_schedule_create(&input, Some(&handle), Some("aaa"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("description"));
+    }
+
+    #[tokio::test]
+    async fn test_schedule_list_reads_from_cron_scheduler() {
+        let job = serde_json::json!({
+            "id": "cron-1",
+            "name": "demo",
+            "enabled": true,
+            "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+            "action": { "kind": "agent_turn", "message": "hello" },
+            "created_at": "2026-01-01T00:00:00Z",
+            "agent_id": "aaa",
+        });
+        let fake = Arc::new(FakeKernelHandle::new().with_job(job));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+
+        let out = tool_schedule_list(Some(&handle), Some("aaa"))
+            .await
+            .expect("schedule_list should succeed");
+        assert!(out.contains("Scheduled tasks (1)"));
+        assert!(out.contains("0 9 * * *"));
+        assert!(out.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_schedule_list_empty() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_schedule_list(Some(&handle), Some("aaa"))
+            .await
+            .unwrap();
+        assert_eq!(out, "No scheduled tasks.");
+    }
+
+    #[tokio::test]
+    async fn test_schedule_delete_routes_to_cron_cancel() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let input = serde_json::json!({ "id": "abc-123" });
+        let out = tool_schedule_delete(&input, Some(&handle)).await.unwrap();
+        assert!(out.contains("abc-123"));
+        let cancelled = fake.cancelled.lock().unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0], "abc-123");
+    }
+
+    #[tokio::test]
+    async fn test_schedule_tools_require_kernel() {
+        // Without a kernel handle, the new tools must fail loudly rather than
+        // silently writing to the old shared-memory key.
+        let err = tool_schedule_create(
+            &serde_json::json!({"description": "x", "schedule": "every hour"}),
+            None,
+            Some("aaa"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_lowercase().contains("kernel"));
+
+        let err = tool_schedule_list(None, Some("aaa")).await.unwrap_err();
+        assert!(err.to_lowercase().contains("kernel"));
+
+        let err = tool_schedule_delete(&serde_json::json!({"id": "x"}), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_lowercase().contains("kernel"));
     }
 }

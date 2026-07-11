@@ -11,9 +11,9 @@ use crate::types::{
 use async_trait::async_trait;
 use futures::Stream;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -25,6 +25,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Telegram long-polling timeout (seconds) — sent as the `timeout` parameter to getUpdates.
 const LONG_POLL_TIMEOUT: u64 = 30;
+/// Bound startup control-plane calls so a flaky Local Bot API cannot block daemon boot forever.
+const STARTUP_API_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default Telegram Bot API base URL.
 const DEFAULT_API_URL: &str = "https://api.telegram.org";
@@ -44,9 +46,29 @@ pub struct TelegramAdapter {
     poll_interval: Duration,
     /// Base URL for Telegram Bot API (supports proxies/mirrors).
     api_base_url: String,
+    /// Maps Telegram forum topic `message_thread_id` to an agent name. When a
+    /// message arrives inside a configured topic, the inbound parser stamps
+    /// `target_agent` so the bridge dispatches to that agent instead of the
+    /// default. Empty map = default routing for every thread. Issue #780.
+    thread_routes: Arc<HashMap<i64, String>>,
     /// Bot username (without @), populated from `getMe` during `start()`.
     /// Used for @mention detection in group messages.
     bot_username: Arc<tokio::sync::RwLock<Option<String>>>,
+    /// `(chat_id, emoji)` pairs that Telegram has rejected with a terminal
+    /// `setMessageReaction` error for this bot instance. Checked before
+    /// issuing the API call so we don't keep retrying reactions that will
+    /// never succeed in that chat. Keyed by chat so that an emoji restricted
+    /// in one chat can still be attempted in another (`Chat.available_reactions`
+    /// can differ per chat and is settable by admins).
+    ///
+    /// Cached errors: `REACTION_INVALID` (emoji not in the free-reaction
+    /// allowlist, or not a valid reaction at all) and `REACTION_NOT_AVAILABLE`
+    /// (chat admin restricted this emoji). Transient errors (429, 5xx,
+    /// `REACTION_TOO_MANY` per-message rate-limit, unrelated 400s) are NOT
+    /// cached. Grows monotonically over process lifetime; cache resets on
+    /// restart, which is fine because admins can change allowed reactions at
+    /// any time.
+    rejected_reactions: Arc<Mutex<HashSet<(i64, String)>>>,
     shutdown_tx: Arc<watch::Sender<bool>>,
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -63,6 +85,19 @@ impl TelegramAdapter {
         poll_interval: Duration,
         api_url: Option<String>,
     ) -> Self {
+        Self::with_thread_routes(token, allowed_users, poll_interval, api_url, HashMap::new())
+    }
+
+    /// Same as [`new`] but accepts a `thread_routes` map for forum-topic
+    /// routing (issue #780). Keys are Telegram `message_thread_id` values,
+    /// values are agent names to dispatch matching messages to.
+    pub fn with_thread_routes(
+        token: String,
+        allowed_users: Vec<String>,
+        poll_interval: Duration,
+        api_url: Option<String>,
+        thread_routes: HashMap<i64, String>,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let api_base_url = api_url
             .unwrap_or_else(|| DEFAULT_API_URL.to_string())
@@ -74,7 +109,9 @@ impl TelegramAdapter {
             allowed_users,
             poll_interval,
             api_base_url,
+            thread_routes: Arc::new(thread_routes),
             bot_username: Arc::new(tokio::sync::RwLock::new(None)),
+            rejected_reactions: Arc::new(Mutex::new(HashSet::new())),
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
         }
@@ -120,6 +157,7 @@ impl TelegramAdapter {
         let resp: serde_json::Value = self
             .client
             .post(&url)
+            .timeout(STARTUP_API_TIMEOUT)
             .json(&serde_json::json!({ "commands": commands }))
             .send()
             .await?
@@ -155,8 +193,20 @@ impl TelegramAdapter {
         // Any other tag (e.g. <name>, <thinking>) causes a 400 Bad Request.
         let sanitized = sanitize_telegram_html(text);
 
-        // Telegram has a 4096 character limit per message — split if needed
+        // Telegram has a 4096 character limit per message — split if needed.
+        //
+        // Error semantics for multi-chunk sends match the convention used by
+        // sibling adapters that also call `split_message` (Discord, Gitter,
+        // Mattermost, Nextcloud, Twitch, Pumble): fail loudly if NOTHING was
+        // delivered (first-chunk failure → return Err so the caller knows), but
+        // treat a mid-stream failure as best-effort — warn and continue — so the
+        // user isn't told "send failed" after they've already received
+        // preceding chunks. The motivating bug (HTML parse errors) is always a
+        // first-chunk failure anyway (sanitization/parse_mode applies to the
+        // whole text), so this keeps the fix effective while avoiding a
+        // partial-delivery-then-error regression.
         let chunks = split_message(&sanitized, 4096);
+        let mut delivered_any = false;
         for chunk in chunks {
             let mut body = serde_json::json!({
                 "chat_id": chat_id,
@@ -172,7 +222,15 @@ impl TelegramAdapter {
             if !status.is_success() {
                 let body_text = resp.text().await.unwrap_or_default();
                 warn!("Telegram sendMessage failed ({status}): {body_text}");
+                if !delivered_any {
+                    return Err(
+                        format!("Telegram sendMessage failed ({status}): {body_text}").into(),
+                    );
+                }
+                // Partial delivery already happened; continue on best-effort.
+                continue;
             }
+            delivered_any = true;
         }
         Ok(())
     }
@@ -198,9 +256,11 @@ impl TelegramAdapter {
             body["message_thread_id"] = serde_json::json!(tid);
         }
         let resp = self.client.post(&url).json(&body).send().await?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("Telegram sendPhoto failed: {body_text}");
+            warn!("Telegram sendPhoto failed ({status}): {body_text}");
+            return Err(format!("Telegram sendPhoto failed ({status}): {body_text}").into());
         }
         Ok(())
     }
@@ -227,9 +287,11 @@ impl TelegramAdapter {
             body["message_thread_id"] = serde_json::json!(tid);
         }
         let resp = self.client.post(&url).json(&body).send().await?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("Telegram sendDocument failed: {body_text}");
+            warn!("Telegram sendDocument failed ({status}): {body_text}");
+            return Err(format!("Telegram sendDocument failed ({status}): {body_text}").into());
         }
         Ok(())
     }
@@ -265,9 +327,13 @@ impl TelegramAdapter {
         }
 
         let resp = self.client.post(&url).multipart(form).send().await?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("Telegram sendDocument upload failed: {body_text}");
+            warn!("Telegram sendDocument upload failed ({status}): {body_text}");
+            return Err(
+                format!("Telegram sendDocument upload failed ({status}): {body_text}").into(),
+            );
         }
         Ok(())
     }
@@ -288,9 +354,11 @@ impl TelegramAdapter {
             body["message_thread_id"] = serde_json::json!(tid);
         }
         let resp = self.client.post(&url).json(&body).send().await?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("Telegram sendVoice failed: {body_text}");
+            warn!("Telegram sendVoice failed ({status}): {body_text}");
+            return Err(format!("Telegram sendVoice failed ({status}): {body_text}").into());
         }
         Ok(())
     }
@@ -317,9 +385,11 @@ impl TelegramAdapter {
             body["message_thread_id"] = serde_json::json!(tid);
         }
         let resp = self.client.post(&url).json(&body).send().await?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            warn!("Telegram sendLocation failed: {body_text}");
+            warn!("Telegram sendLocation failed ({status}): {body_text}");
+            return Err(format!("Telegram sendLocation failed ({status}): {body_text}").into());
         }
         Ok(())
     }
@@ -353,7 +423,27 @@ impl TelegramAdapter {
     /// Sets or replaces the bot's emoji reaction on a message. Each new call
     /// automatically replaces the previous reaction, so there is no need to
     /// explicitly remove old ones.
+    ///
+    /// Telegram restricts non-premium bots to a free-reaction allowlist, and
+    /// chat admins can further restrict allowed reactions per chat via
+    /// `Chat.available_reactions`. Terminal errors
+    /// (`REACTION_INVALID`, `REACTION_NOT_AVAILABLE`) are cached per
+    /// `(chat_id, emoji)` so we don't keep calling the API with reactions
+    /// that will never succeed in that chat. `REACTION_TOO_MANY` is a
+    /// transient per-message rate-limit and is NOT cached. Because two
+    /// concurrent `fire_reaction` calls for the same `(chat_id, emoji)` can
+    /// both pass the cache check before either rejection lands, the first
+    /// rejection may produce up to N duplicate API calls where N is the
+    /// concurrency — this is benign (insert is idempotent) and self-limits
+    /// on the second turn.
     fn fire_reaction(&self, chat_id: i64, message_id: i64, emoji: &str) {
+        // Short-circuit: (chat_id, emoji) previously rejected for this bot.
+        if let Ok(rejected) = self.rejected_reactions.lock() {
+            if rejected.contains(&(chat_id, emoji.to_string())) {
+                return;
+            }
+        }
+
         let url = format!(
             "{}/bot{}/setMessageReaction",
             self.api_base_url,
@@ -365,11 +455,23 @@ impl TelegramAdapter {
             "reaction": [{"type": "emoji", "emoji": emoji}],
         });
         let client = self.client.clone();
+        let rejected_cache = self.rejected_reactions.clone();
+        let emoji = emoji.to_string();
         tokio::spawn(async move {
             match client.post(&url).json(&body).send().await {
                 Ok(resp) if !resp.status().is_success() => {
                     let body_text = resp.text().await.unwrap_or_default();
                     debug!("Telegram setMessageReaction failed: {body_text}");
+                    if is_terminal_reaction_error(&body_text) {
+                        if let Ok(mut rejected) = rejected_cache.lock() {
+                            if rejected.insert((chat_id, emoji.clone())) {
+                                debug!(
+                                    "Telegram: caching rejected reaction (chat={chat_id}, emoji={emoji:?}); \
+                                     further setMessageReaction calls with this pair will be skipped"
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     debug!("Telegram setMessageReaction error: {e}");
@@ -378,6 +480,16 @@ impl TelegramAdapter {
             }
         });
     }
+}
+
+/// Terminal errors for `setMessageReaction` — retrying with the same
+/// `(chat, emoji)` pair will not succeed without an outside change (chat
+/// admin updating `Chat.available_reactions`, bot getting Premium, etc.).
+/// Callers cache these and stop retrying. Transient errors (429, 5xx,
+/// `RETRY_AFTER`, `REACTION_TOO_MANY` per-message rate-limit, unrelated
+/// 400s like `MESSAGE_NOT_MODIFIED`) are NOT included here.
+fn is_terminal_reaction_error(body_text: &str) -> bool {
+    body_text.contains("REACTION_INVALID") || body_text.contains("REACTION_NOT_AVAILABLE")
 }
 
 impl TelegramAdapter {
@@ -405,7 +517,7 @@ impl TelegramAdapter {
                 self.api_send_photo(chat_id, &url, caption.as_deref(), thread_id)
                     .await?;
             }
-            ChannelContent::File { url, filename } => {
+            ChannelContent::File { url, filename, .. } => {
                 self.api_send_document(chat_id, &url, &filename, thread_id)
                     .await?;
             }
@@ -427,6 +539,17 @@ impl TelegramAdapter {
                 let text = format!("/{name} {}", args.join(" "));
                 self.api_send_message(chat_id, text.trim(), thread_id)
                     .await?;
+            }
+            ChannelContent::Multipart(parts) => {
+                // Send each child as its own Telegram message. Nested
+                // Multipart is rejected by adapters; flatten defensively.
+                for part in parts {
+                    if let ChannelContent::Multipart(_) = part {
+                        debug_assert!(false, "nested Multipart in send_to_user");
+                        continue;
+                    }
+                    Box::pin(self.send_content(user, part, thread_id)).await?;
+                }
             }
         }
         Ok(())
@@ -468,6 +591,7 @@ impl ChannelAdapter for TelegramAdapter {
                 .client
                 .post(&delete_url)
                 .json(&serde_json::json!({"drop_pending_updates": true}))
+                .timeout(STARTUP_API_TIMEOUT)
                 .send()
                 .await
             {
@@ -492,6 +616,7 @@ impl ChannelAdapter for TelegramAdapter {
         let poll_interval = self.poll_interval;
         let api_base_url = self.api_base_url.clone();
         let bot_username = self.bot_username.clone();
+        let thread_routes = self.thread_routes.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
         tokio::spawn(async move {
@@ -612,6 +737,7 @@ impl ChannelAdapter for TelegramAdapter {
                         &client,
                         &api_base_url,
                         bot_uname.as_deref(),
+                        &thread_routes,
                     )
                     .await
                     {
@@ -721,6 +847,7 @@ async fn parse_telegram_update(
     client: &reqwest::Client,
     api_base_url: &str,
     bot_username: Option<&str>,
+    thread_routes: &HashMap<i64, String>,
 ) -> Option<ChannelMessage> {
     let update_id = update["update_id"].as_i64().unwrap_or(0);
     let message = match update
@@ -840,7 +967,12 @@ async fn parse_telegram_update(
             .unwrap_or("document")
             .to_string();
         match telegram_get_file_url(token, client, file_id, api_base_url).await {
-            Some(url) => ChannelContent::File { url, filename },
+            Some(url) => ChannelContent::File {
+                url,
+                filename,
+                mime: None,
+                size: None,
+            },
             None => ChannelContent::Text(format!("[Document received: {filename}]")),
         }
     } else if message.get("voice").is_some() {
@@ -898,12 +1030,28 @@ async fn parse_telegram_update(
 
     // Extract forum topic thread_id (Telegram sends this as `message_thread_id`
     // for messages inside forum topics / reply threads).
-    let thread_id = message["message_thread_id"]
-        .as_i64()
-        .map(|tid| tid.to_string());
+    let thread_id_raw = message["message_thread_id"].as_i64();
+    let thread_id = thread_id_raw.map(|tid| tid.to_string());
+
+    // Forum topic routing (issue #780). If the message lives inside a
+    // configured topic, stash the target agent name in metadata under
+    // `target_agent_name` so the bridge dispatcher prefers it over the
+    // channel default. Topics with no entry leave metadata untouched and
+    // fall through to the adapter's default_agent.
+    let target_agent_name = thread_id_raw.and_then(|tid| thread_routes.get(&tid).cloned());
 
     // Detect @mention of the bot in entities / caption_entities for MentionOnly group policy.
     let mut metadata = HashMap::new();
+
+    // Always expose the Telegram numeric user_id in metadata. Display names are not
+    // unique and can change, so agents that need stable per-user keys (RBAC, per-user
+    // workspaces, deterministic routing) must rely on this id. The id originates from
+    // `message.from.id` for normal users or `message.sender_chat.id` for messages sent
+    // on behalf of a channel/group. See issue #915.
+    metadata.insert(
+        "telegram_user_id".to_string(),
+        serde_json::json!(user_id_str),
+    );
 
     // Store reply_to_message_id in metadata for downstream consumers.
     if let Some(reply_msg) = message.get("reply_to_message") {
@@ -921,6 +1069,16 @@ async fn parse_telegram_update(
                 metadata.insert("was_mentioned".to_string(), serde_json::json!(true));
             }
         }
+    }
+
+    // Stash the forum-topic route target so the bridge can dispatch to a
+    // specific agent for this topic. The bridge resolves the name via
+    // `find_agent_by_name` before the standard router fallback.
+    if let Some(name) = target_agent_name {
+        metadata.insert(
+            "target_agent_name".to_string(),
+            serde_json::Value::String(name),
+        );
     }
 
     Some(ChannelMessage {
@@ -1076,13 +1234,114 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.channel, ChannelType::Telegram);
         assert_eq!(msg.sender.display_name, "Alice Smith");
         assert_eq!(msg.sender.platform_id, "111222333");
         assert!(matches!(msg.content, ChannelContent::Text(ref t) if t == "Hello, agent!"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_injects_telegram_user_id_metadata() {
+        // Issue #915 — agents need a stable per-user identifier. The numeric
+        // Telegram user_id from `message.from.id` must land in metadata as a
+        // string so downstream consumers (bridge prompt builder, tools, etc.)
+        // can key per-user state on it.
+        let update = serde_json::json!({
+            "update_id": 555,
+            "message": {
+                "message_id": 1,
+                "from": {
+                    "id": 554772934_i64,
+                    "first_name": "Alena"
+                },
+                "chat": {
+                    "id": -1009876543210_i64,
+                    "type": "group"
+                },
+                "date": 1700000000,
+                "text": "Hello"
+            }
+        });
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        // The chat_id (used for replies) stays on sender.platform_id.
+        assert_eq!(msg.sender.platform_id, "-1009876543210");
+        assert_eq!(msg.sender.display_name, "Alena");
+
+        // The numeric Telegram user_id is exposed in metadata as a string.
+        let tg_id = msg
+            .metadata
+            .get("telegram_user_id")
+            .and_then(|v| v.as_str())
+            .expect("telegram_user_id should be present in metadata");
+        assert_eq!(tg_id, "554772934");
+    }
+
+    #[tokio::test]
+    async fn test_parse_sender_chat_user_id_metadata() {
+        // When a message arrives via `sender_chat` (channel/group posting on
+        // its own behalf), the chat id is what we have — surface it under
+        // `telegram_user_id` so the metadata key is always present.
+        let update = serde_json::json!({
+            "update_id": 556,
+            "message": {
+                "message_id": 2,
+                "sender_chat": {
+                    "id": -1001234567890_i64,
+                    "type": "channel",
+                    "title": "My Channel"
+                },
+                "chat": {
+                    "id": -1001234567890_i64,
+                    "type": "channel"
+                },
+                "date": 1700000001,
+                "text": "Broadcast"
+            }
+        });
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let tg_id = msg
+            .metadata
+            .get("telegram_user_id")
+            .and_then(|v| v.as_str())
+            .expect("telegram_user_id should be present in metadata");
+        assert_eq!(tg_id, "-1001234567890");
     }
 
     #[tokio::test]
@@ -1110,9 +1369,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -1144,8 +1411,16 @@ mod tests {
         let client = test_client();
 
         // Empty allowed_users = allow all
-        let msg =
-            parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None).await;
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await;
         assert!(msg.is_some());
 
         // Non-matching allowed_users = filter out
@@ -1157,6 +1432,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             None,
+            &HashMap::new(),
         )
         .await;
         assert!(msg.is_none());
@@ -1170,6 +1446,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             None,
+            &HashMap::new(),
         )
         .await;
         assert!(msg.is_some());
@@ -1197,9 +1474,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.channel, ChannelType::Telegram);
         assert_eq!(msg.sender.display_name, "Alice Smith");
         assert!(matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message!"));
@@ -1235,9 +1520,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agents");
@@ -1261,9 +1554,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(msg.content, ChannelContent::Location { .. }));
     }
 
@@ -1287,9 +1588,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         // With a fake token, getFile will fail, so we get a text fallback
         match &msg.content {
             ChannelContent::Text(t) => {
@@ -1324,9 +1633,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.contains("Document received"));
@@ -1357,9 +1674,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.contains("Voice message"));
@@ -1390,9 +1715,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.thread_id, Some("42".to_string()));
         assert!(msg.is_group);
     }
@@ -1412,9 +1745,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.thread_id, None);
         assert!(!msg.is_group);
     }
@@ -1436,10 +1777,191 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.thread_id, Some("99".to_string()));
+    }
+
+    // ---- Issue #780: forum topic -> agent routing ----
+
+    fn forum_topic_update(thread_id: i64, update_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": 1000 + update_id,
+                "message_thread_id": thread_id,
+                "from": { "id": 555, "first_name": "Operator" },
+                "chat": { "id": -1009998887776_i64, "type": "supergroup" },
+                "date": 1700000000,
+                "text": "scoped message"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_thread_routes_dispatch_matching_topic_to_named_agent() {
+        // A message inside a configured forum topic must route to that agent
+        // via `target_agent`, overriding the channel default.
+        let update = forum_topic_update(42, 1);
+        let mut routes = HashMap::new();
+        routes.insert(42_i64, "support-agent".to_string());
+        routes.insert(99_i64, "ops-agent".to_string());
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.thread_id, Some("42".to_string()));
+        assert_eq!(
+            msg.metadata
+                .get("target_agent_name")
+                .and_then(|v| v.as_str()),
+            Some("support-agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thread_routes_unconfigured_topic_falls_through() {
+        // A thread id NOT in the route map must leave target_agent = None so
+        // the bridge applies the channel default_agent.
+        let update = forum_topic_update(7, 2);
+        let mut routes = HashMap::new();
+        routes.insert(42_i64, "support-agent".to_string());
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.thread_id, Some("7".to_string()));
+        assert!(!msg.metadata.contains_key("target_agent_name"));
+    }
+
+    #[tokio::test]
+    async fn test_thread_routes_ignored_for_non_topic_message() {
+        // Messages with no message_thread_id (regular group / DM) must never
+        // be matched against thread_routes, even if the map is non-empty.
+        let update = serde_json::json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 1003,
+                "from": { "id": 555, "first_name": "Operator" },
+                "chat": { "id": -1009998887776_i64, "type": "supergroup" },
+                "date": 1700000000,
+                "text": "general group message"
+            }
+        });
+        let mut routes = HashMap::new();
+        routes.insert(42_i64, "support-agent".to_string());
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.thread_id, None);
+        assert!(!msg.metadata.contains_key("target_agent_name"));
+    }
+
+    #[tokio::test]
+    async fn test_thread_routes_multiple_topics_route_independently() {
+        // Two different topics in the same chat must dispatch to two different
+        // agents.
+        let mut routes = HashMap::new();
+        routes.insert(10_i64, "alpha".to_string());
+        routes.insert(20_i64, "beta".to_string());
+
+        let client = test_client();
+
+        let update_alpha = forum_topic_update(10, 4);
+        let msg_alpha = parse_telegram_update(
+            &update_alpha,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            msg_alpha
+                .metadata
+                .get("target_agent_name")
+                .and_then(|v| v.as_str()),
+            Some("alpha")
+        );
+
+        let update_beta = forum_topic_update(20, 5);
+        let msg_beta = parse_telegram_update(
+            &update_beta,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            msg_beta
+                .metadata
+                .get("target_agent_name")
+                .and_then(|v| v.as_str()),
+            Some("beta")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adapter_with_thread_routes_constructor_stores_map() {
+        // Sanity check that the new constructor wires the route map onto the
+        // adapter so the spawned polling task sees it.
+        let mut routes = HashMap::new();
+        routes.insert(1_i64, "first".to_string());
+        let adapter = TelegramAdapter::with_thread_routes(
+            "test:token".to_string(),
+            vec![],
+            Duration::from_millis(10),
+            Some("https://example.test".to_string()),
+            routes.clone(),
+        );
+        assert_eq!(adapter.thread_routes.as_ref(), &routes);
     }
 
     #[tokio::test]
@@ -1461,9 +1983,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.sender.display_name, "My Channel");
         assert_eq!(msg.sender.platform_id, "-1001234567890");
         assert!(
@@ -1485,8 +2015,16 @@ mod tests {
         });
 
         let client = test_client();
-        let msg =
-            parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None).await;
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await;
         assert!(msg.is_none());
     }
 
@@ -1517,6 +2055,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1549,6 +2088,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1583,6 +2123,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1620,6 +2161,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1657,6 +2199,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1693,6 +2236,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1746,9 +2290,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.starts_with("[Replying to Bob: We should use Rust]\n\n"));
@@ -1788,9 +2340,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.starts_with("[Replying to Carol: Sunset view]\n\n"));
@@ -1829,9 +2389,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert_eq!(t, "What was that?");
@@ -1867,9 +2435,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.starts_with("[Replying to Unknown: Anonymous message]\n\n"));
@@ -1894,9 +2470,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert_eq!(t, "Just a normal message");
@@ -1904,5 +2488,356 @@ mod tests {
             other => panic!("Expected Text, got {other:?}"),
         }
         assert!(!msg.metadata.contains_key("reply_to_message_id"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stub Telegram Bot API server for send-path and reaction-cache tests.
+    //
+    // Binds an axum app to an ephemeral port, returns a base URL that the
+    // `TelegramAdapter` can be pointed at via the `api_url` constructor
+    // parameter, and records per-call response fixtures + hit count.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct StubServer {
+        hits: AtomicUsize,
+        responses: std::sync::Mutex<Vec<(u16, String)>>,
+    }
+
+    impl StubServer {
+        fn new(responses: Vec<(u16, &str)>) -> Arc<Self> {
+            Arc::new(Self {
+                hits: AtomicUsize::new(0),
+                responses: std::sync::Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|(s, b)| (s, b.to_string()))
+                        .collect(),
+                ),
+            })
+        }
+
+        fn hit_count(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn spawn_stub_server(stub: Arc<StubServer>) -> String {
+        use axum::{http::StatusCode, routing::any, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub_for_handler = stub.clone();
+        let app = Router::new().fallback(any(move || {
+            let stub = stub_for_handler.clone();
+            async move {
+                let i = stub.hits.fetch_add(1, Ordering::SeqCst);
+                let responses = stub.responses.lock().unwrap();
+                if i < responses.len() {
+                    let (status, body) = responses[i].clone();
+                    (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        body,
+                    )
+                } else {
+                    (StatusCode::OK, r#"{"ok":true,"result":true}"#.to_string())
+                }
+            }
+        }));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    /// Build an adapter pointed at a stub server, bypassing `start()` (which
+    /// would call `getMe` / `setMyCommands` against the real API).
+    fn test_adapter(api_url: String) -> TelegramAdapter {
+        TelegramAdapter::new(
+            "test:token".to_string(),
+            vec![],
+            Duration::from_millis(10),
+            Some(api_url),
+        )
+    }
+
+    async fn wait_for<F>(mut cond: F, timeout_ms: u64) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    // -----------------------------------------------------------------------
+    // send-path error propagation (api_send_message)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_api_send_message_single_chunk_400_returns_err() {
+        let stub = StubServer::new(vec![(
+            400,
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}"#,
+        )]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        let result = adapter.api_send_message(12345, "hello", None).await;
+
+        assert!(result.is_err(), "expected Err on single-chunk 400");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("400"), "err should include status: {err}");
+        assert!(
+            err.contains("can't parse entities"),
+            "err should include body: {err}"
+        );
+        assert_eq!(stub.hit_count(), 1, "expected exactly one POST");
+    }
+
+    #[tokio::test]
+    async fn test_api_send_message_single_chunk_200_returns_ok() {
+        let stub = StubServer::new(vec![(200, r#"{"ok":true,"result":{}}"#)]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        let result = adapter.api_send_message(12345, "hello", None).await;
+
+        assert!(result.is_ok(), "expected Ok on 200: {result:?}");
+        assert_eq!(stub.hit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_api_send_message_first_chunk_fail_returns_err() {
+        // Two-chunk message; first POST fails. Nothing delivered → Err.
+        let big = "a".repeat(5000); // > 4096 → split into two chunks
+        let stub = StubServer::new(vec![
+            (
+                500,
+                r#"{"ok":false,"error_code":500,"description":"server"}"#,
+            ),
+            (200, r#"{"ok":true,"result":{}}"#),
+        ]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        let result = adapter.api_send_message(12345, &big, None).await;
+
+        assert!(
+            result.is_err(),
+            "first-chunk failure must return Err, got Ok"
+        );
+        // Must have stopped after the failing first chunk — no partial send.
+        assert_eq!(
+            stub.hit_count(),
+            1,
+            "expected adapter to abort after first-chunk failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_send_message_partial_delivery_returns_ok() {
+        // Two-chunk message; first POST succeeds (user sees chunk 1), second
+        // fails. Match sibling-adapter best-effort convention: warn + continue,
+        // return Ok so the agent isn't told total failure after partial success.
+        let big = "a".repeat(5000);
+        let stub = StubServer::new(vec![
+            (200, r#"{"ok":true,"result":{}}"#),
+            (
+                400,
+                r#"{"ok":false,"error_code":400,"description":"some err"}"#,
+            ),
+        ]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        let result = adapter.api_send_message(12345, &big, None).await;
+
+        assert!(
+            result.is_ok(),
+            "partial delivery must return Ok (best-effort), got {result:?}"
+        );
+        assert_eq!(
+            stub.hit_count(),
+            2,
+            "both chunks should have been attempted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reaction cache (fire_reaction + is_terminal_reaction_error)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_terminal_reaction_error_matches() {
+        assert!(is_terminal_reaction_error(
+            r#"{"ok":false,"description":"Bad Request: REACTION_INVALID"}"#
+        ));
+        assert!(is_terminal_reaction_error(
+            r#"{"description":"Bad Request: REACTION_NOT_AVAILABLE"}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_terminal_reaction_error_rejects_transient() {
+        // REACTION_TOO_MANY is a per-message rate-limit, not permanent.
+        // Caching it would suppress valid future reactions on that emoji
+        // for the lifetime of the process — see issue #1133.
+        assert!(!is_terminal_reaction_error(
+            r#"{"description":"Bad Request: REACTION_TOO_MANY"}"#
+        ));
+        assert!(!is_terminal_reaction_error(
+            r#"{"description":"Too Many Requests: retry after 5"}"#
+        ));
+        assert!(!is_terminal_reaction_error(
+            r#"{"description":"Bad Request: MESSAGE_NOT_MODIFIED"}"#
+        ));
+        assert!(!is_terminal_reaction_error(r#"{"ok":true}"#));
+        assert!(!is_terminal_reaction_error(""));
+    }
+
+    #[tokio::test]
+    async fn test_fire_reaction_does_not_cache_reaction_too_many() {
+        // Regression test for #1133: REACTION_TOO_MANY is a transient
+        // per-message rate-limit and must NOT be cached as a permanent
+        // rejection. Caching it would suppress valid future reactions on
+        // that (chat_id, emoji) pair for the lifetime of the process.
+        let stub = StubServer::new(vec![(
+            400,
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: REACTION_TOO_MANY"}"#,
+        )]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        adapter.fire_reaction(999, 1, "⏳");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(stub.hit_count(), 1);
+
+        let cached = adapter
+            .rejected_reactions
+            .lock()
+            .map(|s| s.contains(&(999_i64, "⏳".to_string())))
+            .unwrap_or(true);
+        assert!(
+            !cached,
+            "REACTION_TOO_MANY is transient and must NOT populate the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fire_reaction_caches_on_reaction_invalid() {
+        let stub = StubServer::new(vec![(
+            400,
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: REACTION_INVALID"}"#,
+        )]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        adapter.fire_reaction(999, 1, "⏳");
+
+        let cached = wait_for(
+            || {
+                adapter
+                    .rejected_reactions
+                    .lock()
+                    .map(|s| s.contains(&(999_i64, "⏳".to_string())))
+                    .unwrap_or(false)
+            },
+            1000,
+        )
+        .await;
+        assert!(cached, "emoji should be cached after REACTION_INVALID");
+        assert_eq!(stub.hit_count(), 1);
+
+        // Second call with same (chat, emoji) must short-circuit.
+        adapter.fire_reaction(999, 2, "⏳");
+        // Give any rogue task time to fire.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            stub.hit_count(),
+            1,
+            "short-circuit should have prevented second POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fire_reaction_cache_is_per_chat() {
+        // Same emoji rejected in chat A should NOT short-circuit in chat B.
+        let stub = StubServer::new(vec![
+            (
+                400,
+                r#"{"ok":false,"error_code":400,"description":"Bad Request: REACTION_INVALID"}"#,
+            ),
+            (200, r#"{"ok":true,"result":true}"#),
+        ]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        adapter.fire_reaction(111, 1, "⏳");
+        wait_for(
+            || {
+                adapter
+                    .rejected_reactions
+                    .lock()
+                    .map(|s| s.contains(&(111_i64, "⏳".to_string())))
+                    .unwrap_or(false)
+            },
+            1000,
+        )
+        .await;
+        assert_eq!(stub.hit_count(), 1);
+
+        adapter.fire_reaction(222, 1, "⏳");
+        wait_for(|| stub.hit_count() >= 2, 1000).await;
+        assert_eq!(
+            stub.hit_count(),
+            2,
+            "different chat_id must still fire even when same emoji was cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fire_reaction_does_not_cache_non_terminal() {
+        let stub = StubServer::new(vec![(
+            400,
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: MESSAGE_NOT_MODIFIED"}"#,
+        )]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        adapter.fire_reaction(999, 1, "⏳");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(stub.hit_count(), 1);
+
+        let cached = adapter
+            .rejected_reactions
+            .lock()
+            .map(|s| s.contains(&(999_i64, "⏳".to_string())))
+            .unwrap_or(true);
+        assert!(!cached, "non-terminal 400 must NOT populate the cache");
+    }
+
+    #[tokio::test]
+    async fn test_fire_reaction_does_not_cache_on_success() {
+        let stub = StubServer::new(vec![(200, r#"{"ok":true,"result":true}"#)]);
+        let base = spawn_stub_server(stub.clone()).await;
+        let adapter = test_adapter(base);
+
+        adapter.fire_reaction(999, 1, "🤔");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(stub.hit_count(), 1);
+
+        let cached = adapter
+            .rejected_reactions
+            .lock()
+            .map(|s| s.contains(&(999_i64, "🤔".to_string())))
+            .unwrap_or(true);
+        assert!(!cached, "successful reaction must NOT populate the cache");
     }
 }

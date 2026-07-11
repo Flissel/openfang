@@ -1,6 +1,7 @@
 //! Skill registry — tracks installed skills and their tools.
 
 use crate::bundled;
+use crate::config_injection::{render_config_block, resolve_skill_config, SkillConfigVar};
 use crate::openclaw_compat;
 use crate::verify::SkillVerifier;
 use crate::{InstalledSkill, SkillError, SkillManifest, SkillToolDef};
@@ -19,6 +20,10 @@ pub struct SkillRegistry {
     frozen: bool,
     /// Number of workspace skills blocked for critical prompt injection.
     blocked_skills_count: usize,
+    /// User-supplied config values per skill name (from `[skills.<name>]` in
+    /// `~/.openfang/config.toml`). Used by the loader to resolve declared
+    /// `config:` vars before injecting prompt context.
+    skill_configs: HashMap<String, HashMap<String, String>>,
 }
 
 impl SkillRegistry {
@@ -29,7 +34,18 @@ impl SkillRegistry {
             skills_dir,
             frozen: false,
             blocked_skills_count: 0,
+            skill_configs: HashMap::new(),
         }
+    }
+
+    /// Install the user-supplied per-skill config map.
+    ///
+    /// Keys are skill names; values are `key → value` pairs that the loader
+    /// will pass to [`resolve_skill_config`] when a skill declares a `config:`
+    /// section in its SKILL.md frontmatter. Must be set before `load_all()` /
+    /// `load_bundled()` / `load_workspace_skills()` for it to take effect.
+    pub fn set_skill_configs(&mut self, configs: HashMap<String, HashMap<String, String>>) {
+        self.skill_configs = configs;
     }
 
     /// Create a cheap owned snapshot of this registry.
@@ -42,6 +58,7 @@ impl SkillRegistry {
             skills_dir: self.skills_dir.clone(),
             frozen: self.frozen,
             blocked_skills_count: self.blocked_skills_count,
+            skill_configs: self.skill_configs.clone(),
         }
     }
 
@@ -62,6 +79,44 @@ impl SkillRegistry {
         self.blocked_skills_count
     }
 
+    /// Apply a skill's declared config frontmatter to its prompt body.
+    ///
+    /// If `config_vars` is empty this is a no-op. Otherwise the vars are
+    /// resolved via the user-supplied config, env, and defaults, and the
+    /// rendered (secret-redacted) block is appended to the manifest's
+    /// `prompt_context`. Returns a hard error when a `required` var resolves
+    /// to nothing, so the loader can refuse the skill instead of silently
+    /// registering a broken prompt.
+    fn apply_skill_config(
+        &self,
+        manifest: &mut SkillManifest,
+        config_vars: &HashMap<String, SkillConfigVar>,
+    ) -> Result<(), SkillError> {
+        if config_vars.is_empty() {
+            return Ok(());
+        }
+        let empty = HashMap::new();
+        let user_cfg = self
+            .skill_configs
+            .get(&manifest.skill.name)
+            .unwrap_or(&empty);
+        let resolved = resolve_skill_config(config_vars, user_cfg)?;
+        let block = render_config_block(&resolved);
+        if block.is_empty() {
+            return Ok(());
+        }
+        match manifest.prompt_context.as_mut() {
+            Some(existing) => {
+                existing.push_str("\n\n");
+                existing.push_str(&block);
+            }
+            None => {
+                manifest.prompt_context = Some(block);
+            }
+        }
+        Ok(())
+    }
+
     /// Load all bundled skills (compile-time embedded SKILL.md files).
     ///
     /// Called before `load_all()` so that user-installed skills with the same name
@@ -72,8 +127,20 @@ impl SkillRegistry {
         let mut count = 0;
 
         for (name, content) in &bundled {
-            match bundled::parse_bundled(name, content) {
-                Ok(manifest) => {
+            match bundled::parse_bundled_full(name, content) {
+                Ok(converted) => {
+                    let mut manifest = converted.manifest;
+
+                    // Inject resolved config block into the prompt if the
+                    // frontmatter declared a `config:` section.
+                    if let Err(e) = self.apply_skill_config(&mut manifest, &converted.config_vars) {
+                        warn!(
+                            skill = %manifest.skill.name,
+                            "Skipping bundled skill: config resolution failed: {e}"
+                        );
+                        continue;
+                    }
+
                     // Defense in depth: scan even bundled skill prompt content
                     if let Some(ref ctx) = manifest.prompt_context {
                         let warnings = SkillVerifier::scan_prompt_content(ctx);
@@ -213,7 +280,13 @@ impl SkillRegistry {
         }
         let manifest_path = skill_dir.join("skill.toml");
         let toml_str = std::fs::read_to_string(&manifest_path)?;
-        let manifest: SkillManifest = toml::from_str(&toml_str)?;
+        let mut manifest: SkillManifest = toml::from_str(&toml_str)?;
+
+        // Resolve + inject config block if the manifest declared `config:` vars.
+        // A hard error here propagates up — a broken/unresolvable required var
+        // must not produce a half-configured skill.
+        let vars = manifest.config.clone();
+        self.apply_skill_config(&mut manifest, &vars)?;
 
         let name = manifest.skill.name.clone();
 
@@ -636,7 +709,12 @@ input_schema = { type = "object" }
         registry.load_all().unwrap();
         assert_eq!(registry.count(), 1);
         assert_eq!(
-            registry.get("shared-skill").unwrap().manifest.skill.description,
+            registry
+                .get("shared-skill")
+                .unwrap()
+                .manifest
+                .skill
+                .description,
             "Global version"
         );
 
@@ -645,9 +723,18 @@ input_schema = { type = "object" }
         snapshot.load_workspace_skills(ws_dir.path()).unwrap();
 
         // The workspace version must override the global version
-        assert_eq!(snapshot.count(), 1, "Duplicate should be overwritten, not added");
         assert_eq!(
-            snapshot.get("shared-skill").unwrap().manifest.skill.description,
+            snapshot.count(),
+            1,
+            "Duplicate should be overwritten, not added"
+        );
+        assert_eq!(
+            snapshot
+                .get("shared-skill")
+                .unwrap()
+                .manifest
+                .skill
+                .description,
             "Workspace override version",
             "Workspace skill must override global skill (#808)"
         );
@@ -716,6 +803,63 @@ input_schema = { type = "object" }
             snapshot.get("beta").unwrap().manifest.skill.version,
             "0.1.0",
             "Global beta should remain unchanged"
+        );
+    }
+
+    /// #824: load_workspace_skills must return the count of workspace skills loaded,
+    /// even when a workspace skill overrides a global skill with the same HashMap key.
+    /// The old doctor code computed `total - bundled_count` which underreported when
+    /// an override didn't increase total_loaded.
+    #[test]
+    fn test_workspace_override_returns_correct_count() {
+        let global_dir = TempDir::new().unwrap();
+        let ws_dir = TempDir::new().unwrap();
+
+        // One global skill named "shared"
+        create_test_skill(global_dir.path(), "shared");
+
+        // Workspace skill with the SAME name — override
+        let ws_shared = ws_dir.path().join("shared");
+        std::fs::create_dir_all(&ws_shared).unwrap();
+        std::fs::write(
+            ws_shared.join("skill.toml"),
+            r#"
+[skill]
+name = "shared"
+version = "2.0.0"
+description = "Workspace override"
+
+[runtime]
+type = "python"
+entry = "main.py"
+
+[[tools.provided]]
+name = "shared_tool"
+description = "Workspace tool"
+input_schema = { type = "object" }
+"#,
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::new(global_dir.path().to_path_buf());
+        registry.load_all().unwrap();
+        assert_eq!(registry.count(), 1, "One global skill loaded");
+
+        let ws_count = registry.load_workspace_skills(ws_dir.path()).unwrap();
+
+        // The return value must be 1, NOT 0.
+        // Before the #824 fix, doctor computed total(1) - bundled(1) = 0.
+        assert_eq!(
+            ws_count, 1,
+            "load_workspace_skills must report 1 even when overriding a global skill (#824)"
+        );
+        // Total registry count stays 1 because the override replaced, not added
+        assert_eq!(registry.count(), 1);
+        // But the skill is the workspace version
+        assert_eq!(
+            registry.get("shared").unwrap().manifest.skill.version,
+            "2.0.0",
+            "Workspace version should be active"
         );
     }
 }

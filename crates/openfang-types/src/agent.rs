@@ -67,7 +67,7 @@ impl Default for ModelRoutingConfig {
 }
 
 /// Autonomous agent configuration — guardrails for 24/7 agents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AutonomousConfig {
     /// Cron expression for quiet hours (e.g., "0 22 * * *" to "0 6 * * *").
@@ -223,7 +223,7 @@ impl AgentMode {
 }
 
 /// How an agent is scheduled to run.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleMode {
     /// Agent wakes up when a message/event arrives (default).
@@ -245,7 +245,7 @@ fn default_check_interval() -> u64 {
 }
 
 /// Resource limits for an agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ResourceQuota {
     /// Maximum WASM memory in bytes.
@@ -474,11 +474,23 @@ pub struct AgentManifest {
     /// Pinned model override (used in Stable mode).
     #[serde(default)]
     pub pinned_model: Option<String>,
-    /// Agent workspace directory. Auto-created on spawn.
-    /// Default: `{workspaces_dir}/{agent_name}-{agent_id_prefix}/`
+    /// Agent workspace directory. User-facing working area for output, data,
+    /// skills, context.md, and uploads. When the user sets this in agent.toml
+    /// (e.g. `workspace = "/home/me/Documents"`) the runtime treats it as the
+    /// agent's working directory and will NOT scaffold private state files
+    /// there. Multiple agents can share the same workspace to collaborate on
+    /// files. See issue #1097.
+    /// Default: `{workspaces_dir}/{agent_name}/` (same as state_dir).
     #[serde(default)]
     pub workspace: Option<PathBuf>,
-    /// Whether to generate workspace identity files (SOUL.md, USER.md, etc.) on creation.
+    /// Agent private state directory. Stores identity files (SOUL.md, etc.),
+    /// AGENT.json, sessions/, and the daily memory log. Always lives under
+    /// `~/.openfang/workspaces/{name}/` regardless of where the user-facing
+    /// workspace points. Auto-derived on spawn. See issue #1097.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// Whether to generate identity files (SOUL.md, USER.md, etc.) in
+    /// `state_dir` on creation.
     #[serde(default = "default_true")]
     pub generate_identity_files: bool,
     /// Per-agent exec policy override. If None, uses global exec_policy.
@@ -491,6 +503,35 @@ pub struct AgentManifest {
     /// Tool blocklist — these tools are excluded (applied after allowlist).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub tool_blocklist: Vec<String>,
+    /// If true, the agent's `context.md` is read once at session start and
+    /// reused. Default is `false`: the runtime re-reads `context.md` before
+    /// every turn so external writers (cron jobs, integrations) reach the LLM
+    /// on the next message. See issue #843.
+    #[serde(default)]
+    pub cache_context: bool,
+    /// Per-agent override for the maximum number of in-context message turns
+    /// kept before the safety-valve trim kicks in. `None` falls back to the
+    /// runtime default (20). Primary/orchestrator agents typically want more
+    /// (e.g. 40); short-lived worker agents want less (e.g. 4-6) so their
+    /// `agent_send` results stay focused. See issue #871.
+    #[serde(default)]
+    pub max_history_messages: Option<usize>,
+}
+
+/// Runtime default for `AgentManifest::max_history_messages` when the agent
+/// does not specify an override. Kept in sync with `agent_loop::MAX_HISTORY_MESSAGES`.
+pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 20;
+
+impl AgentManifest {
+    /// Resolve the effective history cap: agent manifest override, falling
+    /// back to `DEFAULT_MAX_HISTORY_MESSAGES`. Values of `Some(0)` are treated
+    /// as the default to avoid an agent accidentally disabling history.
+    pub fn effective_max_history_messages(&self) -> usize {
+        match self.max_history_messages {
+            Some(n) if n > 0 => n,
+            _ => DEFAULT_MAX_HISTORY_MESSAGES,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -521,10 +562,13 @@ impl Default for AgentManifest {
             autonomous: None,
             pinned_model: None,
             workspace: None,
+            state_dir: None,
             generate_identity_files: true,
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            cache_context: false,
+            max_history_messages: None,
         }
     }
 }
@@ -778,10 +822,13 @@ mod tests {
             autonomous: None,
             pinned_model: None,
             workspace: None,
+            state_dir: None,
             generate_identity_files: true,
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            cache_context: false,
+            max_history_messages: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();
