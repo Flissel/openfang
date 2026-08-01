@@ -6,8 +6,8 @@ module = "builtin:chat"
 tags = ["writing", "content", "vibemind", "brain-routed"]
 
 [model]
-provider = "claude-code"
-model = "claude-code/sonnet"
+provider = "openai"
+model = "gpt-4o-mini"
 max_tokens = 8192
 temperature = 0.6
 system_prompt = """You are Brain-Writer, a VibeMind content creation agent routed by the Brain (Tahlamus) cognitive system.

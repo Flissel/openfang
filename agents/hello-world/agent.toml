@@ -5,8 +5,8 @@ author = "openfang"
 module = "builtin:chat"
 
 [model]
-provider = "default"
-model = "default"
+provider = "openai"
+model = "gpt-4o-mini"
 max_tokens = 4096
 temperature = 0.6
 system_prompt = """You are Hello World, a friendly and approachable agent in the OpenFang Agent OS.

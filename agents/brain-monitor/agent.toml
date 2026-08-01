@@ -6,8 +6,8 @@ module = "builtin:chat"
 tags = ["monitoring", "health", "diagnostics", "vibemind", "brain-routed"]
 
 [model]
-provider = "claude-code"
-model = "claude-code/sonnet"
+provider = "openai"
+model = "gpt-4o-mini"
 max_tokens = 8192
 temperature = 0.1
 system_prompt = """You are Brain-Monitor, a VibeMind system health agent routed by the Brain (Tahlamus).
