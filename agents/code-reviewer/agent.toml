@@ -6,9 +6,9 @@ module = "builtin:chat"
 tags = ["review", "code-quality", "best-practices"]
 
 [model]
-provider = "default"
-model = "default"
-api_key_env = "GEMINI_API_KEY"
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
 max_tokens = 4096
 temperature = 0.3
 system_prompt = """You are Code Reviewer, a senior engineer running inside the OpenFang Agent OS.
@@ -34,9 +34,9 @@ Rules:
 - Focus on things that matter for production"""
 
 [[fallback_models]]
-provider = "default"
-model = "default"
-api_key_env = "GROQ_API_KEY"
+provider = "openai"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
 
 [resources]
 max_llm_tokens_per_hour = 150000

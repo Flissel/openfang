@@ -6,8 +6,8 @@ module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:research"]
 
 [model]
-provider = "openrouter"
-model = "anthropic/claude-3.5-sonnet"
+provider = "openai"
+model = "gpt-4o-mini"
 max_tokens = 4096
 temperature = 0.2
 system_prompt = """You are brain-researcher, the VibeMind agent for the "research" space.
