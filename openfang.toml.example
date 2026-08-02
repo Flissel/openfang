@@ -17,6 +17,9 @@ api_key_env = "ANTHROPIC_API_KEY"         # Environment variable holding API key
 
 [memory]
 decay_rate = 0.05                         # Memory confidence decay rate
+embedding_provider = "openai"             # Use the fail-closed OpenAI embeddings driver
+embedding_model = "text-embedding-3-large" # Must match the /v1/embeddings model contract
+embedding_api_key_env = "OPENAI_API_KEY"  # Name only; keep the secret outside this file
 # sqlite_path = "~/.openfang/data/openfang.db"   # Optional: custom DB path
 
 [network]

@@ -4698,4 +4698,17 @@ shell_env_passthrough = ["*"]
         let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
         assert_eq!(policy.shell_env_passthrough, vec!["*"]);
     }
+
+    #[test]
+    fn example_config_pins_openai_embeddings_for_fail_closed_memory() {
+        let config: KernelConfig = toml::from_str(include_str!("../../../openfang.toml.example"))
+            .expect("example configuration must remain parseable");
+
+        assert_eq!(config.memory.embedding_provider.as_deref(), Some("openai"));
+        assert_eq!(config.memory.embedding_model, "text-embedding-3-large");
+        assert_eq!(
+            config.memory.embedding_api_key_env.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+    }
 }
