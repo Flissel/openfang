@@ -2,7 +2,7 @@
 
 use crate::types::*;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use dashmap::DashMap;
@@ -7010,12 +7010,62 @@ pub async fn a2a_external_task_status(
 
 // ── MCP HTTP Endpoint ───────────────────────────────────────────────────
 
+const MCP_CALLER_AGENT_ID_HEADER: &str = "x-openfang-agent-id";
+
+/// Resolve the agent authority selected by an authenticated MCP request.
+///
+/// The API router applies its global control-plane bearer/session credential
+/// middleware before this handler. That credential is the authority that
+/// permits selection of a registered execution identity; this header is not a
+/// credential by itself. The caller identity is intentionally read only from
+/// a transport header, never from untrusted JSON-RPC parameters. This keeps
+/// tool scope, approvals, and audit attribution inside the authenticated
+/// request boundary.
+fn resolve_mcp_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<openfang_types::agent::AgentEntry, serde_json::Value> {
+    let raw_agent_id = headers
+        .get(MCP_CALLER_AGENT_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            serde_json::json!({
+                "code": -32001,
+                "message": "MCP tool requests require an authenticated X-OpenFang-Agent-Id header"
+            })
+        })?;
+
+    let agent_id: AgentId = raw_agent_id.parse().map_err(|_| {
+        serde_json::json!({
+            "code": -32001,
+            "message": "X-OpenFang-Agent-Id must be a registered agent UUID"
+        })
+    })?;
+
+    state.kernel.registry.get(agent_id).ok_or_else(|| {
+        serde_json::json!({
+            "code": -32002,
+            "message": "MCP caller agent is not registered"
+        })
+    })
+}
+
+fn mcp_error(request: &serde_json::Value, error: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned(),
+        "error": error,
+    })
+}
+
 /// POST /mcp — Handle MCP JSON-RPC requests over HTTP.
 ///
 /// Exposes the same MCP protocol normally served via stdio, allowing
 /// external MCP clients to connect over HTTP instead.
 pub async fn mcp_http(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // Gather all available tools (builtin + skills + MCP)
@@ -7038,23 +7088,45 @@ pub async fn mcp_http(
         tools.extend(mcp_tools.iter().cloned());
     }
 
-    // Check if this is a tools/call that needs real execution
+    // Tools discovery and execution are both scoped to a registered caller.
+    // Protocol housekeeping (initialize and similar non-tool methods) remains
+    // available without an execution identity.
     let method = request["method"].as_str().unwrap_or("");
-    if method == "tools/call" {
+    if matches!(method, "tools/list" | "tools/call") {
+        let caller = match resolve_mcp_caller(&state, &headers) {
+            Ok(caller) => caller,
+            Err(error) => return Json(mcp_error(&request, error)),
+        };
+        let caller_tools = state.kernel.available_tools(caller.id);
+
+        if method == "tools/list" {
+            let response =
+                openfang_runtime::mcp_server::handle_mcp_request(&request, &caller_tools).await;
+            return Json(response);
+        }
+
         let tool_name = request["params"]["name"].as_str().unwrap_or("");
         let arguments = request["params"]
             .get("arguments")
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
-        // Verify the tool exists
-        if !tools.iter().any(|t| t.name == tool_name) {
-            return Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request.get("id").cloned(),
-                "error": {"code": -32602, "message": format!("Unknown tool: {tool_name}")}
-            }));
+        // Resolve the caller's effective tool set using the same capability,
+        // profile, MCP-server, allowlist, blocklist, and exec-policy filters
+        // as the agent runtime. A globally available tool is not executable
+        // unless this caller is entitled to it.
+        if !caller_tools.iter().any(|tool| tool.name == tool_name) {
+            return Json(mcp_error(
+                &request,
+                serde_json::json!({
+                    "code": -32602,
+                    "message": format!("Tool not permitted for caller agent: {tool_name}")
+                }),
+            ));
         }
+        let caller_tool_names: Vec<String> =
+            caller_tools.iter().map(|tool| tool.name.clone()).collect();
+        let caller_agent_id = caller.id.to_string();
 
         // Snapshot skill registry before async call (RwLockReadGuard is !Send)
         let skill_snapshot = state
@@ -7072,8 +7144,8 @@ pub async fn mcp_http(
             tool_name,
             &arguments,
             Some(&kernel_handle),
-            None,
-            None,
+            Some(&caller_tool_names),
+            Some(&caller_agent_id),
             Some(&skill_snapshot),
             Some(&state.kernel.mcp_connections),
             Some(&state.kernel.web_ctx),
@@ -7081,7 +7153,7 @@ pub async fn mcp_http(
             None,
             None,
             Some(&state.kernel.media_engine),
-            None, // exec_policy
+            caller.manifest.exec_policy.as_ref(),
             if state.kernel.config.tts.enabled {
                 Some(&state.kernel.tts_engine)
             } else {

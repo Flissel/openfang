@@ -89,6 +89,7 @@ async fn start_test_server_with_provider(
             "/v1/embeddings",
             axum::routing::post(openfang_api::openai_compat::embeddings),
         )
+        .route("/mcp", axum::routing::post(routes::mcp_http))
         .route(
             "/api/agents",
             axum::routing::get(routes::list_agents).post(routes::spawn_agent),
@@ -228,6 +229,153 @@ async fn test_embeddings_rejects_unconfigured_non_openai_provider() {
     let body: serde_json::Value = response.json().await.expect("error body should be JSON");
     assert_eq!(body["error"]["type"], "service_unavailable_error");
     assert_eq!(body["error"]["code"], "embedding_provider_not_configured");
+}
+
+/// MCP tool execution must not accept an agent identity from the JSON-RPC
+/// body. The caller identity is an authenticated transport concern and is
+/// required before the route reaches the tool runner.
+#[tokio::test]
+async fn test_mcp_tools_call_rejects_body_claimed_caller_without_bound_header() {
+    let server = start_test_server().await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/mcp", server.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "file_read",
+                "arguments": {"path": "ignored"},
+                "caller_agent_id": "00000000-0000-0000-0000-000000000000"
+            }
+        }))
+        .send()
+        .await
+        .expect("the local test server should respond");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("response is JSON");
+    assert_eq!(body["error"]["code"], -32001);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("X-OpenFang-Agent-Id"));
+}
+
+/// A client that has reached the MCP route still cannot claim an unregistered
+/// caller identity. The route must resolve the ID against the kernel registry.
+#[tokio::test]
+async fn test_mcp_tools_call_rejects_unknown_bound_caller() {
+    let server = start_test_server().await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/mcp", server.base_url))
+        .header(
+            "X-OpenFang-Agent-Id",
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "file_read", "arguments": {"path": "ignored"}}
+        }))
+        .send()
+        .await
+        .expect("the local test server should respond");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("response is JSON");
+    assert_eq!(body["error"]["code"], -32002);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not registered"));
+}
+
+/// A registered caller receives only the tool set resolved from its manifest;
+/// a globally-known tool outside that scope must fail closed.
+#[tokio::test]
+async fn test_mcp_tools_call_rejects_tool_outside_caller_scope() {
+    let server = start_test_server().await;
+    let caller_id = spawn_test_agent(&server).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/mcp", server.base_url))
+        .header("X-OpenFang-Agent-Id", caller_id)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "file_write", "arguments": {"path": "ignored", "content": "x"}}
+        }))
+        .send()
+        .await
+        .expect("the local test server should respond");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("response is JSON");
+    assert_eq!(body["error"]["code"], -32602);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not permitted"));
+}
+
+/// Tool discovery carries the same authority as execution: a client must not
+/// discover the global catalog merely by omitting the caller binding.
+#[tokio::test]
+async fn test_mcp_tools_list_rejects_missing_caller_binding() {
+    let server = start_test_server().await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/mcp", server.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("the local test server should respond");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("response is JSON");
+    assert_eq!(body["error"]["code"], -32001);
+}
+
+/// Tool discovery is a projection of the caller's effective allowlist, not a
+/// global catalog. The test agent is limited to `file_read` by its manifest.
+#[tokio::test]
+async fn test_mcp_tools_list_filters_catalog_to_caller_scope() {
+    let server = start_test_server().await;
+    let caller_id = spawn_test_agent(&server).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/mcp", server.base_url))
+        .header("X-OpenFang-Agent-Id", caller_id)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .expect("the local test server should respond");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("response is JSON");
+    let names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .expect("tools/list result has tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"file_read"));
+    assert!(!names.contains(&"file_write"));
 }
 
 #[tokio::test]
