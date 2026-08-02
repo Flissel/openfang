@@ -772,6 +772,10 @@ pub async fn build_router(
             axum::routing::post(crate::openai_compat::chat_completions),
         )
         .route(
+            "/v1/embeddings",
+            axum::routing::post(crate::openai_compat::embeddings),
+        )
+        .route(
             "/v1/models",
             axum::routing::get(crate::openai_compat::list_models),
         )
