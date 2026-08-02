@@ -4,6 +4,7 @@
 //! that works with any provider offering a `/v1/embeddings` endpoint (OpenAI,
 //! Groq, Together, Fireworks, Ollama, etc.).
 
+use crate::retry::{retry_async, RetryConfig, RetryOutcome};
 use async_trait::async_trait;
 use openfang_types::model_catalog::{
     FIREWORKS_BASE_URL, GROQ_BASE_URL, LMSTUDIO_BASE_URL, MISTRAL_BASE_URL, OLLAMA_BASE_URL,
@@ -86,6 +87,16 @@ struct EmbedData {
     embedding: Vec<f32>,
 }
 
+#[derive(Debug)]
+struct EmbeddingAttemptError {
+    error: EmbeddingError,
+    retryable: bool,
+}
+
+fn is_retryable_embedding_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
 impl OpenAIEmbeddingDriver {
     /// Create a new OpenAI-compatible embedding driver.
     pub fn new(config: EmbeddingConfig) -> Result<Self, EmbeddingError> {
@@ -133,28 +144,53 @@ impl EmbeddingDriver for OpenAIEmbeddingDriver {
             input: texts,
         };
 
-        let mut req = self.client.post(&url).json(&body);
-        if !self.api_key.as_str().is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key.as_str()));
-        }
+        let retry_config = RetryConfig::default();
+        let response = retry_async(
+            &retry_config,
+            || {
+                let mut req = self.client.post(&url).json(&body);
+                if !self.api_key.as_str().is_empty() {
+                    req = req.header("Authorization", format!("Bearer {}", self.api_key.as_str()));
+                }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| EmbeddingError::Http(e.to_string()))?;
-        let status = resp.status().as_u16();
+                async move {
+                    let resp = req.send().await.map_err(|error| EmbeddingAttemptError {
+                        retryable: error.is_timeout() || error.is_connect(),
+                        error: EmbeddingError::Http(error.to_string()),
+                    })?;
+                    let status = resp.status().as_u16();
 
-        if status != 200 {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(EmbeddingError::Api {
-                status,
-                message: body_text,
-            });
-        }
+                    if status != 200 {
+                        let body_text = resp.text().await.unwrap_or_default();
+                        return Err(EmbeddingAttemptError {
+                            error: EmbeddingError::Api {
+                                status,
+                                message: body_text,
+                            },
+                            retryable: is_retryable_embedding_status(status),
+                        });
+                    }
 
-        let data: EmbedResponse = resp
-            .json()
-            .await
+                    resp.bytes().await.map_err(|error| EmbeddingAttemptError {
+                        retryable: error.is_timeout()
+                            || error.is_connect()
+                            || error.is_body()
+                            || error.is_decode(),
+                        error: EmbeddingError::Parse(error.to_string()),
+                    })
+                }
+            },
+            |error| error.retryable,
+            |_| None,
+        )
+        .await;
+
+        let response_bytes = match response {
+            RetryOutcome::Success { result, .. } => result,
+            RetryOutcome::Exhausted { last_error, .. } => return Err(last_error.error),
+        };
+
+        let data: EmbedResponse = serde_json::from_slice(&response_bytes)
             .map_err(|e| EmbeddingError::Parse(e.to_string()))?;
 
         // Update dimensions from actual response if available
@@ -295,6 +331,137 @@ pub fn embedding_from_bytes(bytes: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_embedding_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let responses = responses
+            .into_iter()
+            .map(|(status, body)| (status, body, body.len()))
+            .collect();
+        spawn_embedding_server_with_content_lengths(responses).await
+    }
+
+    async fn spawn_embedding_server_with_content_lengths(
+        responses: Vec<(u16, &'static str, usize)>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let request_attempts = attempts.clone();
+
+        tokio::spawn(async move {
+            for (status, body, content_length) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                stream.read(&mut request).await.unwrap();
+                request_attempts.fetch_add(1, Ordering::SeqCst);
+
+                let response = format!(
+                    "HTTP/1.1 {status} test\r\nContent-Length: {content_length}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        (format!("http://{address}"), attempts)
+    }
+
+    fn test_driver(base_url: String) -> OpenAIEmbeddingDriver {
+        OpenAIEmbeddingDriver::new(EmbeddingConfig {
+            provider: "openai".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            api_key: "test-key".to_string(),
+            base_url,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retries_transient_upstream_failure_before_returning_embedding() {
+        let (base_url, attempts) = spawn_embedding_server(vec![
+            (503, r#"{"error":"temporarily unavailable"}"#),
+            (200, r#"{"data":[{"embedding":[0.25,0.5]}]}"#),
+        ])
+        .await;
+        let driver = test_driver(base_url);
+
+        let embeddings = tokio::time::timeout(
+            Duration::from_secs(2),
+            driver.embed(&["retry this embedding"]),
+        )
+        .await
+        .expect("bounded retry window elapsed")
+        .expect("transient failure should recover");
+
+        assert_eq!(embeddings, vec![vec![0.25, 0.5]]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_truncated_successful_embedding_response_before_decoding_json() {
+        let valid_response = r#"{"data":[{"embedding":[0.25,0.5]}]}"#;
+        let (base_url, attempts) = spawn_embedding_server_with_content_lengths(vec![
+            (200, r#"{"data":["#, valid_response.len()),
+            (200, valid_response, valid_response.len()),
+        ])
+        .await;
+        let driver = test_driver(base_url);
+
+        let embeddings = tokio::time::timeout(
+            Duration::from_secs(2),
+            driver.embed(&["retry truncated embedding response"]),
+        )
+        .await
+        .expect("bounded retry window elapsed")
+        .expect("truncated response should recover");
+
+        assert_eq!(embeddings, vec![vec![0.25, 0.5]]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_permanent_upstream_failure_or_fallback() {
+        let (base_url, attempts) = spawn_embedding_server(vec![
+            (400, r#"{"error":"invalid embedding request"}"#),
+            (200, r#"{"data":[{"embedding":[0.25,0.5]}]}"#),
+        ])
+        .await;
+        let driver = test_driver(base_url);
+
+        let error = driver
+            .embed(&["invalid embedding request"])
+            .await
+            .expect_err("permanent upstream failure must fail closed");
+
+        assert!(matches!(error, EmbeddingError::Api { status: 400, .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_malformed_successful_embedding_response() {
+        let (base_url, attempts) = spawn_embedding_server(vec![
+            (200, "not valid embedding json"),
+            (200, r#"{"data":[{"embedding":[0.25,0.5]}]}"#),
+        ])
+        .await;
+        let driver = test_driver(base_url);
+
+        let error = driver
+            .embed(&["malformed embedding response"])
+            .await
+            .expect_err("malformed successful response must fail closed");
+
+        assert!(matches!(error, EmbeddingError::Parse(_)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_cosine_similarity_identical() {
