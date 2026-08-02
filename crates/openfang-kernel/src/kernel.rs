@@ -6134,7 +6134,12 @@ impl OpenFangKernel {
     ///
     /// If `capabilities.tools` is empty (or contains `"*"`), all tools are
     /// available (backwards compatible).
-    fn available_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
+    /// Return the effective tool set for a registered agent.
+    ///
+    /// API ingress uses this same resolution path as the agent loop so an
+    /// authenticated external caller cannot expand an agent's authority by
+    /// naming a globally registered tool.
+    pub fn available_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
         self.available_tools_with_registry(agent_id, None)
     }
 
