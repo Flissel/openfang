@@ -86,6 +86,10 @@ async fn start_test_server_with_provider(
         .route("/api/health", axum::routing::get(routes::health))
         .route("/api/status", axum::routing::get(routes::status))
         .route(
+            "/v1/embeddings",
+            axum::routing::post(openfang_api::openai_compat::embeddings),
+        )
+        .route(
             "/api/agents",
             axum::routing::get(routes::list_agents).post(routes::spawn_agent),
         )
@@ -206,6 +210,25 @@ memory_write = ["self.*"]
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_embeddings_rejects_unconfigured_non_openai_provider() {
+    let server = start_test_server().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", server.base_url))
+        .json(&serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": "fail closed"
+        }))
+        .send()
+        .await
+        .expect("the local test server should respond");
+
+    assert_eq!(response.status(), 503);
+    let body: serde_json::Value = response.json().await.expect("error body should be JSON");
+    assert_eq!(body["error"]["type"], "service_unavailable_error");
+    assert_eq!(body["error"]["code"], "embedding_provider_not_configured");
+}
 
 #[tokio::test]
 async fn test_health_endpoint() {

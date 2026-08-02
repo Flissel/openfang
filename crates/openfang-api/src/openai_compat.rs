@@ -63,6 +63,50 @@ pub struct OaiImageUrlRef {
     pub url: String,
 }
 
+/// Bounded OpenAI-compatible request body for `/v1/embeddings`.
+///
+/// The endpoint accepts either one text or a non-empty batch of texts. Other
+/// OpenAI request fields are deliberately not accepted until OpenFang can
+/// honour them through its embedding driver abstraction.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingsRequest {
+    pub model: String,
+    pub input: EmbeddingsInput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingsInput {
+    Text(String),
+    Batch(Vec<String>),
+}
+
+impl EmbeddingsInput {
+    fn texts(&self) -> Vec<&str> {
+        match self {
+            Self::Text(text) => vec![text],
+            Self::Batch(texts) => texts.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+impl EmbeddingsRequest {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.model.trim().is_empty() {
+            return Err("'model' must not be empty");
+        }
+        let texts = self.input.texts();
+        if texts.is_empty() {
+            return Err("'input' must contain at least one text");
+        }
+        if texts.iter().any(|text| text.trim().is_empty()) {
+            return Err("'input' must not contain empty text");
+        }
+        Ok(())
+    }
+}
+
 // ── Response types ──────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -155,6 +199,50 @@ struct ModelObject {
 struct ModelListResponse {
     object: &'static str,
     data: Vec<ModelObject>,
+}
+
+#[derive(Serialize)]
+struct EmbeddingsResponse {
+    object: &'static str,
+    data: Vec<EmbeddingObject>,
+    model: String,
+    usage: EmbeddingUsage,
+}
+
+#[derive(Serialize)]
+struct EmbeddingObject {
+    object: &'static str,
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Serialize)]
+struct EmbeddingUsage {
+    prompt_tokens: u64,
+    total_tokens: u64,
+}
+
+impl EmbeddingsResponse {
+    fn from_vectors(model: String, vectors: Vec<Vec<f32>>) -> Self {
+        Self {
+            object: "list",
+            data: vectors
+                .into_iter()
+                .enumerate()
+                .map(|(index, embedding)| EmbeddingObject {
+                    object: "embedding",
+                    embedding,
+                    index,
+                })
+                .collect(),
+            model,
+            // The shared EmbeddingDriver does not expose token accounting.
+            usage: EmbeddingUsage {
+                prompt_tokens: 0,
+                total_tokens: 0,
+            },
+        }
+    }
 }
 
 // ── Agent resolution ────────────────────────────────────────────────────────
@@ -371,6 +459,110 @@ pub async fn chat_completions(
     }
 }
 
+/// POST /v1/embeddings
+///
+/// Computes embeddings through the already-booted OpenFang OpenAI embedding
+/// driver. The endpoint refuses any implicit provider selection so a request
+/// can never fall through to a local model or a different provider.
+pub async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> axum::response::Response {
+    if let Err(message) = req.validate() {
+        return embeddings_error(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            "invalid_embedding_input",
+        );
+    }
+
+    let memory_config = &state.kernel.config.memory;
+    if memory_config.embedding_provider.as_deref() != Some("openai") {
+        return embeddings_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Embeddings require an explicit OpenAI memory provider configuration",
+            "service_unavailable_error",
+            "embedding_provider_not_configured",
+        );
+    }
+
+    let configured_model = memory_config.embedding_model.trim();
+    if !is_openai_embedding_model(configured_model) || req.model != configured_model {
+        return embeddings_error(
+            StatusCode::BAD_REQUEST,
+            "Requested model is not the configured OpenFang OpenAI embedding model",
+            "invalid_request_error",
+            "embedding_model_not_configured",
+        );
+    }
+
+    let api_key_env = memory_config
+        .embedding_api_key_env
+        .as_deref()
+        .unwrap_or("OPENAI_API_KEY");
+    let has_api_key = std::env::var(api_key_env)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_api_key {
+        return embeddings_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configured OpenAI embedding credentials are unavailable",
+            "service_unavailable_error",
+            "embedding_credentials_unavailable",
+        );
+    }
+
+    let Some(driver) = state.kernel.embedding_driver.as_ref() else {
+        return embeddings_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "OpenAI embedding driver is unavailable",
+            "service_unavailable_error",
+            "embedding_driver_unavailable",
+        );
+    };
+
+    let texts = req.input.texts();
+    match driver.embed(&texts).await {
+        Ok(vectors) => Json(EmbeddingsResponse::from_vectors(req.model, vectors)).into_response(),
+        Err(error) => {
+            warn!(error = %error, "OpenAI embeddings request failed");
+            embeddings_error(
+                StatusCode::BAD_GATEWAY,
+                "OpenAI embeddings request failed",
+                "server_error",
+                "embedding_provider_error",
+            )
+        }
+    }
+}
+
+fn is_openai_embedding_model(model: &str) -> bool {
+    matches!(
+        model,
+        "text-embedding-3-small" | "text-embedding-3-large" | "text-embedding-ada-002"
+    )
+}
+
+fn embeddings_error(
+    status: StatusCode,
+    message: &str,
+    error_type: &str,
+    code: &str,
+) -> axum::response::Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": code,
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// Build an SSE stream response for streaming completions.
 async fn stream_response(
     state: Arc<AppState>,
@@ -566,6 +758,70 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embeddings_request_accepts_text_or_non_empty_batch_only() {
+        let one: EmbeddingsRequest =
+            serde_json::from_str(r#"{"model":"text-embedding-3-small","input":"hello"}"#)
+                .expect("a single text input should be accepted");
+        assert_eq!(one.input.texts(), vec!["hello"]);
+
+        let batch: EmbeddingsRequest =
+            serde_json::from_str(r#"{"model":"text-embedding-3-small","input":["hello","world"]}"#)
+                .expect("a text batch should be accepted");
+        assert_eq!(batch.input.texts(), vec!["hello", "world"]);
+
+        let empty: EmbeddingsRequest =
+            serde_json::from_str(r#"{"model":"text-embedding-3-small","input":[]}"#)
+                .expect("the syntactic request is valid");
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn embeddings_request_rejects_empty_or_whitespace_texts() {
+        for input in ["\"\"", "\"   \""] {
+            let request: EmbeddingsRequest = serde_json::from_str(&format!(
+                r#"{{"model":"text-embedding-3-small","input":{input}}}"#
+            ))
+            .expect("the syntactic request is valid");
+            assert!(
+                request.validate().is_err(),
+                "input {input:?} must fail closed"
+            );
+        }
+
+        for input in [r#"["valid",""]"#, r#"["valid","   "]"#] {
+            let request: EmbeddingsRequest = serde_json::from_str(&format!(
+                r#"{{"model":"text-embedding-3-small","input":{input}}}"#
+            ))
+            .expect("the syntactic request is valid");
+            assert!(
+                request.validate().is_err(),
+                "input {input:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn embeddings_response_has_openai_shape_and_preserves_batch_order() {
+        let response = EmbeddingsResponse::from_vectors(
+            "text-embedding-3-small".to_string(),
+            vec![vec![0.25, -0.5], vec![1.0, 0.0]],
+        );
+
+        let json = serde_json::to_value(response).expect("response should serialize");
+        assert_eq!(json["object"], "list");
+        assert_eq!(json["model"], "text-embedding-3-small");
+        assert_eq!(json["data"][0]["object"], "embedding");
+        assert_eq!(json["data"][0]["index"], 0);
+        assert_eq!(
+            json["data"][0]["embedding"],
+            serde_json::json!([0.25, -0.5])
+        );
+        assert_eq!(json["data"][1]["index"], 1);
+        assert_eq!(json["usage"]["prompt_tokens"], 0);
+        assert_eq!(json["usage"]["total_tokens"], 0);
+    }
 
     #[test]
     fn test_oai_content_deserialize_string() {
