@@ -155,7 +155,7 @@ impl EmbeddingDriver for OpenAIEmbeddingDriver {
 
                 async move {
                     let resp = req.send().await.map_err(|error| EmbeddingAttemptError {
-                        retryable: error.is_timeout() || error.is_connect() || error.is_request(),
+                        retryable: error.is_timeout() || error.is_connect(),
                         error: EmbeddingError::Http(error.to_string()),
                     })?;
                     let status = resp.status().as_u16();
@@ -171,7 +171,13 @@ impl EmbeddingDriver for OpenAIEmbeddingDriver {
                         });
                     }
 
-                    Ok(resp)
+                    resp.bytes().await.map_err(|error| EmbeddingAttemptError {
+                        retryable: error.is_timeout()
+                            || error.is_connect()
+                            || error.is_body()
+                            || error.is_decode(),
+                        error: EmbeddingError::Parse(error.to_string()),
+                    })
                 }
             },
             |error| error.retryable,
@@ -179,14 +185,12 @@ impl EmbeddingDriver for OpenAIEmbeddingDriver {
         )
         .await;
 
-        let resp = match response {
+        let response_bytes = match response {
             RetryOutcome::Success { result, .. } => result,
             RetryOutcome::Exhausted { last_error, .. } => return Err(last_error.error),
         };
 
-        let data: EmbedResponse = resp
-            .json()
-            .await
+        let data: EmbedResponse = serde_json::from_slice(&response_bytes)
             .map_err(|e| EmbeddingError::Parse(e.to_string()))?;
 
         // Update dimensions from actual response if available
@@ -338,21 +342,30 @@ mod tests {
     async fn spawn_embedding_server(
         responses: Vec<(u16, &'static str)>,
     ) -> (String, Arc<AtomicUsize>) {
+        let responses = responses
+            .into_iter()
+            .map(|(status, body)| (status, body, body.len()))
+            .collect();
+        spawn_embedding_server_with_content_lengths(responses).await
+    }
+
+    async fn spawn_embedding_server_with_content_lengths(
+        responses: Vec<(u16, &'static str, usize)>,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let request_attempts = attempts.clone();
 
         tokio::spawn(async move {
-            for (status, body) in responses {
+            for (status, body, content_length) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0_u8; 1024];
                 stream.read(&mut request).await.unwrap();
                 request_attempts.fetch_add(1, Ordering::SeqCst);
 
                 let response = format!(
-                    "HTTP/1.1 {status} test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 {status} test\r\nContent-Length: {content_length}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
@@ -387,6 +400,28 @@ mod tests {
         .await
         .expect("bounded retry window elapsed")
         .expect("transient failure should recover");
+
+        assert_eq!(embeddings, vec![vec![0.25, 0.5]]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_truncated_successful_embedding_response_before_decoding_json() {
+        let valid_response = r#"{"data":[{"embedding":[0.25,0.5]}]}"#;
+        let (base_url, attempts) = spawn_embedding_server_with_content_lengths(vec![
+            (200, r#"{"data":["#, valid_response.len()),
+            (200, valid_response, valid_response.len()),
+        ])
+        .await;
+        let driver = test_driver(base_url);
+
+        let embeddings = tokio::time::timeout(
+            Duration::from_secs(2),
+            driver.embed(&["retry truncated embedding response"]),
+        )
+        .await
+        .expect("bounded retry window elapsed")
+        .expect("truncated response should recover");
 
         assert_eq!(embeddings, vec![vec![0.25, 0.5]]);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
