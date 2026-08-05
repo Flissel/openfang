@@ -1354,35 +1354,69 @@ memory_write = ["self.*"]
             (
                 "agents/brain-bubbles/agent.toml",
                 &["vibemind-db", "vibemind", "spaces-ideas"][..],
+                &[
+                    "memory_store",
+                    "memory_recall",
+                    "mcp_spaces_ideas_bubble_create",
+                ][..],
             ),
             (
                 "agents/brain-ideas/agent.toml",
                 &["vibemind-db", "spaces-ideas"][..],
+                &[
+                    "memory_store",
+                    "memory_recall",
+                    "mcp_spaces_ideas_idea_connect",
+                ][..],
             ),
             (
                 "agents/brain-desktop/agent.toml",
                 &["vibemind-db", "desktop-automation"][..],
+                &["memory_store", "memory_recall"][..],
             ),
             (
                 "agents/brain-researcher/agent.toml",
                 &["vibemind-db", "fetch", "qdrant"][..],
+                &["memory_store", "memory_recall"][..],
             ),
             (
                 "agents/brain-knowledge/agent.toml",
                 &["vibemind-db", "fetch", "spaces-minibook"][..],
+                &[
+                    "memory_store",
+                    "memory_recall",
+                    "mcp_spaces_minibook_minibook_status",
+                ][..],
             ),
             (
                 "agents/brain-scheduler/agent.toml",
                 &["vibemind-db", "scheduled-tasks"][..],
+                &["memory_store", "memory_recall"][..],
             ),
-            ("agents/brain-n8n/agent.toml", &["vibemind-db", "n8n"][..]),
-            ("agents/brain-video/agent.toml", &["vibemind-db"][..]),
-            ("agents/brain-wellness/agent.toml", &["vibemind-db"][..]),
-            ("agents/brain-forecaster/agent.toml", &["vibemind-db"][..]),
+            (
+                "agents/brain-n8n/agent.toml",
+                &["vibemind-db", "n8n"][..],
+                &["memory_store", "memory_recall"][..],
+            ),
+            (
+                "agents/brain-video/agent.toml",
+                &["vibemind-db"][..],
+                &["memory_store", "memory_recall"][..],
+            ),
+            (
+                "agents/brain-wellness/agent.toml",
+                &["vibemind-db"][..],
+                &["memory_store", "memory_recall"][..],
+            ),
+            (
+                "agents/brain-forecaster/agent.toml",
+                &["vibemind-db"][..],
+                &["memory_store", "memory_recall"][..],
+            ),
         ];
         let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
 
-        for (relative_path, expected_servers) in expected_manifests {
+        for (relative_path, expected_servers, expected_tools) in expected_manifests {
             let contents = std::fs::read_to_string(repository_root.join(relative_path)).unwrap();
             let document: toml::Value = toml::from_str(&contents).unwrap();
             let manifest: AgentManifest = toml::from_str(&contents).unwrap();
@@ -1398,6 +1432,14 @@ memory_write = ["self.*"]
             assert_eq!(
                 manifest.mcp_servers, expected_servers,
                 "{relative_path} has an unexpected mcp_servers scope"
+            );
+            assert_eq!(
+                manifest.capabilities.tools, expected_tools,
+                "{relative_path} has an unexpected effective tool scope"
+            );
+            assert!(
+                !manifest.capabilities.tools.iter().any(|tool| tool == "*"),
+                "{relative_path} must not use a wildcard capability tool scope"
             );
         }
     }
