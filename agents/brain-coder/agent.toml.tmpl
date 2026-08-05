@@ -5,6 +5,18 @@ author = "vibemind"
 module = "builtin:chat"
 tags = ["coding", "vibemind", "brain-routed"]
 memory_profile = "coding"
+mcp_servers = [
+  "vibemind-db",
+  "filesystem",
+  "git",
+  "github",
+  "context7",
+  "qdrant",
+  "fetch",
+  "brain",
+  "issue-detector",
+  "memory-search"
+]
 
 [model]
 provider = "claude-code"
@@ -41,17 +53,3 @@ network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 shell = ["cargo *", "git *", "npm *", "python *", "pip *", "pytest *"]
-
-[mcp_allowed]
-servers = [
-  "vibemind-db",
-  "filesystem",
-  "git",
-  "github",
-  "context7",
-  "qdrant",
-  "fetch",
-  "brain",
-  "issue-detector",
-  "memory-search"
-]

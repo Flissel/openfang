@@ -4,6 +4,16 @@ description = "VibeMind security auditor. Brain-routed for security tasks. Vuln 
 author = "vibemind"
 module = "builtin:chat"
 tags = ["security", "auditing", "threat-detection", "vibemind", "brain-routed"]
+mcp_servers = [
+  "botnet-detector",
+  "endpoint-hardening",
+  "firewall",
+  "network-monitor",
+  "event-log",
+  "site-verifier",
+  "issue-detector",
+  "brain"
+]
 
 [model]
 provider = "openai"
@@ -50,15 +60,3 @@ tools = ["shell_exec", "file_read", "process_list"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = [
-  "botnet-detector",
-  "endpoint-hardening",
-  "firewall",
-  "network-monitor",
-  "event-log",
-  "site-verifier",
-  "issue-detector",
-  "brain"
-]

@@ -4,6 +4,22 @@ description = "VibeMind desktop/devops agent. Brain-routed from the desktop spac
 author = "vibemind"
 module = "builtin:chat"
 tags = ["desktop", "devops", "vibemind", "brain-routed"]
+mcp_servers = [
+  "vibemind-db",
+  "docker",
+  "redis",
+  "postgres",
+  "filesystem",
+  "git",
+  "process-manager",
+  "driver-manager",
+  "power-manager",
+  "scheduled-tasks",
+  "registry",
+  "env-manager",
+  "brain",
+  "issue-detector"
+]
 
 [model]
 provider = "openai"
@@ -41,21 +57,3 @@ network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 shell = ["*"]
-
-[mcp_allowed]
-servers = [
-  "vibemind-db",
-  "docker",
-  "redis",
-  "postgres",
-  "filesystem",
-  "git",
-  "process-manager",
-  "driver-manager",
-  "power-manager",
-  "scheduled-tasks",
-  "registry",
-  "env-manager",
-  "brain",
-  "issue-detector"
-]

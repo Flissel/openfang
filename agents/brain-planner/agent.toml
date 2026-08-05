@@ -4,6 +4,15 @@ description = "VibeMind ideas/planning agent. Brain-routed from the ideas space.
 author = "vibemind"
 module = "builtin:chat"
 tags = ["ideas", "planning", "vibemind", "brain-routed"]
+mcp_servers = [
+  "vibemind-db",
+  "taskmanager",
+  "memory",
+  "qdrant",
+  "filesystem",
+  "time",
+  "brain"
+]
 
 [model]
 provider = "openai"
@@ -37,14 +46,3 @@ network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 agent_message = ["*"]
-
-[mcp_allowed]
-servers = [
-  "vibemind-db",
-  "taskmanager",
-  "memory",
-  "qdrant",
-  "filesystem",
-  "time",
-  "brain"
-]

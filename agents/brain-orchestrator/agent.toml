@@ -4,6 +4,7 @@ description = "AutoGen multi-agent team coordination."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:agentfarm"]
+mcp_servers = ["vibemind-db", "space-navigator"]
 
 [model]
 provider = "openai"
@@ -40,6 +41,3 @@ tools = ["memory_store", "memory_recall"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = ["vibemind-db", "space-navigator"]

@@ -4,6 +4,14 @@ description = "VibeMind content agent. Brain-routed from bubbles/minibook spaces
 author = "vibemind"
 module = "builtin:chat"
 tags = ["writing", "content", "vibemind", "brain-routed"]
+mcp_servers = [
+  "vibemind-db",
+  "filesystem",
+  "memory",
+  "context7",
+  "tavily",
+  "brain"
+]
 
 [model]
 provider = "openai"
@@ -36,13 +44,3 @@ tools = ["file_read", "file_write", "file_list", "web_search", "web_fetch", "mem
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = [
-  "vibemind-db",
-  "filesystem",
-  "memory",
-  "context7",
-  "tavily",
-  "brain"
-]
