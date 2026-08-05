@@ -103,6 +103,8 @@ pub struct OpenFangKernel {
     >,
     /// Tracks running agent tasks for cancellation support.
     pub running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
+    /// Serializes complete MCP lifecycle operations across connect/reload/reconnect.
+    mcp_lifecycle: tokio::sync::Mutex<()>,
     /// MCP server connections (lazily initialized at start_background_agents).
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
@@ -1198,6 +1200,7 @@ impl OpenFangKernel {
             skill_registry: std::sync::RwLock::new(skill_registry),
             skill_config_overrides: std::sync::RwLock::new(None),
             running_tasks: dashmap::DashMap::new(),
+            mcp_lifecycle: tokio::sync::Mutex::new(()),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
             mcp_tool_origins: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -5859,6 +5862,8 @@ impl OpenFangKernel {
         use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
         use openfang_types::config::McpTransportEntry;
 
+        let _lifecycle_guard = self.mcp_lifecycle.lock().await;
+
         let servers = self
             .effective_mcp_servers
             .read()
@@ -5934,6 +5939,8 @@ impl OpenFangKernel {
     pub async fn reload_extension_mcps(self: &Arc<Self>) -> Result<usize, String> {
         use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
         use openfang_types::config::McpTransportEntry;
+
+        let _lifecycle_guard = self.mcp_lifecycle.lock().await;
 
         // 1. Reload installed integrations from disk
         let installed_count = {
@@ -6068,6 +6075,8 @@ impl OpenFangKernel {
     pub async fn reconnect_extension_mcp(self: &Arc<Self>, id: &str) -> Result<usize, String> {
         use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
         use openfang_types::config::McpTransportEntry;
+
+        let _lifecycle_guard = self.mcp_lifecycle.lock().await;
 
         // Find the config for this server
         let server_config = {
@@ -8736,6 +8745,68 @@ mod tests {
         };
         kernel.registry.register(entry).unwrap();
         agent_id
+    }
+
+    #[tokio::test]
+    async fn test_mcp_lifecycle_serializes_stale_connect_before_effective_removal() {
+        use openfang_types::config::{McpServerConfigEntry, McpTransportEntry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-mcp-lifecycle-order");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        let (connect_started_tx, connect_started_rx) = tokio::sync::oneshot::channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connect_events = Arc::clone(&events);
+        let remove_events = Arc::clone(&events);
+        let connect_lifecycle = &kernel.mcp_lifecycle;
+        let remove_lifecycle = &kernel.mcp_lifecycle;
+        let connect_effective = &kernel.effective_mcp_servers;
+        let remove_effective = &kernel.effective_mcp_servers;
+        let stale_config = McpServerConfigEntry {
+            name: "stale-connect".to_string(),
+            transport: McpTransportEntry::Stdio {
+                command: "unused-hermetic-test-server".to_string(),
+                args: vec![],
+            },
+            timeout_secs: 30,
+            env: vec![],
+            headers: vec![],
+        };
+
+        let stale_connect = async move {
+            let _guard = connect_lifecycle.lock().await;
+            connect_events.lock().unwrap().push("connect-start");
+            *connect_effective.write().unwrap() = vec![stale_config];
+            connect_started_tx.send(()).unwrap();
+            tokio::task::yield_now().await;
+            connect_events.lock().unwrap().push("connect-finish");
+        };
+        let effective_removal = async move {
+            connect_started_rx.await.unwrap();
+            let _guard = remove_lifecycle.lock().await;
+            remove_events.lock().unwrap().push("effective-remove");
+            remove_effective.write().unwrap().clear();
+        };
+
+        futures::future::join(stale_connect, effective_removal).await;
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["connect-start", "connect-finish", "effective-remove"]
+        );
+        assert!(
+            kernel.effective_mcp_servers.read().unwrap().is_empty(),
+            "the later effective removal must win after the stale connect completes"
+        );
+
+        kernel.shutdown();
     }
 
     #[test]
