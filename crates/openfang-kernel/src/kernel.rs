@@ -1333,6 +1333,7 @@ impl OpenFangKernel {
                                             || disk_manifest.skills != entry.manifest.skills
                                             || disk_manifest.mcp_servers
                                                 != entry.manifest.mcp_servers
+                                            || disk_manifest.no_mcp != entry.manifest.no_mcp
                                             // Fields previously missing from this check (#1087):
                                             // Only compare workspace when the TOML explicitly sets
                                             // one, so the kernel-assigned default path in the DB
@@ -6212,13 +6213,14 @@ impl OpenFangKernel {
 
         // Look up agent entry for profile, skill/MCP allowlists, and declared tools
         let entry = self.registry.get(agent_id);
-        let (skill_allowlist, mcp_allowlist, tool_profile) = entry
+        let (skill_allowlist, mcp_allowlist, tool_profile, no_mcp) = entry
             .as_ref()
             .map(|e| {
                 (
                     e.manifest.skills.clone(),
                     e.manifest.mcp_servers.clone(),
                     e.manifest.profile.clone(),
+                    e.manifest.no_mcp,
                 )
             })
             .unwrap_or_default();
@@ -6311,6 +6313,9 @@ impl OpenFangKernel {
                             .or_insert(0_usize) += 1;
                     }
                     for tool in mcp_tools.iter() {
+                        if no_mcp {
+                            continue;
+                        }
                         let Some(origins) = mcp_tool_origins.get(&tool.name) else {
                             continue;
                         };
@@ -8036,6 +8041,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            no_mcp: false,
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -8080,6 +8086,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            no_mcp: false,
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -8131,6 +8138,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            no_mcp: false,
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -8188,6 +8196,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            no_mcp: false,
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -8302,6 +8311,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            no_mcp: false,
             metadata: HashMap::new(),
             tags,
             routing: None,
@@ -9080,6 +9090,107 @@ mod tests {
                 "a public-cache tool without connection provenance must fail closed"
             );
         }
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_no_mcp_manifest_blocks_mcp_tools_but_keeps_builtins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-no-mcp");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let kernel = OpenFangKernel::boot_with_config(KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        })
+        .expect("kernel boots");
+
+        let manifest: AgentManifest = toml::from_str(
+            r#"
+                name = "brain-fallback"
+                no_mcp = true
+
+                [capabilities]
+                tools = ["file_read", "mcp_spaces_ideas_idea_connect"]
+            "#,
+        )
+        .expect("manifest parses");
+        let agent_id = AgentId::new();
+        kernel
+            .registry
+            .register(AgentEntry {
+                id: agent_id,
+                name: manifest.name.clone(),
+                manifest,
+                state: AgentState::Running,
+                mode: AgentMode::default(),
+                created_at: chrono::Utc::now(),
+                last_active: chrono::Utc::now(),
+                parent: None,
+                children: vec![],
+                session_id: SessionId::new(),
+                tags: vec![],
+                identity: Default::default(),
+                onboarding_completed: false,
+                onboarding_completed_at: None,
+            })
+            .expect("agent registers");
+        let legacy_manifest: AgentManifest = toml::from_str(
+            r#"
+                name = "legacy-agent"
+
+                [capabilities]
+                tools = ["file_read", "mcp_spaces_ideas_idea_connect"]
+            "#,
+        )
+        .expect("legacy manifest parses");
+        assert!(legacy_manifest.mcp_servers.is_empty());
+        assert!(!legacy_manifest.no_mcp);
+        let legacy_agent_id = AgentId::new();
+        kernel
+            .registry
+            .register(AgentEntry {
+                id: legacy_agent_id,
+                name: legacy_manifest.name.clone(),
+                manifest: legacy_manifest,
+                state: AgentState::Running,
+                mode: AgentMode::default(),
+                created_at: chrono::Utc::now(),
+                last_active: chrono::Utc::now(),
+                parent: None,
+                children: vec![],
+                session_id: SessionId::new(),
+                tags: vec![],
+                identity: Default::default(),
+                onboarding_completed: false,
+                onboarding_completed_at: None,
+            })
+            .expect("legacy agent registers");
+        kernel.replace_mcp_tool_cache(&[(
+            "spaces-ideas".to_string(),
+            vec![ToolDefinition {
+                name: "mcp_spaces_ideas_idea_connect".to_string(),
+                description: "MCP tool that must stay hidden".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        )]);
+
+        let no_mcp_names: Vec<_> = kernel
+            .available_tools(agent_id)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(no_mcp_names.contains(&"file_read".to_string()));
+        assert!(!no_mcp_names.contains(&"mcp_spaces_ideas_idea_connect".to_string()));
+
+        let legacy_names: Vec<_> = kernel
+            .available_tools(legacy_agent_id)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(legacy_names.contains(&"file_read".to_string()));
+        assert!(legacy_names.contains(&"mcp_spaces_ideas_idea_connect".to_string()));
 
         kernel.shutdown();
     }
