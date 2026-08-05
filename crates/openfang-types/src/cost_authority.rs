@@ -42,7 +42,8 @@ impl CostReservationRequestV1 {
 
         validate_positive("plan_revision", self.plan_revision)?;
         validate_positive("max_cost_microusd", self.max_cost_microusd)?;
-        validate_positive("ttl_seconds", self.ttl_seconds)
+        validate_positive("ttl_seconds", self.ttl_seconds)?;
+        duration_from_ttl_seconds(self.ttl_seconds).map(|_| ())
     }
 }
 
@@ -93,11 +94,10 @@ impl CostReservationRecordV1 {
             return Err("reserved_cost_microusd must exactly match max_cost_microusd".into());
         }
 
-        let ttl_seconds = i64::try_from(self.ttl_seconds)
-            .map_err(|_| "ttl_seconds is too large to represent".to_string())?;
+        let ttl = duration_from_ttl_seconds(self.ttl_seconds)?;
         let expected_expires_at = self
             .issued_at
-            .checked_add_signed(Duration::seconds(ttl_seconds))
+            .checked_add_signed(ttl)
             .ok_or_else(|| "ttl_seconds produces an unrepresentable expires_at".to_string())?;
         if self.expires_at != expected_expires_at {
             return Err("expires_at must exactly match issued_at plus ttl_seconds".into());
@@ -222,6 +222,13 @@ fn validate_positive(name: &str, value: u64) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn duration_from_ttl_seconds(ttl_seconds: u64) -> Result<Duration, String> {
+    let ttl_seconds = i64::try_from(ttl_seconds)
+        .map_err(|_| "ttl_seconds is too large to represent".to_string())?;
+    Duration::try_seconds(ttl_seconds)
+        .ok_or_else(|| "ttl_seconds is too large to represent as a duration".to_string())
 }
 
 #[cfg(test)]
@@ -357,6 +364,31 @@ mod tests {
             request[field] = value;
             assert!(serde_json::from_value::<CostReservationRequestV1>(request).is_err());
         }
+    }
+
+    #[test]
+    fn huge_json_valid_ttl_is_rejected_without_panicking_for_request_or_record() {
+        let huge_ttl = i64::MAX as u64;
+
+        let mut request_json = serde_json::to_value(valid_request()).unwrap();
+        request_json["ttl_seconds"] = json!(huge_ttl);
+        let request: CostReservationRequestV1 = serde_json::from_value(request_json).unwrap();
+        let request_validation = std::panic::catch_unwind(|| request.validate());
+        assert!(
+            request_validation.is_ok(),
+            "request validation must not panic"
+        );
+        assert!(request_validation.unwrap().is_err());
+
+        let mut record_json = serde_json::to_value(valid_reservation(&valid_request())).unwrap();
+        record_json["ttl_seconds"] = json!(huge_ttl);
+        let record: CostReservationRecordV1 = serde_json::from_value(record_json).unwrap();
+        let record_validation = std::panic::catch_unwind(|| record.validate());
+        assert!(
+            record_validation.is_ok(),
+            "record validation must not panic"
+        );
+        assert!(record_validation.unwrap().is_err());
     }
 
     #[test]
