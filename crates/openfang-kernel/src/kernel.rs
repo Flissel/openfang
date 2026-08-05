@@ -6257,23 +6257,41 @@ impl OpenFangKernel {
 
         // Step 3: Add MCP tools (filtered by agent's MCP server allowlist,
         // then by declared tools).
+        let known_mcp_servers: Vec<String> = self
+            .effective_mcp_servers
+            .read()
+            .map(|servers| servers.iter().map(|server| server.name.clone()).collect())
+            .unwrap_or_default();
+        let known_server_refs: Vec<&str> = known_mcp_servers.iter().map(String::as_str).collect();
+        let mut normalized_server_counts = std::collections::HashMap::new();
+        for server in &known_mcp_servers {
+            *normalized_server_counts
+                .entry(openfang_runtime::mcp::normalize_name(server))
+                .or_insert(0_usize) += 1;
+        }
         if let Ok(mcp_tools) = self.mcp_tools.lock() {
-            let mcp_candidates: Vec<ToolDefinition> = if mcp_allowlist.is_empty() {
-                mcp_tools.iter().cloned().collect()
-            } else {
-                let known_servers: Vec<&str> = mcp_allowlist.iter().map(String::as_str).collect();
-                mcp_tools
-                    .iter()
-                    .filter(|t| {
+            let mcp_candidates: Vec<ToolDefinition> = mcp_tools
+                .iter()
+                .filter(|tool| {
+                    let Some(resolved_server) =
                         openfang_runtime::mcp::extract_mcp_server_from_known(
-                            &t.name,
-                            &known_servers,
+                            &tool.name,
+                            &known_server_refs,
                         )
-                        .is_some()
-                    })
-                    .cloned()
-                    .collect()
-            };
+                    else {
+                        return false;
+                    };
+                    let normalized_server = openfang_runtime::mcp::normalize_name(resolved_server);
+                    if normalized_server_counts.get(&normalized_server) != Some(&1) {
+                        return false;
+                    }
+                    mcp_allowlist.is_empty()
+                        || mcp_allowlist
+                            .iter()
+                            .any(|allowed| allowed == resolved_server)
+                })
+                .cloned()
+                .collect();
             for t in mcp_candidates {
                 // If agent declares specific tools, only include matching MCP tools
                 if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
@@ -8665,6 +8683,8 @@ mod tests {
 
     #[test]
     fn test_declared_mcp_tools_are_scoped_to_agent_and_server() {
+        use openfang_types::config::{McpServerConfigEntry, McpTransportEntry};
+
         let tmp = tempfile::tempdir().unwrap();
         let home_dir = tmp.path().join("openfang-mcp-tool-scope");
         std::fs::create_dir_all(&home_dir).unwrap();
@@ -8674,6 +8694,21 @@ mod tests {
             ..KernelConfig::default()
         };
         let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        let test_server = |name: &str| McpServerConfigEntry {
+            name: name.to_string(),
+            transport: McpTransportEntry::Stdio {
+                command: "unused-hermetic-test-server".to_string(),
+                args: vec![],
+            },
+            timeout_secs: 30,
+            env: vec![],
+            headers: vec![],
+        };
+        *kernel.effective_mcp_servers.write().unwrap() = vec![
+            test_server("spaces"),
+            test_server("spaces-ideas"),
+            test_server("spaces-rowboat"),
+        ];
 
         let mut manifest = test_manifest("brain-ideas-scope", "MCP scope test", vec![]);
         manifest.mcp_servers = vec!["spaces-ideas".to_string()];
@@ -8681,6 +8716,7 @@ mod tests {
             "memory_store".to_string(),
             "memory_recall".to_string(),
             "mcp_spaces_ideas_idea_connect".to_string(),
+            "mcp_spaces_rowboat_rowboat_status".to_string(),
         ];
         let agent_id = AgentId::new();
         kernel
@@ -8730,6 +8766,56 @@ mod tests {
             assert!(names.contains(&"mcp_spaces_ideas_idea_connect".to_string()));
             assert!(!names.contains(&"mcp_spaces_ideas_idea_delete".to_string()));
             assert!(!names.contains(&"mcp_spaces_rowboat_rowboat_status".to_string()));
+        }
+
+        let mut overlap_manifest =
+            test_manifest("brain-spaces-scope", "MCP overlap scope test", vec![]);
+        overlap_manifest.mcp_servers = vec!["spaces".to_string()];
+        overlap_manifest.capabilities.tools = vec!["mcp_spaces_ideas_idea_connect".to_string()];
+        let overlap_agent_id = AgentId::new();
+        kernel
+            .registry
+            .register(AgentEntry {
+                id: overlap_agent_id,
+                name: overlap_manifest.name.clone(),
+                manifest: overlap_manifest,
+                state: AgentState::Running,
+                mode: AgentMode::default(),
+                created_at: chrono::Utc::now(),
+                last_active: chrono::Utc::now(),
+                parent: None,
+                children: vec![],
+                session_id: SessionId::new(),
+                tags: vec![],
+                identity: Default::default(),
+                onboarding_completed: false,
+                onboarding_completed_at: None,
+            })
+            .unwrap();
+        for tools in [
+            kernel.available_tools(overlap_agent_id),
+            kernel.available_tools_with_registry(overlap_agent_id, None),
+        ] {
+            assert!(!tools
+                .iter()
+                .any(|tool| tool.name == "mcp_spaces_ideas_idea_connect"));
+        }
+
+        kernel
+            .effective_mcp_servers
+            .write()
+            .unwrap()
+            .push(test_server("spaces_ideas"));
+        for tools in [
+            kernel.available_tools(agent_id),
+            kernel.available_tools_with_registry(agent_id, None),
+        ] {
+            assert!(
+                !tools
+                    .iter()
+                    .any(|tool| tool.name == "mcp_spaces_ideas_idea_connect"),
+                "normalized server-name collisions must fail closed"
+            );
         }
 
         kernel.shutdown();
