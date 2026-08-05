@@ -4,6 +4,7 @@ description = "Wellness check-ins, diary, daily flow."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:flowzen"]
+mcp_servers = ["vibemind-db"]
 
 [model]
 provider = "openai"
@@ -40,6 +41,3 @@ tools = ["memory_store", "memory_recall"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = ["vibemind-db"]

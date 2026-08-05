@@ -4,6 +4,7 @@ description = "Video generation, vision, lipsync."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:video"]
+mcp_servers = ["vibemind-db"]
 
 [model]
 provider = "openai"
@@ -40,6 +41,3 @@ tools = ["memory_store", "memory_recall"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = ["vibemind-db"]
