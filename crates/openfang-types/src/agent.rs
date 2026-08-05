@@ -459,6 +459,9 @@ pub struct AgentManifest {
     /// MCP server allowlist (empty = all connected MCP servers available).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub mcp_servers: Vec<String>,
+    /// Disable all MCP tool exposure for this agent, regardless of its server allowlist.
+    #[serde(default)]
+    pub no_mcp: bool,
     /// Custom metadata.
     #[serde(default, deserialize_with = "crate::serde_compat::map_lenient")]
     pub metadata: HashMap<String, serde_json::Value>,
@@ -556,6 +559,7 @@ impl Default for AgentManifest {
             tools: HashMap::new(),
             skills: Vec::new(),
             mcp_servers: Vec::new(),
+            no_mcp: false,
             metadata: HashMap::new(),
             tags: Vec::new(),
             routing: None,
@@ -816,6 +820,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            no_mcp: false,
             metadata: HashMap::new(),
             tags: vec!["test".to_string()],
             routing: None,
@@ -834,6 +839,18 @@ mod tests {
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "test-agent");
         assert_eq!(deserialized.tags, vec!["test".to_string()]);
+    }
+
+    #[test]
+    fn test_no_mcp_defaults_false_and_brain_fallback_enables_it() {
+        assert!(!AgentManifest::default().no_mcp);
+
+        let legacy_manifest: AgentManifest = toml::from_str("name = \"legacy-agent\"").unwrap();
+        assert!(!legacy_manifest.no_mcp);
+
+        let brain_fallback_manifest: AgentManifest =
+            toml::from_str(include_str!("../../../agents/brain-fallback/agent.toml")).unwrap();
+        assert!(brain_fallback_manifest.no_mcp);
     }
 
     // ----- ToolProfile tests -----

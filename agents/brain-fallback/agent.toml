@@ -3,6 +3,7 @@ version = "0.1.0"
 description = "VibeMind general-purpose agent. Handles any Brain-routed space without a dedicated template."
 author = "vibemind"
 module = "builtin:chat"
+no_mcp = true
 tags = ["general", "fallback", "vibemind", "brain-routed"]
 
 [model]
