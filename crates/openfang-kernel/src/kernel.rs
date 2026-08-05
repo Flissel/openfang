@@ -5857,6 +5857,23 @@ impl OpenFangKernel {
         self.replace_mcp_tool_cache(&snapshot);
     }
 
+    /// Remove actual MCP connections and rebuild every cache from the
+    /// remaining authoritative connection set before releasing the lock.
+    async fn remove_mcp_connections_and_rebuild_cache(&self, removed: &[String]) {
+        if removed.is_empty() {
+            return;
+        }
+
+        let mut connections = self.mcp_connections.lock().await;
+        let remaining: Vec<_> = connections
+            .iter()
+            .filter(|connection| !removed.iter().any(|name| name == connection.name()))
+            .map(|connection| (connection.name().to_string(), connection.tools().to_vec()))
+            .collect();
+        self.replace_mcp_tool_cache(&remaining);
+        connections.retain(|connection| !removed.iter().any(|name| name == connection.name()));
+    }
+
     /// Connect to all configured MCP servers and cache their tool definitions.
     async fn connect_mcp_servers(self: &Arc<Self>) {
         use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
@@ -5982,9 +5999,21 @@ impl OpenFangKernel {
             .cloned()
             .collect();
 
-        // 4. Update effective list
+        // 4. Publish the new effective list and revoke removed connections
+        // before awaiting any new server connection.
         if let Ok(mut effective) = self.effective_mcp_servers.write() {
-            *effective = new_configs;
+            *effective = new_configs.clone();
+        }
+        let removed: Vec<String> = already_connected
+            .iter()
+            .filter(|name| !new_configs.iter().any(|server| &server.name == *name))
+            .cloned()
+            .collect();
+        self.remove_mcp_connections_and_rebuild_cache(&removed)
+            .await;
+        for name in &removed {
+            self.extension_health.unregister(name);
+            info!(server = %name, "Extension MCP server disconnected (removed)");
         }
 
         // 5. Connect new servers
@@ -6034,34 +6063,6 @@ impl OpenFangKernel {
             }
         }
 
-        // 6. Remove connections for uninstalled integrations
-        let removed: Vec<String> = already_connected
-            .iter()
-            .filter(|name| {
-                let effective = self
-                    .effective_mcp_servers
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner());
-                !effective.iter().any(|s| &s.name == *name)
-            })
-            .cloned()
-            .collect();
-
-        if !removed.is_empty() {
-            let mut conns = self.mcp_connections.lock().await;
-            let remaining: Vec<_> = conns
-                .iter()
-                .filter(|connection| !removed.contains(&connection.name().to_string()))
-                .map(|connection| (connection.name().to_string(), connection.tools().to_vec()))
-                .collect();
-            self.replace_mcp_tool_cache(&remaining);
-            conns.retain(|c| !removed.contains(&c.name().to_string()));
-            for name in &removed {
-                self.extension_health.unregister(name);
-                info!(server = %name, "Extension MCP server disconnected (removed)");
-            }
-        }
-
         info!(
             "Extension reload: {} installed, {} new connections, {} removed",
             installed_count,
@@ -6090,19 +6091,9 @@ impl OpenFangKernel {
         let server_config =
             server_config.ok_or_else(|| format!("No MCP config found for integration '{id}'"))?;
 
-        // Disconnect existing connection if any
-        {
-            let mut conns = self.mcp_connections.lock().await;
-            if conns.iter().any(|connection| connection.name() == id) {
-                let remaining: Vec<_> = conns
-                    .iter()
-                    .filter(|connection| connection.name() != id)
-                    .map(|connection| (connection.name().to_string(), connection.tools().to_vec()))
-                    .collect();
-                self.replace_mcp_tool_cache(&remaining);
-                conns.retain(|connection| connection.name() != id);
-            }
-        }
+        // Disconnect existing connection if any before the reconnect await.
+        self.remove_mcp_connections_and_rebuild_cache(&[id.to_string()])
+            .await;
 
         self.extension_health.mark_reconnecting(id);
 
@@ -8748,29 +8739,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mcp_lifecycle_serializes_stale_connect_before_effective_removal() {
+    async fn test_mcp_reload_revokes_tools_before_pending_connect() {
         use openfang_types::config::{McpServerConfigEntry, McpTransportEntry};
 
         let tmp = tempfile::tempdir().unwrap();
         let home_dir = tmp.path().join("openfang-mcp-lifecycle-order");
         std::fs::create_dir_all(&home_dir).unwrap();
-        let config = KernelConfig {
-            home_dir: home_dir.clone(),
-            data_dir: home_dir.join("data"),
-            ..KernelConfig::default()
-        };
-        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
-
-        let (connect_started_tx, connect_started_rx) = tokio::sync::oneshot::channel();
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let connect_events = Arc::clone(&events);
-        let remove_events = Arc::clone(&events);
-        let connect_lifecycle = &kernel.mcp_lifecycle;
-        let remove_lifecycle = &kernel.mcp_lifecycle;
-        let connect_effective = &kernel.effective_mcp_servers;
-        let remove_effective = &kernel.effective_mcp_servers;
-        let stale_config = McpServerConfigEntry {
-            name: "stale-connect".to_string(),
+        let removed_server = McpServerConfigEntry {
+            name: "spaces-ideas".to_string(),
             transport: McpTransportEntry::Stdio {
                 command: "unused-hermetic-test-server".to_string(),
                 args: vec![],
@@ -8779,27 +8755,122 @@ mod tests {
             env: vec![],
             headers: vec![],
         };
+        let mut config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        config.mcp_servers = vec![removed_server];
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        let tool_name = "mcp_spaces_ideas_idea_connect";
+        let mut manifest = test_manifest("brain-ideas-reload", "MCP reload test", vec![]);
+        manifest.mcp_servers = vec!["spaces-ideas".to_string()];
+        manifest.capabilities.tools = vec![tool_name.to_string()];
+        let agent_id = AgentId::new();
+        kernel
+            .registry
+            .register(AgentEntry {
+                id: agent_id,
+                name: manifest.name.clone(),
+                manifest,
+                state: AgentState::Running,
+                mode: AgentMode::default(),
+                created_at: chrono::Utc::now(),
+                last_active: chrono::Utc::now(),
+                parent: None,
+                children: vec![],
+                session_id: SessionId::new(),
+                tags: vec![],
+                identity: Default::default(),
+                onboarding_completed: false,
+                onboarding_completed_at: None,
+            })
+            .unwrap();
+        kernel.replace_mcp_tool_cache(&[(
+            "spaces-ideas".to_string(),
+            vec![ToolDefinition {
+                name: tool_name.to_string(),
+                description: "permitted ideas tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+        )]);
+        for tools in [
+            kernel.available_tools(agent_id),
+            kernel.available_tools_with_registry(agent_id, None),
+        ] {
+            assert!(tools.iter().any(|tool| tool.name == tool_name));
+        }
+
+        let (stale_started_tx, stale_started_rx) = tokio::sync::oneshot::channel();
+        let (removal_applied_tx, removal_applied_rx) = tokio::sync::oneshot::channel();
+        let (pending_connect_release_tx, pending_connect_release_rx) =
+            tokio::sync::oneshot::channel();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stale_events = Arc::clone(&events);
+        let reload_events = Arc::clone(&events);
+        let stale_lifecycle = &kernel.mcp_lifecycle;
+        let reload_kernel = &kernel;
+        let observer_kernel = &kernel;
 
         let stale_connect = async move {
-            let _guard = connect_lifecycle.lock().await;
-            connect_events.lock().unwrap().push("connect-start");
-            *connect_effective.write().unwrap() = vec![stale_config];
-            connect_started_tx.send(()).unwrap();
+            let _guard = stale_lifecycle.lock().await;
+            stale_events.lock().unwrap().push("stale-connect-start");
+            stale_started_tx.send(()).unwrap();
             tokio::task::yield_now().await;
-            connect_events.lock().unwrap().push("connect-finish");
+            stale_events.lock().unwrap().push("stale-connect-finish");
         };
-        let effective_removal = async move {
-            connect_started_rx.await.unwrap();
-            let _guard = remove_lifecycle.lock().await;
-            remove_events.lock().unwrap().push("effective-remove");
-            remove_effective.write().unwrap().clear();
+        let reload_then_pending_connect = async move {
+            stale_started_rx.await.unwrap();
+            let _guard = reload_kernel.mcp_lifecycle.lock().await;
+            reload_kernel.effective_mcp_servers.write().unwrap().clear();
+            reload_kernel
+                .remove_mcp_connections_and_rebuild_cache(&["spaces-ideas".to_string()])
+                .await;
+            reload_events.lock().unwrap().push("effective-remove");
+            removal_applied_tx.send(()).unwrap();
+
+            // Model the next network connection await while the reload still
+            // owns the lifecycle guard.
+            pending_connect_release_rx.await.unwrap();
+            reload_events.lock().unwrap().push("new-connect-resolved");
+        };
+        let observe_pending_connect = async move {
+            removal_applied_rx.await.unwrap();
+            for tools in [
+                observer_kernel.available_tools(agent_id),
+                observer_kernel.available_tools_with_registry(agent_id, None),
+            ] {
+                assert!(
+                    !tools.iter().any(|tool| tool.name == tool_name),
+                    "removed MCP tools must be unavailable while a new connection is pending"
+                );
+            }
+            assert!(observer_kernel.mcp_tools.lock().unwrap().is_empty());
+            assert!(observer_kernel.mcp_tool_origins.lock().unwrap().is_empty());
+            assert!(observer_kernel
+                .mcp_connected_servers
+                .lock()
+                .unwrap()
+                .is_empty());
+            pending_connect_release_tx.send(()).unwrap();
         };
 
-        futures::future::join(stale_connect, effective_removal).await;
+        futures::future::join3(
+            stale_connect,
+            reload_then_pending_connect,
+            observe_pending_connect,
+        )
+        .await;
 
         assert_eq!(
             *events.lock().unwrap(),
-            vec!["connect-start", "connect-finish", "effective-remove"]
+            vec![
+                "stale-connect-start",
+                "stale-connect-finish",
+                "effective-remove",
+                "new-connect-resolved"
+            ]
         );
         assert!(
             kernel.effective_mcp_servers.read().unwrap().is_empty(),
