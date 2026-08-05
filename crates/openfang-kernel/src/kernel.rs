@@ -107,6 +107,13 @@ pub struct OpenFangKernel {
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
     pub mcp_tools: std::sync::Mutex<Vec<ToolDefinition>>,
+    /// Actual connected-server origins for each cached MCP tool name.
+    ///
+    /// Kept separate from the public tool cache so existing API/CLI readers
+    /// remain compatible. Authorization fails closed unless a tool has exactly
+    /// one provenance-backed origin in this map.
+    mcp_tool_origins:
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
     /// A2A task store for tracking task lifecycle.
     pub a2a_task_store: openfang_runtime::a2a::A2aTaskStore,
     /// Discovered external A2A agent cards.
@@ -1190,6 +1197,7 @@ impl OpenFangKernel {
             running_tasks: dashmap::DashMap::new(),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
+            mcp_tool_origins: std::sync::Mutex::new(std::collections::HashMap::new()),
             a2a_task_store: openfang_runtime::a2a::A2aTaskStore::default(),
             a2a_external_agents: std::sync::Mutex::new(Vec::new()),
             web_ctx,
@@ -3446,21 +3454,20 @@ impl OpenFangKernel {
     ) -> KernelResult<()> {
         // Validate server names if allowlist is non-empty
         if !servers.is_empty() {
-            if let Ok(mcp_tools) = self.mcp_tools.lock() {
-                let mut known_servers: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for tool in mcp_tools.iter() {
-                    if let Some(s) = openfang_runtime::mcp::extract_mcp_server(&tool.name) {
-                        known_servers.insert(s.to_string());
-                    }
-                }
-                for name in &servers {
-                    let normalized = openfang_runtime::mcp::normalize_name(name);
-                    if !known_servers.contains(&normalized) {
-                        return Err(KernelError::OpenFang(OpenFangError::Internal(format!(
-                            "Unknown MCP server: {name}"
-                        ))));
-                    }
+            let origins = self.mcp_tool_origins.lock().map_err(|_| {
+                KernelError::OpenFang(OpenFangError::Internal(
+                    "MCP tool provenance unavailable".to_string(),
+                ))
+            })?;
+            let known_servers: std::collections::HashSet<&str> = origins
+                .values()
+                .flat_map(|tool_origins| tool_origins.iter().map(String::as_str))
+                .collect();
+            for name in &servers {
+                if !known_servers.contains(name.as_str()) {
+                    return Err(KernelError::OpenFang(OpenFangError::Internal(format!(
+                        "Unknown connected MCP server: {name}"
+                    ))));
                 }
             }
         }
@@ -5797,6 +5804,48 @@ impl OpenFangKernel {
         Ok(primary)
     }
 
+    /// Add one successfully connected server's tools and actual origin to both
+    /// MCP caches. The lock order is always definitions first, provenance
+    /// second; readers use the same order.
+    fn cache_mcp_tools_from_server(&self, server: &str, definitions: &[ToolDefinition]) {
+        let Ok(mut tools) = self.mcp_tools.lock() else {
+            return;
+        };
+        let Ok(mut origins) = self.mcp_tool_origins.lock() else {
+            return;
+        };
+        for definition in definitions {
+            tools.push(definition.clone());
+            origins
+                .entry(definition.name.clone())
+                .or_default()
+                .insert(server.to_string());
+        }
+    }
+
+    /// Replace both MCP caches from one connection snapshot. Callers derive
+    /// the snapshot from actual connection objects, never from configured
+    /// server names or tool-name prefixes.
+    fn replace_mcp_tool_cache(&self, sources: &[(String, Vec<ToolDefinition>)]) {
+        let Ok(mut tools) = self.mcp_tools.lock() else {
+            return;
+        };
+        let Ok(mut origins) = self.mcp_tool_origins.lock() else {
+            return;
+        };
+        tools.clear();
+        origins.clear();
+        for (server, definitions) in sources {
+            for definition in definitions {
+                tools.push(definition.clone());
+                origins
+                    .entry(definition.name.clone())
+                    .or_default()
+                    .insert(server.clone());
+            }
+        }
+    }
+
     /// Connect to all configured MCP servers and cache their tool definitions.
     async fn connect_mcp_servers(self: &Arc<Self>) {
         use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
@@ -5840,10 +5889,8 @@ impl OpenFangKernel {
             match McpConnection::connect(mcp_config).await {
                 Ok(conn) => {
                     let tool_count = conn.tools().len();
-                    // Cache tool definitions
-                    if let Ok(mut tools) = self.mcp_tools.lock() {
-                        tools.extend(conn.tools().iter().cloned());
-                    }
+                    let server = conn.name().to_string();
+                    let definitions = conn.tools().to_vec();
                     info!(
                         server = %server_config.name,
                         tools = tool_count,
@@ -5853,6 +5900,7 @@ impl OpenFangKernel {
                     self.extension_health
                         .report_ok(&server_config.name, tool_count);
                     self.mcp_connections.lock().await.push(conn);
+                    self.cache_mcp_tools_from_server(&server, &definitions);
                 }
                 Err(e) => {
                     warn!(
@@ -5952,9 +6000,8 @@ impl OpenFangKernel {
             match McpConnection::connect(mcp_config).await {
                 Ok(conn) => {
                     let tool_count = conn.tools().len();
-                    if let Ok(mut tools) = self.mcp_tools.lock() {
-                        tools.extend(conn.tools().iter().cloned());
-                    }
+                    let server = conn.name().to_string();
+                    let definitions = conn.tools().to_vec();
                     self.extension_health
                         .report_ok(&server_config.name, tool_count);
                     info!(
@@ -5963,6 +6010,7 @@ impl OpenFangKernel {
                         "Extension MCP server connected (hot-reload)"
                     );
                     self.mcp_connections.lock().await.push(conn);
+                    self.cache_mcp_tools_from_server(&server, &definitions);
                     connected_count += 1;
                 }
                 Err(e) => {
@@ -5992,14 +6040,13 @@ impl OpenFangKernel {
 
         if !removed.is_empty() {
             let mut conns = self.mcp_connections.lock().await;
+            let remaining: Vec<_> = conns
+                .iter()
+                .filter(|connection| !removed.contains(&connection.name().to_string()))
+                .map(|connection| (connection.name().to_string(), connection.tools().to_vec()))
+                .collect();
+            self.replace_mcp_tool_cache(&remaining);
             conns.retain(|c| !removed.contains(&c.name().to_string()));
-            // Rebuild tool cache
-            if let Ok(mut tools) = self.mcp_tools.lock() {
-                tools.clear();
-                for conn in conns.iter() {
-                    tools.extend(conn.tools().iter().cloned());
-                }
-            }
             for name in &removed {
                 self.extension_health.unregister(name);
                 info!(server = %name, "Extension MCP server disconnected (removed)");
@@ -6035,16 +6082,14 @@ impl OpenFangKernel {
         // Disconnect existing connection if any
         {
             let mut conns = self.mcp_connections.lock().await;
-            let old_len = conns.len();
-            conns.retain(|c| c.name() != id);
-            if conns.len() < old_len {
-                // Rebuild tool cache
-                if let Ok(mut tools) = self.mcp_tools.lock() {
-                    tools.clear();
-                    for conn in conns.iter() {
-                        tools.extend(conn.tools().iter().cloned());
-                    }
-                }
+            if conns.iter().any(|connection| connection.name() == id) {
+                let remaining: Vec<_> = conns
+                    .iter()
+                    .filter(|connection| connection.name() != id)
+                    .map(|connection| (connection.name().to_string(), connection.tools().to_vec()))
+                    .collect();
+                self.replace_mcp_tool_cache(&remaining);
+                conns.retain(|connection| connection.name() != id);
             }
         }
 
@@ -6070,9 +6115,8 @@ impl OpenFangKernel {
         match McpConnection::connect(mcp_config).await {
             Ok(conn) => {
                 let tool_count = conn.tools().len();
-                if let Ok(mut tools) = self.mcp_tools.lock() {
-                    tools.extend(conn.tools().iter().cloned());
-                }
+                let server = conn.name().to_string();
+                let definitions = conn.tools().to_vec();
                 self.extension_health.report_ok(id, tool_count);
                 info!(
                     server = %id,
@@ -6080,6 +6124,7 @@ impl OpenFangKernel {
                     "Extension MCP server reconnected"
                 );
                 self.mcp_connections.lock().await.push(conn);
+                self.cache_mcp_tools_from_server(&server, &definitions);
                 Ok(tool_count)
             }
             Err(e) => {
@@ -6257,47 +6302,29 @@ impl OpenFangKernel {
 
         // Step 3: Add MCP tools (filtered by agent's MCP server allowlist,
         // then by declared tools).
-        let known_mcp_servers: Vec<String> = self
-            .effective_mcp_servers
-            .read()
-            .map(|servers| servers.iter().map(|server| server.name.clone()).collect())
-            .unwrap_or_default();
-        let known_server_refs: Vec<&str> = known_mcp_servers.iter().map(String::as_str).collect();
-        let mut normalized_server_counts = std::collections::HashMap::new();
-        for server in &known_mcp_servers {
-            *normalized_server_counts
-                .entry(openfang_runtime::mcp::normalize_name(server))
-                .or_insert(0_usize) += 1;
-        }
         if let Ok(mcp_tools) = self.mcp_tools.lock() {
-            let mcp_candidates: Vec<ToolDefinition> = mcp_tools
-                .iter()
-                .filter(|tool| {
-                    let Some(resolved_server) =
-                        openfang_runtime::mcp::extract_mcp_server_from_known(
-                            &tool.name,
-                            &known_server_refs,
-                        )
-                    else {
-                        return false;
+            if let Ok(mcp_tool_origins) = self.mcp_tool_origins.lock() {
+                for tool in mcp_tools.iter() {
+                    let Some(origins) = mcp_tool_origins.get(&tool.name) else {
+                        continue;
                     };
-                    let normalized_server = openfang_runtime::mcp::normalize_name(resolved_server);
-                    if normalized_server_counts.get(&normalized_server) != Some(&1) {
-                        return false;
+                    if origins.len() != 1 {
+                        continue;
                     }
-                    mcp_allowlist.is_empty()
-                        || mcp_allowlist
-                            .iter()
-                            .any(|allowed| allowed == resolved_server)
-                })
-                .cloned()
-                .collect();
-            for t in mcp_candidates {
-                // If agent declares specific tools, only include matching MCP tools
-                if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
-                    continue;
+                    let Some(actual_server) = origins.iter().next() else {
+                        continue;
+                    };
+                    if !mcp_allowlist.is_empty()
+                        && !mcp_allowlist.iter().any(|allowed| allowed == actual_server)
+                    {
+                        continue;
+                    }
+                    // If agent declares specific tools, only include matching MCP tools.
+                    if !tools_unrestricted && !declared_tools.iter().any(|d| d == &tool.name) {
+                        continue;
+                    }
+                    all_tools.push(tool.clone());
                 }
-                all_tools.push(t);
             }
         }
 
@@ -6462,44 +6489,41 @@ impl OpenFangKernel {
     /// Build a compact MCP server/tool summary for the system prompt so the
     /// agent knows what external tool servers are connected.
     fn build_mcp_summary(&self, mcp_allowlist: &[String]) -> String {
-        let tools = match self.mcp_tools.lock() {
-            Ok(t) => t.clone(),
+        let (tools, tool_origins) = match self.mcp_tools.lock() {
+            Ok(tools) => match self.mcp_tool_origins.lock() {
+                Ok(origins) => (tools.clone(), origins.clone()),
+                Err(_) => return String::new(),
+            },
             Err(_) => return String::new(),
         };
         if tools.is_empty() {
             return String::new();
         }
 
-        // Normalize allowlist for matching
-        let normalized: Vec<String> = mcp_allowlist
-            .iter()
-            .map(|s| openfang_runtime::mcp::normalize_name(s))
-            .collect();
-
-        // Group tools by MCP server prefix (mcp_{server}_{tool})
+        // Group only provenance-backed, unambiguous tools by actual server.
         let mut servers: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         let mut tool_count = 0usize;
         for tool in &tools {
-            let parts: Vec<&str> = tool.name.splitn(3, '_').collect();
-            if parts.len() >= 3 && parts[0] == "mcp" {
-                let server = parts[1].to_string();
-                // Filter by MCP allowlist if set
-                if !mcp_allowlist.is_empty() && !normalized.iter().any(|n| n == &server) {
-                    continue;
-                }
-                servers
-                    .entry(server)
-                    .or_default()
-                    .push(parts[2..].join("_"));
-                tool_count += 1;
-            } else {
-                servers
-                    .entry("unknown".to_string())
-                    .or_default()
-                    .push(tool.name.clone());
-                tool_count += 1;
+            let Some(origins) = tool_origins.get(&tool.name) else {
+                continue;
+            };
+            if origins.len() != 1 {
+                continue;
             }
+            let Some(server) = origins.iter().next() else {
+                continue;
+            };
+            if !mcp_allowlist.is_empty() && !mcp_allowlist.iter().any(|allowed| allowed == server) {
+                continue;
+            }
+            let prefix = format!("mcp_{}_", openfang_runtime::mcp::normalize_name(server));
+            let display_name = tool.name.strip_prefix(&prefix).unwrap_or(&tool.name);
+            servers
+                .entry(server.clone())
+                .or_default()
+                .push(display_name.to_string());
+            tool_count += 1;
         }
         if tool_count == 0 {
             return String::new();
@@ -8688,12 +8712,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home_dir = tmp.path().join("openfang-mcp-tool-scope");
         std::fs::create_dir_all(&home_dir).unwrap();
-        let config = KernelConfig {
-            home_dir: home_dir.clone(),
-            data_dir: home_dir.join("data"),
-            ..KernelConfig::default()
-        };
-        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
         let test_server = |name: &str| McpServerConfigEntry {
             name: name.to_string(),
             transport: McpTransportEntry::Stdio {
@@ -8704,11 +8722,17 @@ mod tests {
             env: vec![],
             headers: vec![],
         };
-        *kernel.effective_mcp_servers.write().unwrap() = vec![
+        let mut config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        config.mcp_servers = vec![
             test_server("spaces"),
             test_server("spaces-ideas"),
             test_server("spaces-rowboat"),
         ];
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
 
         let mut manifest = test_manifest("brain-ideas-scope", "MCP scope test", vec![]);
         manifest.mcp_servers = vec!["spaces-ideas".to_string()];
@@ -8756,7 +8780,10 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
             },
         ];
-        *kernel.mcp_tools.lock().unwrap() = fake_mcp_tools;
+        kernel.replace_mcp_tool_cache(&[
+            ("spaces-ideas".to_string(), fake_mcp_tools[..2].to_vec()),
+            ("spaces-rowboat".to_string(), fake_mcp_tools[2..].to_vec()),
+        ]);
 
         for tools in [
             kernel.available_tools(agent_id),
@@ -8801,11 +8828,7 @@ mod tests {
                 .any(|tool| tool.name == "mcp_spaces_ideas_idea_connect"));
         }
 
-        kernel
-            .effective_mcp_servers
-            .write()
-            .unwrap()
-            .push(test_server("spaces_ideas"));
+        kernel.replace_mcp_tool_cache(&[("spaces".to_string(), vec![fake_mcp_tools[0].clone()])]);
         for tools in [
             kernel.available_tools(agent_id),
             kernel.available_tools_with_registry(agent_id, None),
@@ -8814,7 +8837,37 @@ mod tests {
                 !tools
                     .iter()
                     .any(|tool| tool.name == "mcp_spaces_ideas_idea_connect"),
-                "normalized server-name collisions must fail closed"
+                "a configured but unconnected longest-prefix server must not claim another server's tool"
+            );
+        }
+
+        kernel.replace_mcp_tool_cache(&[
+            ("spaces".to_string(), vec![fake_mcp_tools[0].clone()]),
+            ("spaces-ideas".to_string(), vec![fake_mcp_tools[0].clone()]),
+        ]);
+        for tools in [
+            kernel.available_tools(agent_id),
+            kernel.available_tools_with_registry(agent_id, None),
+        ] {
+            assert!(
+                !tools
+                    .iter()
+                    .any(|tool| tool.name == "mcp_spaces_ideas_idea_connect"),
+                "duplicate actual origins for one tool name must fail closed"
+            );
+        }
+
+        kernel.replace_mcp_tool_cache(&[]);
+        *kernel.mcp_tools.lock().unwrap() = vec![fake_mcp_tools[0].clone()];
+        for tools in [
+            kernel.available_tools(agent_id),
+            kernel.available_tools_with_registry(agent_id, None),
+        ] {
+            assert!(
+                !tools
+                    .iter()
+                    .any(|tool| tool.name == "mcp_spaces_ideas_idea_connect"),
+                "a public-cache tool without connection provenance must fail closed"
             );
         }
 
