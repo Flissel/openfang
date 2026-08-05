@@ -4,6 +4,7 @@ description = "Desktop/window automation via pyautogui/moire."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:desktop"]
+mcp_servers = ["vibemind-db", "desktop-automation"]
 
 [model]
 provider = "openai"
@@ -40,6 +41,3 @@ tools = ["memory_store", "memory_recall"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = ["vibemind-db", "desktop-automation"]

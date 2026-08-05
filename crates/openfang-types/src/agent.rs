@@ -1347,4 +1347,58 @@ memory_write = ["self.*"]
             vec!["self.*".to_string()]
         );
     }
+
+    #[test]
+    fn test_vibemind_brain_manifests_use_top_level_mcp_servers() {
+        let expected_manifests = [
+            (
+                "agents/brain-bubbles/agent.toml",
+                &["vibemind-db", "vibemind", "spaces-ideas"][..],
+            ),
+            (
+                "agents/brain-ideas/agent.toml",
+                &["vibemind-db", "spaces-ideas"][..],
+            ),
+            (
+                "agents/brain-desktop/agent.toml",
+                &["vibemind-db", "desktop-automation"][..],
+            ),
+            (
+                "agents/brain-researcher/agent.toml",
+                &["vibemind-db", "fetch", "qdrant"][..],
+            ),
+            (
+                "agents/brain-knowledge/agent.toml",
+                &["vibemind-db", "fetch", "spaces-minibook"][..],
+            ),
+            (
+                "agents/brain-scheduler/agent.toml",
+                &["vibemind-db", "scheduled-tasks"][..],
+            ),
+            ("agents/brain-n8n/agent.toml", &["vibemind-db", "n8n"][..]),
+            ("agents/brain-video/agent.toml", &["vibemind-db"][..]),
+            ("agents/brain-wellness/agent.toml", &["vibemind-db"][..]),
+            ("agents/brain-forecaster/agent.toml", &["vibemind-db"][..]),
+        ];
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        for (relative_path, expected_servers) in expected_manifests {
+            let contents = std::fs::read_to_string(repository_root.join(relative_path)).unwrap();
+            let document: toml::Value = toml::from_str(&contents).unwrap();
+            let manifest: AgentManifest = toml::from_str(&contents).unwrap();
+
+            assert!(
+                document.get("mcp_allowed").is_none(),
+                "{relative_path} must not contain [mcp_allowed]"
+            );
+            assert!(
+                !manifest.mcp_servers.is_empty(),
+                "{relative_path} must define non-empty top-level mcp_servers"
+            );
+            assert_eq!(
+                manifest.mcp_servers, expected_servers,
+                "{relative_path} has an unexpected mcp_servers scope"
+            );
+        }
+    }
 }

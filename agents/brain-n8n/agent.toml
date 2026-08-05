@@ -4,6 +4,7 @@ description = "n8n workflow CRUD + execution."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:n8n"]
+mcp_servers = ["vibemind-db", "n8n"]
 
 [model]
 provider = "openai"
@@ -40,6 +41,3 @@ tools = ["memory_store", "memory_recall"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = ["vibemind-db", "n8n"]

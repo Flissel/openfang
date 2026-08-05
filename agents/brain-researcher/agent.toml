@@ -4,6 +4,7 @@ description = "Web research + summarization into ideas."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:research"]
+mcp_servers = ["vibemind-db", "fetch", "qdrant"]
 
 [model]
 provider = "openai"
@@ -40,6 +41,3 @@ tools = ["memory_store", "memory_recall"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = ["vibemind-db", "fetch", "qdrant"]
