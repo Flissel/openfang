@@ -6261,16 +6261,15 @@ impl OpenFangKernel {
             let mcp_candidates: Vec<ToolDefinition> = if mcp_allowlist.is_empty() {
                 mcp_tools.iter().cloned().collect()
             } else {
-                let normalized: Vec<String> = mcp_allowlist
-                    .iter()
-                    .map(|s| openfang_runtime::mcp::normalize_name(s))
-                    .collect();
+                let known_servers: Vec<&str> = mcp_allowlist.iter().map(String::as_str).collect();
                 mcp_tools
                     .iter()
                     .filter(|t| {
-                        openfang_runtime::mcp::extract_mcp_server(&t.name)
-                            .map(|s| normalized.iter().any(|n| n == s))
-                            .unwrap_or(false)
+                        openfang_runtime::mcp::extract_mcp_server_from_known(
+                            &t.name,
+                            &known_servers,
+                        )
+                        .is_some()
                     })
                     .cloned()
                     .collect()
@@ -8662,6 +8661,78 @@ mod tests {
         };
         kernel.registry.register(entry).unwrap();
         agent_id
+    }
+
+    #[test]
+    fn test_declared_mcp_tools_are_scoped_to_agent_and_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-mcp-tool-scope");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        let mut manifest = test_manifest("brain-ideas-scope", "MCP scope test", vec![]);
+        manifest.mcp_servers = vec!["spaces-ideas".to_string()];
+        manifest.capabilities.tools = vec![
+            "memory_store".to_string(),
+            "memory_recall".to_string(),
+            "mcp_spaces_ideas_idea_connect".to_string(),
+        ];
+        let agent_id = AgentId::new();
+        kernel
+            .registry
+            .register(AgentEntry {
+                id: agent_id,
+                name: manifest.name.clone(),
+                manifest,
+                state: AgentState::Running,
+                mode: AgentMode::default(),
+                created_at: chrono::Utc::now(),
+                last_active: chrono::Utc::now(),
+                parent: None,
+                children: vec![],
+                session_id: SessionId::new(),
+                tags: vec![],
+                identity: Default::default(),
+                onboarding_completed: false,
+                onboarding_completed_at: None,
+            })
+            .unwrap();
+
+        let fake_mcp_tools = vec![
+            ToolDefinition {
+                name: "mcp_spaces_ideas_idea_connect".to_string(),
+                description: "declared ideas tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "mcp_spaces_ideas_idea_delete".to_string(),
+                description: "unlisted ideas tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "mcp_spaces_rowboat_rowboat_status".to_string(),
+                description: "foreign server tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
+        *kernel.mcp_tools.lock().unwrap() = fake_mcp_tools;
+
+        for tools in [
+            kernel.available_tools(agent_id),
+            kernel.available_tools_with_registry(agent_id, None),
+        ] {
+            let names: Vec<_> = tools.into_iter().map(|tool| tool.name).collect();
+            assert!(names.contains(&"mcp_spaces_ideas_idea_connect".to_string()));
+            assert!(!names.contains(&"mcp_spaces_ideas_idea_delete".to_string()));
+            assert!(!names.contains(&"mcp_spaces_rowboat_rowboat_status".to_string()));
+        }
+
+        kernel.shutdown();
     }
 
     #[test]
