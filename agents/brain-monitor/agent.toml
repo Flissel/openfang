@@ -4,6 +4,17 @@ description = "VibeMind system health monitor. Brain-routed for self-diagnostics
 author = "vibemind"
 module = "builtin:chat"
 tags = ["monitoring", "health", "diagnostics", "vibemind", "brain-routed"]
+mcp_servers = [
+  "vibemind-db",
+  "docker",
+  "process-manager",
+  "event-log",
+  "issue-detector",
+  "network-monitor",
+  "redis",
+  "postgres",
+  "brain"
+]
 
 [model]
 provider = "openai"
@@ -48,16 +59,3 @@ tools = ["process_list", "process_kill", "shell_exec"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
-
-[mcp_allowed]
-servers = [
-  "vibemind-db",
-  "docker",
-  "process-manager",
-  "event-log",
-  "issue-detector",
-  "network-monitor",
-  "redis",
-  "postgres",
-  "brain"
-]
