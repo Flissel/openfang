@@ -50,5 +50,7 @@ max_concurrent_tools = 5
 
 [capabilities]
 tools = ["memory_store", "memory_recall", "mcp_spaces_rowboat_rowboat_status", "shell_exec"]
+shell = ["docker *"]
 network = ["*"]
 memory_read = ["*"]
+memory_write = ["self.*"]
