@@ -59,12 +59,12 @@ These ship with VibeMind and only need Python:
 |---|---|---|
 | `brain` | Cognitive state queries | `http://localhost:8900` (SSE) |
 | `issue-detector` | Auto-scan + GitHub issue creation | `vibemind-os/issue-detector/` |
-| `network-monitor` | WiFi, ARP, DNS, TLS, ports | `security/poc_network_monitor/` |
-| `firewall` | Windows Firewall management | `security/poc_firewall/` |
-| `event-log` | Windows Event Log analysis | `security/poc_event_log/` |
-| `botnet-detector` | DGA analysis, C2 beacons | `security/poc_botnet_detector/` |
-| `endpoint-hardening` | Defender, BitLocker, secrets audit | `security/poc_endpoint_hardening/` |
-| `site-verifier` | SSL, headers, CMS detection | `security/poc_site_verifier/` |
+| `network-monitor` | WiFi, ARP, DNS, TLS, ports | `security/pocs/defense/network_monitor/` |
+| `firewall` | Windows Firewall management | `security/pocs/defense/firewall/` |
+| `event-log` | Windows Event Log analysis | `security/pocs/defense/event_log/` |
+| `botnet-detector` | DGA analysis, C2 beacons | `security/pocs/defense/botnet_detector/` |
+| `endpoint-hardening` | Defender, BitLocker, secrets audit | `security/pocs/defense/endpoint_hardening/` |
+| `site-verifier` | SSL, headers, CMS detection | `security/pocs/offense/site_verifier/` |
 | `driver-manager` | Drivers: list, conflicts, unsigned | `system/poc_driver_manager/` |
 | `power-manager` | Battery, sleep, shutdown | `system/poc_power_manager/` |
 | `display-audio` | Resolution, brightness, volume | `system/poc_display_audio/` |

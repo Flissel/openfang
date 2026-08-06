@@ -54,7 +54,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_network_monitor/mcp_server.py"]
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/pocs/defense/network_monitor/mcp_server.py"]
 
 [[mcp_servers]]
 name = "endpoint-hardening"
@@ -62,7 +62,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_endpoint_hardening/mcp_server.py"]
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/pocs/defense/endpoint_hardening/mcp_server.py"]
 
 [[mcp_servers]]
 name = "event-log"
@@ -70,7 +70,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_event_log/mcp_server.py"]
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/pocs/defense/event_log/mcp_server.py"]
 
 [[mcp_servers]]
 name = "firewall"
@@ -78,7 +78,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_firewall/mcp_server.py"]
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/pocs/defense/firewall/mcp_server.py"]
 
 [[mcp_servers]]
 name = "botnet-detector"
@@ -86,7 +86,7 @@ timeout_secs = 60
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_botnet_detector/mcp_server.py"]
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/pocs/defense/botnet_detector/mcp_server.py"]
 
 [[mcp_servers]]
 name = "site-verifier"
@@ -94,7 +94,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["${VIBEMIND_ROOT}/vibemind-os/security/poc_site_verifier/mcp_server.py"]
+args = ["${VIBEMIND_ROOT}/vibemind-os/security/pocs/offense/site_verifier/mcp_server.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # SYSTEM PoC MCP Servers (vibemind-os/system/)
