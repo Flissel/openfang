@@ -1367,6 +1367,120 @@ memory_write = ["self.*"]
     }
 
     #[test]
+    fn test_brain_coder_is_committed_openai_chat_manifest() {
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest_path = repository_root.join("agents/brain-coder/agent.toml");
+        let template_path = repository_root.join("agents/brain-coder/agent.toml.tmpl");
+        let mut violations = Vec::new();
+
+        if !manifest_path.is_file() {
+            violations.push("agents/brain-coder/agent.toml is missing".to_string());
+        }
+        if template_path.exists() {
+            violations.push("agents/brain-coder/agent.toml.tmpl still exists".to_string());
+        }
+        match std::fs::read_to_string(repository_root.join(".gitignore")) {
+            Ok(contents) => {
+                let canonical_manifest = "agents/brain-coder/agent.toml";
+                let canonical_manifest_is_ignored = contents
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| {
+                        !line.is_empty() && !line.starts_with('#') && !line.starts_with('!')
+                    })
+                    .any(|rule| rule.trim_start_matches('/') == canonical_manifest);
+                if canonical_manifest_is_ignored {
+                    violations.push(format!(
+                        "{canonical_manifest} must not be ignored by the repository .gitignore"
+                    ));
+                }
+            }
+            Err(error) => violations.push(format!(
+                "repository .gitignore must be readable for manifest hygiene: {error}"
+            )),
+        }
+
+        let candidate_path = if manifest_path.is_file() {
+            &manifest_path
+        } else {
+            &template_path
+        };
+        match std::fs::read_to_string(candidate_path) {
+            Ok(contents) => match toml::from_str::<AgentManifest>(&contents) {
+                Ok(manifest) => {
+                    let expected_servers = [
+                        "vibemind-db",
+                        "filesystem",
+                        "git",
+                        "github",
+                        "context7",
+                        "qdrant",
+                        "fetch",
+                        "brain",
+                        "issue-detector",
+                    ];
+                    if manifest.module != "builtin:chat" {
+                        violations.push(format!(
+                            "module must be builtin:chat, got {}",
+                            manifest.module
+                        ));
+                    }
+                    if manifest.model.provider != "openai" {
+                        violations.push(format!(
+                            "provider must be openai, got {}",
+                            manifest.model.provider
+                        ));
+                    }
+                    if manifest.model.model != "gpt-4o-mini" {
+                        violations.push(format!(
+                            "model must be gpt-4o-mini, got {}",
+                            manifest.model.model
+                        ));
+                    }
+                    if manifest
+                        .description
+                        .to_ascii_lowercase()
+                        .contains("claude code")
+                    {
+                        violations.push("description must not claim Claude Code".to_string());
+                    }
+                    if manifest.mcp_servers != expected_servers {
+                        violations.push(format!(
+                            "mcp_servers must match the registry scope, got {:?}",
+                            manifest.mcp_servers
+                        ));
+                    }
+                    if manifest
+                        .capabilities
+                        .tools
+                        .iter()
+                        .any(|tool| tool.starts_with("mcp_"))
+                    {
+                        violations.push("capability tools must not grant mcp_* tools".to_string());
+                    }
+                    if !manifest.fallback_models.is_empty() {
+                        violations.push("fallback_models must remain empty".to_string());
+                    }
+                }
+                Err(error) => violations.push(format!(
+                    "{} must parse as an agent manifest: {error}",
+                    candidate_path.display()
+                )),
+            },
+            Err(error) => violations.push(format!(
+                "{} must be readable: {error}",
+                candidate_path.display()
+            )),
+        }
+
+        assert!(
+            violations.is_empty(),
+            "brain-coder manifest contract violations:\n- {}",
+            violations.join("\n- ")
+        );
+    }
+
+    #[test]
     fn test_vibemind_brain_manifests_use_top_level_mcp_servers() {
         let expected_manifests = [
             (
@@ -1542,7 +1656,7 @@ memory_write = ["self.*"]
                 ][..],
             ),
             (
-                "agents/brain-coder/agent.toml.tmpl",
+                "agents/brain-coder/agent.toml",
                 &[
                     "vibemind-db",
                     "filesystem",
@@ -1553,7 +1667,6 @@ memory_write = ["self.*"]
                     "fetch",
                     "brain",
                     "issue-detector",
-                    "memory-search",
                 ][..],
                 &[
                     "file_read",
