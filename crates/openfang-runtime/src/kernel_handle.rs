@@ -37,6 +37,58 @@ pub trait KernelHandle: Send + Sync {
     /// Send a message to another agent and get the response.
     async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String>;
 
+    /// Admit one runtime invocation before any dispatch is attempted.
+    async fn runtime_admit(
+        &self,
+        context: openfang_types::runtime_admission::RuntimeAdmissionContextV1,
+    ) -> Result<openfang_types::runtime_admission::RuntimeAdmissionDecisionV1, String> {
+        let _ = context;
+        Err("runtime admission unavailable".to_string())
+    }
+
+    /// Record that a previously admitted invocation is being dispatched.
+    async fn runtime_mark_dispatching(
+        &self,
+        invocation_id: &str,
+    ) -> Result<openfang_types::runtime_admission::ExecutionReceiptV1, String> {
+        let _ = invocation_id;
+        Err("runtime admission unavailable".to_string())
+    }
+
+    /// Persist a final runtime outcome and its cost settlement.
+    async fn runtime_finalize(
+        &self,
+        invocation_id: &str,
+        update: openfang_types::runtime_admission::ReceiptFinalizationV1,
+    ) -> Result<openfang_types::runtime_admission::ExecutionReceiptV1, String> {
+        let _ = (invocation_id, update);
+        Err("runtime admission unavailable".to_string())
+    }
+
+    /// Persist a non-replayable unknown outcome after a dispatch boundary failure.
+    async fn runtime_mark_outcome_unknown(
+        &self,
+        invocation_id: &str,
+        error_class: String,
+    ) -> Result<openfang_types::runtime_admission::ExecutionReceiptV1, String> {
+        let _ = (invocation_id, error_class);
+        Err("runtime admission unavailable".to_string())
+    }
+
+    /// Read a durable receipt without causing another dispatch.
+    async fn runtime_read_receipt(
+        &self,
+        invocation_id: &str,
+    ) -> Result<Option<openfang_types::runtime_admission::ExecutionReceiptV1>, String> {
+        let _ = invocation_id;
+        Err("runtime admission unavailable".to_string())
+    }
+
+    /// Return the kernel-owned validated receipt retention bound.
+    fn runtime_receipt_max_bytes(&self) -> Result<usize, String> {
+        Err("runtime admission unavailable".to_string())
+    }
+
     /// List all running agents.
     fn list_agents(&self) -> Vec<AgentInfo>;
 

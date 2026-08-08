@@ -8,11 +8,13 @@ use crate::error::{KernelError, KernelResult};
 use crate::event_bus::EventBus;
 use crate::metering::MeteringEngine;
 use crate::registry::AgentRegistry;
+use crate::runtime_admission::{RuntimeAdmissionService, SystemRuntimeClock};
 use crate::scheduler::AgentScheduler;
 use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId};
 
+use openfang_memory::runtime_authority::RuntimeAuthorityStore;
 use openfang_memory::MemorySubstrate;
 use openfang_runtime::agent_loop::{
     run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
@@ -33,6 +35,10 @@ use openfang_types::config::{KernelConfig, OutputFormat};
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
+use openfang_types::runtime_admission::{
+    ExecutionReceiptV1, ReceiptFinalizationV1, RuntimeAdmissionContextV1,
+    RuntimeAdmissionDecisionV1,
+};
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
@@ -70,6 +76,8 @@ pub struct OpenFangKernel {
     pub scheduler: AgentScheduler,
     /// Memory substrate.
     pub memory: Arc<MemorySubstrate>,
+    /// Durable, fail-closed authority admission coordinator for runtime dispatches.
+    pub runtime_admission: Arc<RuntimeAdmissionService>,
     /// Process supervisor.
     pub supervisor: Supervisor,
     /// Workflow engine.
@@ -661,6 +669,24 @@ impl OpenFangKernel {
             MemorySubstrate::open(&db_path, config.memory.decay_rate, &config.memory)
                 .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
         );
+        let runtime_authority_store = Arc::new(
+            RuntimeAuthorityStore::new(memory.usage_conn()).map_err(|error| {
+                KernelError::BootFailed(format!("Runtime authority store init failed: {error}"))
+            })?,
+        );
+        let runtime_admission = Arc::new(
+            RuntimeAdmissionService::new_with_enabled(
+                runtime_authority_store,
+                Arc::new(SystemRuntimeClock),
+                config.runtime_admission.receipt_max_bytes,
+                config.runtime_admission.dispatch_stale_after_secs,
+                config.runtime_admission.enabled,
+            )
+            .map_err(KernelError::BootFailed)?,
+        );
+        runtime_admission.recover_after_restart().map_err(|error| {
+            KernelError::BootFailed(format!("Runtime admission recovery failed: {error}"))
+        })?;
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -1187,6 +1213,7 @@ impl OpenFangKernel {
             event_bus: EventBus::new(),
             scheduler: AgentScheduler::new(),
             memory: memory.clone(),
+            runtime_admission,
             supervisor,
             workflows: WorkflowEngine::new(),
             triggers: TriggerEngine::new(),
@@ -7282,6 +7309,48 @@ impl KernelHandle for OpenFangKernel {
             .await
             .map_err(|e| format!("Send failed: {e}"))?;
         Ok(result.response)
+    }
+
+    async fn runtime_admit(
+        &self,
+        context: RuntimeAdmissionContextV1,
+    ) -> Result<RuntimeAdmissionDecisionV1, String> {
+        self.runtime_admission.admit(context).await
+    }
+
+    async fn runtime_mark_dispatching(
+        &self,
+        invocation_id: &str,
+    ) -> Result<ExecutionReceiptV1, String> {
+        self.runtime_admission.mark_dispatching(invocation_id)
+    }
+
+    async fn runtime_finalize(
+        &self,
+        invocation_id: &str,
+        update: ReceiptFinalizationV1,
+    ) -> Result<ExecutionReceiptV1, String> {
+        self.runtime_admission.finalize(invocation_id, update)
+    }
+
+    async fn runtime_mark_outcome_unknown(
+        &self,
+        invocation_id: &str,
+        error_class: String,
+    ) -> Result<ExecutionReceiptV1, String> {
+        self.runtime_admission
+            .mark_outcome_unknown(invocation_id, error_class)
+    }
+
+    async fn runtime_read_receipt(
+        &self,
+        invocation_id: &str,
+    ) -> Result<Option<ExecutionReceiptV1>, String> {
+        self.runtime_admission.read_receipt(invocation_id)
+    }
+
+    fn runtime_receipt_max_bytes(&self) -> Result<usize, String> {
+        Ok(self.runtime_admission.receipt_max_bytes())
     }
 
     fn list_agents(&self) -> Vec<kernel_handle::AgentInfo> {
