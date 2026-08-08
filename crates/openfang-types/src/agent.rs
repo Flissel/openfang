@@ -703,6 +703,7 @@ pub struct AgentEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{KernelConfig, McpTransportEntry};
 
     #[test]
     fn test_agent_id_uniqueness() {
@@ -1375,6 +1376,9 @@ memory_write = ["self.*"]
                     "memory_store",
                     "memory_recall",
                     "mcp_spaces_ideas_bubble_create",
+                    "mcp_vibemind_db_db_ideas_get",
+                    "mcp_vibemind_db_db_ideas_update",
+                    "mcp_vibemind_db_db_projects_create",
                 ][..],
             ),
             (
@@ -1591,6 +1595,30 @@ memory_write = ["self.*"]
                 !manifest.capabilities.tools.iter().any(|tool| tool == "*"),
                 "{relative_path} must not use a wildcard capability tool scope"
             );
+        }
+    }
+
+    #[test]
+    fn test_vibemind_template_declares_rowboat_mcp_server() {
+        let config: KernelConfig =
+            toml::from_str(include_str!("../../../openfang.vibemind.toml.template")).unwrap();
+        let rowboat = config
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "spaces-rowboat")
+            .expect("openfang template must declare an active spaces-rowboat MCP server");
+
+        assert_eq!(rowboat.timeout_secs, 10);
+        assert_eq!(rowboat.env, ["ROWBOAT_URL"]);
+        match &rowboat.transport {
+            McpTransportEntry::Stdio { command, args } => {
+                assert_eq!(command, "python");
+                assert_eq!(
+                    args,
+                    &["${VIBEMIND_ROOT}/vibemind-os/spaces/rowboat/mcp_server.py"]
+                );
+            }
+            transport => panic!("expected stdio transport for spaces-rowboat, got {transport:?}"),
         }
     }
 }

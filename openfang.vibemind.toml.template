@@ -391,6 +391,15 @@ type = "stdio"
 command = "python"
 args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/ideas/mcp_server.py"]
 
+[[mcp_servers]]
+name = "spaces-rowboat"
+timeout_secs = 10
+env = ["ROWBOAT_URL"]
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/rowboat/mcp_server.py"]
+
 # ═══════════════════════════════════════════════════════════════════
 # Phase 11.B — Multiverse Navigation (Smart 3-layer resolver)
 # Maps natural-language queries to one of 14 spaces and broadcasts
