@@ -1282,6 +1282,9 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// Runtime-admission dispatch bounds. Disabled by default.
+    #[serde(default)]
+    pub runtime_admission: RuntimeAdmissionConfig,
     /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
     ///
     /// When a skill declares a `config:` section in its SKILL.md frontmatter,
@@ -1298,6 +1301,25 @@ pub struct KernelConfig {
     /// ```
     #[serde(default)]
     pub skills: HashMap<String, HashMap<String, String>>,
+}
+
+/// Bounds for admission-controlled runtime dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeAdmissionConfig {
+    pub enabled: bool,
+    pub receipt_max_bytes: usize,
+    pub dispatch_stale_after_secs: u64,
+}
+
+impl Default for RuntimeAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            receipt_max_bytes: 65_536,
+            dispatch_stale_after_secs: 300,
+        }
+    }
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1539,6 +1561,7 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            runtime_admission: RuntimeAdmissionConfig::default(),
             skills: HashMap::new(),
         }
     }
@@ -1658,6 +1681,7 @@ impl std::fmt::Debug for KernelConfig {
                 &format!("{} mapping(s)", self.provider_api_keys.len()),
             )
             .field("auth", &format!("enabled={}", self.auth.enabled))
+            .field("runtime_admission", &self.runtime_admission)
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
             .finish()
     }
@@ -3382,6 +3406,14 @@ impl KernelConfig {
     pub fn validate(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
+        if self.runtime_admission.receipt_max_bytes == 0 {
+            warnings.push("runtime_admission.receipt_max_bytes must be positive".to_string());
+        }
+        if self.runtime_admission.dispatch_stale_after_secs == 0 {
+            warnings
+                .push("runtime_admission.dispatch_stale_after_secs must be positive".to_string());
+        }
+
         if let Some(ref tg) = self.channels.telegram {
             if std::env::var(&tg.bot_token_env)
                 .unwrap_or_default()
@@ -3917,6 +3949,15 @@ impl KernelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_admission_defaults_disabled_and_bounded() {
+        let config = RuntimeAdmissionConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.receipt_max_bytes, 65_536);
+        assert!(config.dispatch_stale_after_secs > 0);
+    }
 
     #[test]
     fn test_default_config() {
