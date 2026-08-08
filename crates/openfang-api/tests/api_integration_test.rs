@@ -13,6 +13,7 @@ use openfang_api::routes::{self, AppState};
 use openfang_api::ws;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
@@ -39,6 +40,311 @@ impl Drop for TestServer {
 /// Tests that need actual LLM calls should use `start_test_server_with_llm()`.
 async fn start_test_server() -> TestServer {
     start_test_server_with_provider("ollama", "test-model", "OLLAMA_API_KEY").await
+}
+
+/// Start the production router with runtime admission enabled. Unlike the
+/// lightweight general-purpose test router, this retains the API-key middleware
+/// so authority endpoints exercise the same authenticated boundary as daemon
+/// traffic.
+async fn start_runtime_admission_test_server(auto_approve: bool) -> TestServer {
+    start_runtime_admission_test_server_with_enabled(true, auto_approve).await
+}
+
+/// Starts the real runtime-admission test server with a harmless test-only
+/// dispatch probe at the real runtime tool-runner boundary.
+async fn start_runtime_admission_test_server_with_dispatch_probe(
+    auto_approve: bool,
+    probe: Arc<RuntimeMcpDispatchProbe>,
+) -> TestServer {
+    start_runtime_admission_test_server_with_api_key_and_dispatch_probe(
+        true,
+        auto_approve,
+        "runtime-admission-test-key",
+        Some(probe),
+    )
+    .await
+}
+
+struct RuntimeMcpDispatchProbe {
+    calls: AtomicUsize,
+    gate: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl RuntimeMcpDispatchProbe {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            gate: None,
+        })
+    }
+
+    fn blocked() -> (Arc<Self>, Arc<tokio::sync::Barrier>) {
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        (
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                gate: Some(gate.clone()),
+            }),
+            gate,
+        )
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn observer(self: &Arc<Self>) -> routes::RuntimeMcpDispatchObserver {
+        let probe = Arc::clone(self);
+        Arc::new(move || {
+            let probe = Arc::clone(&probe);
+            Box::pin(async move {
+                probe.calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(gate) = probe.gate.as_ref() {
+                    gate.wait().await;
+                }
+            })
+        })
+    }
+
+    async fn wait_for_call(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if self.calls() > 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dispatch probe should observe one invocation");
+    }
+}
+
+async fn start_runtime_admission_test_server_with_enabled(
+    runtime_admission_enabled: bool,
+    auto_approve: bool,
+) -> TestServer {
+    start_runtime_admission_test_server_with_api_key(
+        runtime_admission_enabled,
+        auto_approve,
+        "runtime-admission-test-key",
+    )
+    .await
+}
+
+async fn start_runtime_admission_test_server_with_api_key(
+    runtime_admission_enabled: bool,
+    auto_approve: bool,
+    api_key: &str,
+) -> TestServer {
+    start_runtime_admission_test_server_with_api_key_and_dispatch_probe(
+        runtime_admission_enabled,
+        auto_approve,
+        api_key,
+        None,
+    )
+    .await
+}
+
+async fn start_runtime_admission_test_server_with_api_key_and_dispatch_probe(
+    runtime_admission_enabled: bool,
+    auto_approve: bool,
+    api_key: &str,
+    dispatch_probe: Option<Arc<RuntimeMcpDispatchProbe>>,
+) -> TestServer {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let mut config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        api_key: api_key.to_string(),
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+            subprocess_timeout_secs: None,
+        },
+        ..KernelConfig::default()
+    };
+    config.runtime_admission.enabled = runtime_admission_enabled;
+    config.approval.auto_approve = auto_approve;
+
+    let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("Kernel should boot"));
+    kernel.set_self_handle();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test server");
+    let addr = listener.local_addr().expect("test listener address");
+    let (app, state) = match dispatch_probe {
+        Some(probe) => {
+            openfang_api::server::build_router_with_runtime_mcp_dispatch_observer(
+                kernel,
+                addr,
+                probe.observer(),
+            )
+            .await
+        }
+        None => openfang_api::server::build_router(kernel, addr).await,
+    };
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("test server should serve");
+    });
+
+    TestServer {
+        base_url: format!("http://{addr}"),
+        state,
+        _tmp: tmp,
+    }
+}
+
+async fn spawn_runtime_test_agent(server: &TestServer) -> String {
+    spawn_runtime_test_agent_with_manifest(server, TEST_MANIFEST).await
+}
+
+async fn spawn_runtime_test_agent_with_manifest(server: &TestServer, manifest: &str) -> String {
+    let response = runtime_authorized_request(
+        &reqwest::Client::new(),
+        reqwest::Method::POST,
+        format!("{}/api/agents", server.base_url),
+    )
+    .json(&serde_json::json!({"manifest_toml": manifest}))
+    .send()
+    .await
+    .expect("spawn runtime test agent");
+    assert_eq!(response.status(), 201);
+    response
+        .json::<serde_json::Value>()
+        .await
+        .expect("spawn response JSON")["agent_id"]
+        .as_str()
+        .expect("spawned agent id")
+        .to_string()
+}
+
+fn runtime_authorized_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, url)
+        .bearer_auth("runtime-admission-test-key")
+}
+
+fn runtime_approval_request(agent_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "contract_version": "v1",
+        "correlation_id": "correlation-runtime-admission",
+        "plan_id": "plan-runtime-admission",
+        "plan_revision": 1,
+        "space_id": "space-runtime-admission",
+        "agent_id": agent_id,
+        "max_plan_cost_microusd": 0,
+        "ttl_seconds": 60
+    })
+}
+
+async fn runtime_approved_refs(
+    server: &TestServer,
+    client: &reqwest::Client,
+    agent_id: &str,
+    invocation_id: &str,
+) -> (String, String) {
+    let approval = runtime_authorized_request(
+        client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", server.base_url),
+    )
+    .json(&runtime_approval_request(agent_id))
+    .send()
+    .await
+    .expect("approval route responds");
+    assert_eq!(approval.status(), 200);
+    let approval: serde_json::Value = approval.json().await.expect("approval JSON");
+    let approval_ref = approval["approval_ref"]
+        .as_str()
+        .expect("approved response supplies approval ref")
+        .to_string();
+
+    let reservation = runtime_authorized_request(
+        client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/cost-reservations", server.base_url),
+    )
+    .json(&serde_json::json!({
+        "contract_version": "v1",
+        "correlation_id": "correlation-runtime-admission",
+        "plan_id": "plan-runtime-admission",
+        "plan_revision": 1,
+        "space_id": "space-runtime-admission",
+        "agent_id": agent_id,
+        "approval_ref": approval_ref,
+        "invocation_id": invocation_id,
+        "max_cost_microusd": 0,
+        "ttl_seconds": 60
+    }))
+    .send()
+    .await
+    .expect("cost route responds");
+    assert_eq!(reservation.status(), 200);
+    let reservation: serde_json::Value = reservation.json().await.expect("reservation JSON");
+    let cost_ref = reservation["reservation"]["cost_ref"]
+        .as_str()
+        .expect("reservation supplies cost ref")
+        .to_string();
+    (approval_ref, cost_ref)
+}
+
+fn runtime_mcp_call(
+    client: &reqwest::Client,
+    server: &TestServer,
+    agent_id: &str,
+    invocation_id: serde_json::Value,
+    approval_ref: Option<&str>,
+    cost_ref: Option<&str>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> reqwest::RequestBuilder {
+    let mut request = runtime_authorized_request(
+        client,
+        reqwest::Method::POST,
+        format!("{}/mcp", server.base_url),
+    )
+    .header("X-OpenFang-Agent-Id", agent_id);
+    if let Some(approval_ref) = approval_ref {
+        request = request.header("X-OpenFang-Approval-Ref", approval_ref);
+    }
+    if let Some(cost_ref) = cost_ref {
+        request = request.header("X-OpenFang-Cost-Ref", cost_ref);
+    }
+    request.json(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": invocation_id,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments}
+    }))
+}
+
+fn runtime_authority_row_counts(server: &TestServer) -> (i64, i64) {
+    let connection = server.state.kernel.memory.usage_conn();
+    let connection = connection.lock().expect("runtime authority database lock");
+    let cost_rows = connection
+        .query_row("SELECT COUNT(*) FROM cost_reservations", [], |row| {
+            row.get(0)
+        })
+        .expect("count cost rows");
+    let receipt_rows = connection
+        .query_row("SELECT COUNT(*) FROM execution_receipts", [], |row| {
+            row.get(0)
+        })
+        .expect("count receipt rows");
+    (cost_rows, receipt_rows)
 }
 
 /// Start a test server with Groq as the LLM provider (requires GROQ_API_KEY).
@@ -185,6 +491,42 @@ system_prompt = "You are a test agent. Reply concisely."
 
 [capabilities]
 tools = ["file_read"]
+memory_read = ["*"]
+memory_write = ["self.*"]
+"#;
+
+const RUNTIME_MULTI_TOOL_MANIFEST: &str = r#"
+name = "runtime-test-agent"
+version = "0.1.0"
+description = "Runtime admission integration test agent"
+author = "test"
+module = "builtin:chat"
+
+[model]
+provider = "ollama"
+model = "test-model"
+system_prompt = "You are a test agent. Reply concisely."
+
+[capabilities]
+tools = ["file_read", "file_list"]
+memory_read = ["*"]
+memory_write = ["self.*"]
+"#;
+
+const RUNTIME_AGENT_LIST_MANIFEST: &str = r#"
+name = "runtime-agent-list-test-agent"
+version = "0.1.0"
+description = "Runtime admission replay envelope integration test agent"
+author = "test"
+module = "builtin:chat"
+
+[model]
+provider = "ollama"
+model = "test-model"
+system_prompt = "You are a test agent. Reply concisely."
+
+[capabilities]
+tools = ["agent_find"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 "#;
@@ -376,6 +718,966 @@ async fn test_mcp_tools_list_filters_catalog_to_caller_scope() {
         .collect();
     assert!(names.contains(&"file_read"));
     assert!(!names.contains(&"file_write"));
+}
+
+#[tokio::test]
+async fn runtime_control_plane_empty_configured_key_is_denied_on_loopback() {
+    let server = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        start_runtime_admission_test_server_with_api_key(true, true, ""),
+    )
+    .await
+    .expect("runtime test server startup timed out");
+    let client = reqwest::Client::new();
+    let caller_id = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        spawn_runtime_test_agent(&server),
+    )
+    .await
+    .expect("registered agent spawn timed out");
+
+    let approval = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client
+            .post(format!("{}/api/runtime/approvals/admit", server.base_url))
+            .json(&runtime_approval_request(&caller_id))
+            .send(),
+    )
+    .await
+    .expect("runtime approval request timed out")
+    .expect("runtime approval route responds");
+    assert_eq!(approval.status(), 401);
+}
+
+#[tokio::test]
+async fn registered_agent_header_without_control_plane_key_is_denied() {
+    let server = start_runtime_admission_test_server_with_api_key(true, true, "").await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+
+    let response = client
+        .post(format!("{}/mcp", server.base_url))
+        .header("X-OpenFang-Agent-Id", caller_id)
+        .header("X-OpenFang-Approval-Ref", "not-authority")
+        .header("X-OpenFang-Cost-Ref", "not-authority")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "spoofed-agent-header",
+            "method": "tools/call",
+            "params": {"name": "file_read", "arguments": {"path": "Cargo.toml"}}
+        }))
+        .send()
+        .await
+        .expect("MCP route responds");
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
+async fn runtime_admission_mcp_protocol_methods_preserve_global_api_auth() {
+    let server = start_runtime_admission_test_server(true).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+
+    for (method, params, requires_caller) in [
+        (
+            "initialize",
+            serde_json::json!({"protocolVersion": "2024-11-05"}),
+            false,
+        ),
+        ("tools/list", serde_json::json!({}), true),
+    ] {
+        for credential in [None, Some("wrong-control-plane-key")] {
+            let request = client.post(format!("{}/mcp", server.base_url));
+            let request = if let Some(credential) = credential {
+                request.bearer_auth(credential)
+            } else {
+                request
+            };
+            let request = if requires_caller {
+                request.header("X-OpenFang-Agent-Id", &caller_id)
+            } else {
+                request
+            };
+            let response = request
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("{method}-missing-or-wrong-global-key"),
+                    "method": method,
+                    "params": params,
+                }))
+                .send()
+                .await
+                .expect("MCP protocol route responds");
+            assert_eq!(response.status(), 401, "{method} must retain global auth");
+        }
+
+        let request = client
+            .post(format!("{}/mcp", server.base_url))
+            .bearer_auth("runtime-admission-test-key");
+        let request = if requires_caller {
+            request.header("X-OpenFang-Agent-Id", &caller_id)
+        } else {
+            request
+        };
+        let response = request
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": format!("{method}-valid-global-key"),
+                "method": method,
+                "params": params,
+            }))
+            .send()
+            .await
+            .expect("MCP protocol route responds with valid global API key");
+        assert_eq!(
+            response.status(),
+            200,
+            "{method} accepts the valid global key"
+        );
+        let body: serde_json::Value = response.json().await.expect("MCP protocol JSON");
+        if method == "initialize" {
+            assert_eq!(body["result"]["serverInfo"]["name"], "openfang");
+        } else {
+            assert!(body["result"]["tools"]
+                .as_array()
+                .expect("tools/list exposes the caller-scoped catalog")
+                .iter()
+                .any(|tool| tool["name"] == "file_read"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_control_plane_missing_or_wrong_key_denied_before_registered_agent_authority() {
+    let server = start_runtime_admission_test_server(true).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+    for credential in [None, Some("wrong-control-plane-key")] {
+        let mut request = client
+            .post(format!("{}/mcp", server.base_url))
+            .header("X-OpenFang-Agent-Id", &caller_id)
+            .header("X-OpenFang-Approval-Ref", "not-authority")
+            .header("X-OpenFang-Cost-Ref", "not-authority");
+        if let Some(credential) = credential {
+            request = request.bearer_auth(credential);
+        }
+        let response = request
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "missing-or-wrong-key",
+                "method": "tools/call",
+                "params": {"name": "file_read", "arguments": {"path": "Cargo.toml"}}
+            }))
+            .send()
+            .await
+            .expect("MCP route responds");
+        assert_eq!(response.status(), 401);
+    }
+}
+
+#[tokio::test]
+async fn runtime_control_plane_valid_api_key_allows_registered_agent_authority() {
+    let server = start_runtime_admission_test_server(true).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+    let response = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", server.base_url),
+    )
+    .json(&runtime_approval_request(&caller_id))
+    .send()
+    .await
+    .expect("runtime approval route responds");
+    assert_eq!(response.status(), 200);
+
+    let x_api_key = client
+        .post(format!("{}/api/runtime/approvals/admit", server.base_url))
+        .header("X-API-Key", "runtime-admission-test-key")
+        .json(&runtime_approval_request(&caller_id))
+        .send()
+        .await
+        .expect("runtime approval route responds");
+    assert_eq!(x_api_key.status(), 200);
+}
+
+#[tokio::test]
+async fn runtime_admission_rejects_body_authority_and_non_string_invocation_ids() {
+    let probe = RuntimeMcpDispatchProbe::new();
+    let server = start_runtime_admission_test_server_with_dispatch_probe(true, probe.clone()).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+
+    let body_authority = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!("body-refs-only"),
+        None,
+        None,
+        "file_read",
+        serde_json::json!({
+            "path": "Cargo.toml",
+            "approval_ref": "body-approval",
+            "cost_ref": "body-cost"
+        }),
+    )
+    .send()
+    .await
+    .expect("MCP route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("MCP response JSON");
+    assert_eq!(
+        body_authority["error"]["data"]["authority_status"],
+        "denied"
+    );
+    assert!(body_authority.get("result").is_none());
+
+    for invalid_id in [
+        serde_json::json!(7),
+        serde_json::json!("  "),
+        serde_json::Value::Null,
+    ] {
+        let body = runtime_mcp_call(
+            &client,
+            &server,
+            &caller_id,
+            invalid_id,
+            Some("approval-header"),
+            Some("cost-header"),
+            "file_read",
+            serde_json::json!({"path": "Cargo.toml"}),
+        )
+        .send()
+        .await
+        .expect("MCP route responds")
+        .json::<serde_json::Value>()
+        .await
+        .expect("MCP response JSON");
+        assert_eq!(body["error"]["data"]["authority_status"], "denied");
+    }
+    assert_eq!(probe.calls(), 0, "denied calls must not dispatch");
+}
+
+#[tokio::test]
+async fn runtime_admission_pending_approval_never_creates_a_receipt_or_dispatches() {
+    let probe = RuntimeMcpDispatchProbe::new();
+    let server =
+        start_runtime_admission_test_server_with_dispatch_probe(false, probe.clone()).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+
+    let pending = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", server.base_url),
+    )
+    .json(&runtime_approval_request(&caller_id))
+    .send()
+    .await
+    .expect("approval route responds");
+    assert_eq!(pending.status(), 200);
+    let pending: serde_json::Value = pending.json().await.expect("pending JSON");
+    let approval_ref = pending["approval_ref"]
+        .as_str()
+        .expect("pending approval ref");
+
+    let response = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!("pending-invocation"),
+        Some(approval_ref),
+        Some("unusable-cost-ref"),
+        "file_read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )
+    .send()
+    .await
+    .expect("MCP route responds");
+    let body: serde_json::Value = response.json().await.expect("MCP JSON");
+    assert_eq!(
+        body["error"]["data"]["authority_status"],
+        "pending_approval"
+    );
+
+    let receipt = runtime_authorized_request(
+        &client,
+        reqwest::Method::GET,
+        format!(
+            "{}/api/runtime/receipts/pending-invocation",
+            server.base_url
+        ),
+    )
+    .send()
+    .await
+    .expect("receipt route responds");
+    assert_eq!(receipt.status(), 404);
+    assert_eq!(runtime_authority_row_counts(&server), (0, 0));
+    assert_eq!(probe.calls(), 0, "pending approval must not dispatch");
+}
+
+#[tokio::test]
+async fn runtime_admission_replays_exact_string_invocation_without_a_second_dispatch() {
+    let probe = RuntimeMcpDispatchProbe::new();
+    let server = start_runtime_admission_test_server_with_dispatch_probe(true, probe.clone()).await;
+    let client = reqwest::Client::new();
+    let caller_id =
+        spawn_runtime_test_agent_with_manifest(&server, RUNTIME_AGENT_LIST_MANIFEST).await;
+    let invocation_id = "replay-exact-string-id";
+    let (approval_ref, cost_ref) =
+        runtime_approved_refs(&server, &client, &caller_id, invocation_id).await;
+
+    let first = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "agent_find",
+        serde_json::json!({"query": "runtime-agent-list-test-agent"}),
+    )
+    .send()
+    .await
+    .expect("first MCP route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("first MCP JSON");
+    assert_eq!(
+        first["result"]["_meta"]["runtime_admission"]["replayed"],
+        false
+    );
+
+    let replay = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "agent_find",
+        serde_json::json!({"query": "runtime-agent-list-test-agent"}),
+    )
+    .send()
+    .await
+    .expect("replay MCP route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("replay MCP JSON");
+    assert_eq!(
+        replay["result"]["_meta"]["runtime_admission"]["replayed"],
+        true
+    );
+    let content = replay["result"]["content"]
+        .as_array()
+        .expect("redacted envelope replay content is an array");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    let envelope = content[0]["text"]
+        .as_str()
+        .expect("replayed redacted envelope is text");
+    assert!(serde_json::from_str::<serde_json::Value>(envelope)
+        .expect("replayed redacted envelope remains valid JSON")
+        .is_array());
+    assert!(
+        replay["result"]["_meta"]["runtime_admission"]["receipt"]["result_sha256"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(
+        replay["result"]["_meta"]["runtime_admission"]["receipt"]["result_storage_mode"],
+        "redacted_envelope"
+    );
+
+    let receipt = runtime_authorized_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{}/api/runtime/receipts/{invocation_id}", server.base_url),
+    )
+    .send()
+    .await
+    .expect("receipt route responds");
+    assert_eq!(receipt.status(), 200);
+    let receipt: serde_json::Value = receipt.json().await.expect("receipt JSON");
+    assert_eq!(receipt["invocation_id"], invocation_id);
+    assert_eq!(receipt["status"], "succeeded");
+    assert_eq!(
+        probe.calls(),
+        1,
+        "success and replay must dispatch exactly once"
+    );
+}
+
+#[tokio::test]
+async fn runtime_admission_digest_only_replay_exposes_hash_metadata_without_content() {
+    let probe = RuntimeMcpDispatchProbe::new();
+    let server = start_runtime_admission_test_server_with_dispatch_probe(true, probe.clone()).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+    let invocation_id = "digest-only-replay-invocation";
+    let (approval_ref, cost_ref) =
+        runtime_approved_refs(&server, &client, &caller_id, invocation_id).await;
+
+    let first = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "file_read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )
+    .send()
+    .await
+    .expect("first MCP route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("first MCP JSON");
+    assert_eq!(first["result"]["isError"], false);
+
+    let replay = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "file_read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )
+    .send()
+    .await
+    .expect("replay MCP route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("replay MCP JSON");
+    assert_eq!(
+        replay["result"]["_meta"]["runtime_admission"]["replayed"],
+        true
+    );
+    assert!(replay["result"]["content"]
+        .as_array()
+        .expect("digest-only replay content is an array")
+        .is_empty());
+    assert_eq!(
+        replay["result"]["_meta"]["runtime_admission"]["receipt"]["result_storage_mode"],
+        "digest_only"
+    );
+    assert!(
+        replay["result"]["_meta"]["runtime_admission"]["receipt"]["result_sha256"]
+            .as_str()
+            .is_some()
+    );
+    assert_eq!(probe.calls(), 1, "digest-only replay must not redispatch");
+}
+
+#[tokio::test]
+async fn runtime_admission_failed_tool_replay_preserves_error_without_second_dispatch() {
+    let probe = RuntimeMcpDispatchProbe::new();
+    let server = start_runtime_admission_test_server_with_dispatch_probe(true, probe.clone()).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+    let invocation_id = "failed-replay-invocation";
+    let arguments = serde_json::json!({"path": "definitely-missing-runtime-admission-file"});
+    let (approval_ref, cost_ref) =
+        runtime_approved_refs(&server, &client, &caller_id, invocation_id).await;
+
+    let first = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "file_read",
+        arguments.clone(),
+    )
+    .send()
+    .await
+    .expect("failed tool call responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("failed tool JSON");
+    assert_eq!(first["result"]["isError"], true);
+    assert_eq!(
+        first["result"]["_meta"]["runtime_admission"]["replayed"],
+        false
+    );
+
+    let replay = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "file_read",
+        arguments,
+    )
+    .send()
+    .await
+    .expect("failed replay responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("failed replay JSON");
+    assert_eq!(replay["result"]["isError"], true);
+    assert_eq!(
+        replay["result"]["_meta"]["runtime_admission"]["replayed"],
+        true
+    );
+    assert_eq!(
+        replay["result"]["_meta"]["runtime_admission"]["receipt"]["status"],
+        "failed"
+    );
+
+    let receipt = runtime_authorized_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{}/api/runtime/receipts/{invocation_id}", server.base_url),
+    )
+    .send()
+    .await
+    .expect("receipt route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("receipt JSON");
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(
+        probe.calls(),
+        1,
+        "failed call and replay must dispatch exactly once"
+    );
+}
+
+#[tokio::test]
+async fn runtime_admission_routes_require_auth_reject_unknown_fields_and_fail_closed_when_disabled()
+{
+    let disabled = start_runtime_admission_test_server_with_enabled(false, true).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&disabled).await;
+    let request = runtime_approval_request(&caller_id);
+
+    let unauthenticated = client
+        .post(format!("{}/api/runtime/approvals/admit", disabled.base_url))
+        .json(&request)
+        .send()
+        .await
+        .expect("route responds");
+    assert_eq!(unauthenticated.status(), 401);
+
+    let mut unknown = request.clone();
+    unknown["unexpected"] = serde_json::json!(true);
+    let unknown = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", disabled.base_url),
+    )
+    .json(&unknown)
+    .send()
+    .await
+    .expect("route responds");
+    assert_eq!(unknown.status(), 400);
+
+    let closed = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", disabled.base_url),
+    )
+    .json(&request)
+    .send()
+    .await
+    .expect("route responds");
+    assert_eq!(closed.status(), 503);
+
+    let invalid_decision = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/resolve", disabled.base_url),
+    )
+    .json(&serde_json::json!({"approval_ref": "approval-test", "decision": "unknown"}))
+    .send()
+    .await
+    .expect("resolve route responds");
+    assert_eq!(invalid_decision.status(), 400);
+
+    let legacy = runtime_mcp_call(
+        &client,
+        &disabled,
+        &caller_id,
+        serde_json::json!("legacy-disabled-admission"),
+        None,
+        None,
+        "file_read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )
+    .send()
+    .await
+    .expect("legacy MCP route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("legacy MCP JSON");
+    assert!(legacy["result"]["content"].is_array());
+    assert!(legacy["result"]["_meta"].is_null());
+}
+
+#[tokio::test]
+async fn runtime_admission_disabled_legacy_mcp_tools_call_preserves_global_api_auth() {
+    let server = start_runtime_admission_test_server_with_enabled(false, true).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+
+    for credential in [None, Some("wrong-control-plane-key")] {
+        let request = client
+            .post(format!("{}/mcp", server.base_url))
+            .header("X-OpenFang-Agent-Id", &caller_id);
+        let request = if let Some(credential) = credential {
+            request.bearer_auth(credential)
+        } else {
+            request
+        };
+        let response = request
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "legacy-missing-or-wrong-global-key",
+                "method": "tools/call",
+                "params": {"name": "file_read", "arguments": {"path": "Cargo.toml"}}
+            }))
+            .send()
+            .await
+            .expect("legacy MCP route responds");
+        assert_eq!(
+            response.status(),
+            401,
+            "legacy tools/call retains global auth"
+        );
+    }
+
+    let valid = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!("legacy-valid-global-key"),
+        None,
+        None,
+        "file_read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )
+    .send()
+    .await
+    .expect("legacy MCP route responds with valid global key");
+    assert_eq!(valid.status(), 200);
+    let valid: serde_json::Value = valid.json().await.expect("legacy MCP JSON");
+    assert!(valid["result"]["content"].is_array());
+    assert!(valid["result"]["_meta"].is_null());
+}
+
+#[tokio::test]
+async fn runtime_authority_invalid_contract_is_400_without_retry_hint() {
+    let server = start_runtime_admission_test_server(true).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+    let mut request = runtime_approval_request(&caller_id);
+    request["correlation_id"] = serde_json::json!("   ");
+
+    let response = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", server.base_url),
+    )
+    .json(&request)
+    .send()
+    .await
+    .expect("runtime approval route responds");
+    assert_eq!(response.status(), 400);
+    assert!(!response.headers().contains_key("retry-after"));
+    let body: serde_json::Value = response.json().await.expect("invalid request JSON");
+    assert_eq!(body["error"], "invalid_runtime_authority_request");
+    assert!(body.get("retry_after").is_none());
+}
+
+#[tokio::test]
+async fn runtime_authority_unknown_expired_and_already_resolved_are_stable_conflicts() {
+    let server = start_runtime_admission_test_server(false).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+
+    let unknown = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/resolve", server.base_url),
+    )
+    .json(&serde_json::json!({
+        "approval_ref": "approval-unknown",
+        "decision": "approved"
+    }))
+    .send()
+    .await
+    .expect("unknown resolve responds");
+    assert_eq!(unknown.status(), 409);
+    assert_eq!(
+        unknown
+            .json::<serde_json::Value>()
+            .await
+            .expect("unknown conflict JSON")["error"],
+        "runtime_authority_conflict"
+    );
+
+    let pending = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", server.base_url),
+    )
+    .json(&runtime_approval_request(&caller_id))
+    .send()
+    .await
+    .expect("pending approval responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("pending approval JSON");
+    let approval_ref = pending["approval_ref"]
+        .as_str()
+        .expect("pending approval ref");
+    for expected_status in [200, 409] {
+        let response = runtime_authorized_request(
+            &client,
+            reqwest::Method::POST,
+            format!("{}/api/runtime/approvals/resolve", server.base_url),
+        )
+        .json(&serde_json::json!({
+            "approval_ref": approval_ref,
+            "decision": "approved"
+        }))
+        .send()
+        .await
+        .expect("resolve responds");
+        assert_eq!(response.status().as_u16(), expected_status);
+        if expected_status == 409 {
+            assert_eq!(
+                response
+                    .json::<serde_json::Value>()
+                    .await
+                    .expect("already resolved conflict JSON")["error"],
+                "runtime_authority_conflict"
+            );
+        }
+    }
+
+    let mut expiring_request = runtime_approval_request(&caller_id);
+    expiring_request["correlation_id"] = serde_json::json!("correlation-expiring");
+    expiring_request["plan_id"] = serde_json::json!("plan-expiring");
+    expiring_request["ttl_seconds"] = serde_json::json!(1);
+    let expiring = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", server.base_url),
+    )
+    .json(&expiring_request)
+    .send()
+    .await
+    .expect("expiring approval responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("expiring approval JSON");
+    let expiring_ref = expiring["approval_ref"]
+        .as_str()
+        .expect("expiring approval ref");
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let expired = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/resolve", server.base_url),
+    )
+    .json(&serde_json::json!({
+        "approval_ref": expiring_ref,
+        "decision": "approved"
+    }))
+    .send()
+    .await
+    .expect("expired resolve responds");
+    assert_eq!(expired.status(), 409);
+    assert_eq!(
+        expired
+            .json::<serde_json::Value>()
+            .await
+            .expect("expired conflict JSON")["error"],
+        "runtime_authority_conflict"
+    );
+}
+
+#[tokio::test]
+async fn runtime_admission_rejects_changed_bindings_without_replacing_the_first_receipt() {
+    let server = start_runtime_admission_test_server(true).await;
+    let client = reqwest::Client::new();
+    let caller_id =
+        spawn_runtime_test_agent_with_manifest(&server, RUNTIME_MULTI_TOOL_MANIFEST).await;
+    let other_caller_id = spawn_runtime_test_agent(&server).await;
+    let invocation_id = "binding-guard-invocation";
+    let (approval_ref, cost_ref) =
+        runtime_approved_refs(&server, &client, &caller_id, invocation_id).await;
+
+    let first = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "file_read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )
+    .send()
+    .await
+    .expect("first call responds");
+    assert_eq!(first.status(), 200);
+
+    for (agent_id, tool_name, arguments) in [
+        (
+            caller_id.as_str(),
+            "file_read",
+            serde_json::json!({"path": "crates/openfang-api/Cargo.toml"}),
+        ),
+        (
+            caller_id.as_str(),
+            "file_list",
+            serde_json::json!({"path": "."}),
+        ),
+        (
+            other_caller_id.as_str(),
+            "file_read",
+            serde_json::json!({"path": "Cargo.toml"}),
+        ),
+    ] {
+        let body = runtime_mcp_call(
+            &client,
+            &server,
+            agent_id,
+            serde_json::json!(invocation_id),
+            Some(&approval_ref),
+            Some(&cost_ref),
+            tool_name,
+            arguments,
+        )
+        .send()
+        .await
+        .expect("changed binding route responds")
+        .json::<serde_json::Value>()
+        .await
+        .expect("changed binding JSON");
+        assert_eq!(body["error"]["data"]["authority_status"], "denied");
+    }
+
+    let receipt = runtime_authorized_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{}/api/runtime/receipts/{invocation_id}", server.base_url),
+    )
+    .send()
+    .await
+    .expect("receipt route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("receipt JSON");
+    assert_eq!(receipt["agent_id"], caller_id);
+    assert_eq!(receipt["tool_name"], "file_read");
+    assert_eq!(
+        receipt["arguments_sha256"],
+        openfang_runtime::result_receipt::canonical_json_sha256(&serde_json::json!({
+            "path": "Cargo.toml"
+        }))
+        .expect("digest")
+    );
+}
+
+#[tokio::test]
+async fn runtime_admission_concurrent_duplicate_has_one_durable_dispatch_receipt() {
+    let (probe, dispatch_gate) = RuntimeMcpDispatchProbe::blocked();
+    let server = start_runtime_admission_test_server_with_dispatch_probe(true, probe.clone()).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+    let invocation_id = "concurrent-duplicate-invocation";
+    let (approval_ref, cost_ref) =
+        runtime_approved_refs(&server, &client, &caller_id, invocation_id).await;
+
+    let first = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "file_read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )
+    .send();
+    let first = tokio::spawn(first);
+    probe.wait_for_call().await;
+    let second = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!(invocation_id),
+        Some(&approval_ref),
+        Some(&cost_ref),
+        "file_read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )
+    .send();
+    let second = tokio::spawn(second);
+    tokio::task::yield_now().await;
+    dispatch_gate.wait().await;
+    let (first, second) = tokio::join!(first, second);
+    let bodies = [
+        first
+            .expect("first concurrent task")
+            .expect("first concurrent response")
+            .json::<serde_json::Value>()
+            .await
+            .expect("first concurrent JSON"),
+        second
+            .expect("second concurrent task")
+            .expect("second concurrent response")
+            .json::<serde_json::Value>()
+            .await
+            .expect("second concurrent JSON"),
+    ];
+    let completed = bodies
+        .iter()
+        .filter(|body| body["result"]["_meta"]["runtime_admission"]["replayed"] == false)
+        .count();
+    let replay_or_progress = bodies
+        .iter()
+        .filter(|body| {
+            body["result"]["_meta"]["runtime_admission"]["replayed"] == true
+                || body["error"]["data"]["authority_status"] == "in_progress"
+        })
+        .count();
+    assert_eq!(completed, 1, "only one request may dispatch");
+    assert_eq!(
+        replay_or_progress, 1,
+        "duplicate returns replay or in-progress evidence"
+    );
+
+    let receipt = runtime_authorized_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{}/api/runtime/receipts/{invocation_id}", server.base_url),
+    )
+    .send()
+    .await
+    .expect("receipt route responds")
+    .json::<serde_json::Value>()
+    .await
+    .expect("receipt JSON");
+    assert_eq!(receipt["invocation_id"], invocation_id);
+    assert_eq!(receipt["status"], "succeeded");
+    assert_eq!(
+        probe.calls(),
+        1,
+        "concurrent duplicates must dispatch exactly once"
+    );
 }
 
 #[tokio::test]
