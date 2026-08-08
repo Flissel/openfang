@@ -1,6 +1,6 @@
 name = "brain-coder"
 version = "0.1.0"
-description = "VibeMind coding agent. Brain-routed from the coding space. Uses Claude Code for implementation."
+description = "VibeMind coding agent. Brain-routed from the coding space for implementation, debugging, refactoring, and review."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["coding", "vibemind", "brain-routed"]
@@ -14,13 +14,12 @@ mcp_servers = [
   "qdrant",
   "fetch",
   "brain",
-  "issue-detector",
-  "memory-search"
+  "issue-detector"
 ]
 
 [model]
-provider = "claude-code"
-model = "claude-code/sonnet"
+provider = "openai"
+model = "gpt-4o-mini"
 max_tokens = 8192
 temperature = 0.3
 system_prompt = '''{{MEMORY}}
