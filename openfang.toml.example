@@ -7,7 +7,14 @@
                                              # Use "0.0.0.0:<port>" to expose on LAN / Docker. The port must
                                              # match the port you publish (Docker image exposes 4200). You can
                                              # also override at runtime with OPENFANG_LISTEN=0.0.0.0:4200.
-                                             # See docs/configuration.md "Exposing the Dashboard".
+# See docs/configuration.md "Exposing the Dashboard".
+
+# Tool-only runtime profile: disables all LLM, embedding, vision, and TTS
+# initialization plus agent/model routes while preserving authenticated /mcp.
+# Do not combine it with explicit [default_model], [memory] embedding,
+# fallback provider, or provider URL/key configuration.
+# [runtime]
+# tool_only = true
 
 [default_model]
 provider = "anthropic"                    # "anthropic", "gemini", "openai", "groq", "ollama", etc.

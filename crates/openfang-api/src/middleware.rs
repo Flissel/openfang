@@ -6,13 +6,49 @@
 //! - In-memory rate limiting (per IP)
 
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{Request, Response, StatusCode};
 use axum::middleware::Next;
+use axum::response::IntoResponse;
 use std::time::Instant;
 use tracing::info;
 
 /// Request ID header name (standard).
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Returns whether a request targets a model-backed API surface that cannot
+/// exist in the tool-only runtime profile. `/mcp` deliberately remains outside
+/// this set so authenticated runtime-admission tool execution stays available.
+pub fn tool_only_blocks_model_route(tool_only: bool, path: &str) -> bool {
+    tool_only
+        && (path.starts_with("/v1/")
+            || path.starts_with("/api/models")
+            || path.starts_with("/api/providers")
+            || (path.starts_with("/api/agents/") && path.ends_with("/model")))
+}
+
+/// Fail closed before a model-backed route reaches a handler in tool-only mode.
+pub async fn tool_only_model_routes(
+    State(tool_only): State<bool>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    if tool_only_blocks_model_route(tool_only, request.uri().path()) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": "Model runtime is disabled by [runtime] tool_only = true",
+                    "type": "service_unavailable_error",
+                    "code": "tool_only_model_runtime_disabled"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
 
 /// Middleware: inject a unique request ID and log the request/response.
 pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Body> {
@@ -281,8 +317,10 @@ mod tests {
     use axum::extract::ConnectInfo;
     use axum::http::{Method, Request};
     use axum::routing::get;
-    use axum::Router;
+    use axum::{Extension, Router};
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     #[test]
@@ -395,5 +433,43 @@ mod tests {
         req.extensions_mut().insert(ConnectInfo(addr));
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    async fn counted_handler(Extension(calls): Extension<Arc<AtomicUsize>>) -> &'static str {
+        calls.fetch_add(1, Ordering::SeqCst);
+        "reached"
+    }
+
+    #[tokio::test]
+    async fn tool_only_blocks_model_routes_without_calling_the_handler_but_keeps_mcp() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/models", get(counted_handler))
+            .route("/mcp", get(counted_handler))
+            .layer(Extension(Arc::clone(&calls)))
+            .layer(axum::middleware::from_fn_with_state(
+                true,
+                tool_only_model_routes,
+            ));
+
+        let model_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(model_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mcp_response = app
+            .oneshot(Request::builder().uri("/mcp").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(mcp_response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

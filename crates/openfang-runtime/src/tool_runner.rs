@@ -629,6 +629,28 @@ pub async fn execute_external_mcp_tool_via_runner(
     .await
 }
 
+/// Runtime capability required by a built-in tool.
+///
+/// This is the single semantic classification used by transports and agent
+/// tool projection. Keep model-backed tools here so tool-only runtimes can
+/// remove them before discovery, admission, or dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinToolRuntimeRequirement {
+    /// The tool is executable without any model provider.
+    Deterministic,
+    /// The tool invokes a generative, vision, speech, or embedding model.
+    ModelInference,
+}
+
+/// Classify the runtime requirement for one built-in tool name.
+pub fn builtin_tool_runtime_requirement(tool_name: &str) -> BuiltinToolRuntimeRequirement {
+    match tool_name {
+        "media_describe" | "media_transcribe" | "image_generate" | "text_to_speech"
+        | "speech_to_text" => BuiltinToolRuntimeRequirement::ModelInference,
+        _ => BuiltinToolRuntimeRequirement::Deterministic,
+    }
+}
+
 /// Get definitions for all built-in tools.
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -3879,6 +3901,33 @@ mod tests {
         assert!(names.contains(&"skill_list"));
         assert!(names.contains(&"skill_describe"));
         assert!(names.contains(&"skill_execute"));
+    }
+
+    #[test]
+    fn tool_only_classification_covers_every_model_backed_builtin() {
+        let model_backed = [
+            "media_describe",
+            "media_transcribe",
+            "image_generate",
+            "text_to_speech",
+            "speech_to_text",
+        ];
+
+        for name in model_backed {
+            assert_eq!(
+                builtin_tool_runtime_requirement(name),
+                BuiltinToolRuntimeRequirement::ModelInference,
+                "{name} must be classified as model inference"
+            );
+        }
+
+        for name in ["system_time", "file_read", "image_analyze"] {
+            assert_eq!(
+                builtin_tool_runtime_requirement(name),
+                BuiltinToolRuntimeRequirement::Deterministic,
+                "{name} must remain available without a model runtime"
+            );
+        }
     }
 
     /// Issue #1038: skill_list, skill_describe, skill_execute work without

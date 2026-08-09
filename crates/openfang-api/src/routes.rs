@@ -7544,10 +7544,10 @@ pub async fn mcp_http(
                         Some(&state.kernel.browser_ctx),
                         None,
                         None,
-                        Some(&state.kernel.media_engine),
+                        state.kernel.media_engine.as_ref(),
                         caller.manifest.exec_policy.as_ref(),
                         if state.kernel.config.tts.enabled {
-                            Some(&state.kernel.tts_engine)
+                            state.kernel.tts_engine.as_ref()
                         } else {
                             None
                         },
@@ -7668,10 +7668,10 @@ pub async fn mcp_http(
             Some(&state.kernel.browser_ctx),
             None,
             None,
-            Some(&state.kernel.media_engine),
+            state.kernel.media_engine.as_ref(),
             caller.manifest.exec_policy.as_ref(),
             if state.kernel.config.tts.enabled {
-                Some(&state.kernel.tts_engine)
+                state.kernel.tts_engine.as_ref()
             } else {
                 None
             },
@@ -11271,12 +11271,15 @@ pub async fn upload_file(
             },
             size_bytes: size as u64,
         };
-        match state
-            .kernel
-            .media_engine
-            .transcribe_audio(&attachment)
-            .await
-        {
+        let Some(media_engine) = state.kernel.media_engine.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    serde_json::json!({"error": "Media processing is disabled by the runtime profile"}),
+                ),
+            );
+        };
+        match media_engine.transcribe_audio(&attachment).await {
             Ok(result) => {
                 tracing::info!(chars = result.description.len(), provider = %result.provider, "Audio transcribed");
                 Some(result.description)
