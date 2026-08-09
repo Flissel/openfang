@@ -38,6 +38,25 @@ pub async fn build_router(
     kernel: Arc<OpenFangKernel>,
     listen_addr: SocketAddr,
 ) -> (Router<()>, Arc<AppState>) {
+    build_router_inner(kernel, listen_addr).await
+}
+
+/// Builds one test router with a lifecycle-owned MCP dispatch observer.
+/// Daemon startup always uses `build_router`, which leaves it unset.
+#[doc(hidden)]
+pub async fn build_router_with_runtime_mcp_dispatch_observer(
+    kernel: Arc<OpenFangKernel>,
+    listen_addr: SocketAddr,
+    observer: routes::RuntimeMcpDispatchObserver,
+) -> (Router<()>, Arc<AppState>) {
+    let (router, state) = build_router_inner(kernel, listen_addr).await;
+    (router.layer(axum::Extension(observer)), state)
+}
+
+async fn build_router_inner(
+    kernel: Arc<OpenFangKernel>,
+    listen_addr: SocketAddr,
+) -> (Router<()>, Arc<AppState>) {
     // Start channel bridges (Telegram, etc.)
     let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
 
@@ -544,6 +563,25 @@ pub async fn build_router(
         .route(
             "/api/approvals/{id}/reject",
             axum::routing::post(routes::reject_request),
+        )
+        // Runtime authority endpoints remain inside the global API auth layer
+        // and also require the configured administrative control-plane API key
+        // in their handlers. Agent identity headers are never credentials.
+        .route(
+            "/api/runtime/approvals/admit",
+            axum::routing::post(routes::runtime_admit_plan_approval),
+        )
+        .route(
+            "/api/runtime/approvals/resolve",
+            axum::routing::post(routes::runtime_resolve_plan_approval),
+        )
+        .route(
+            "/api/runtime/cost-reservations",
+            axum::routing::post(routes::runtime_reserve_cost),
+        )
+        .route(
+            "/api/runtime/receipts/{invocation_id}",
+            axum::routing::get(routes::runtime_read_receipt),
         )
         // Usage endpoints
         .route("/api/usage", axum::routing::get(routes::usage_stats))

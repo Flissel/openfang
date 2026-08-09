@@ -5,6 +5,9 @@
 
 use crate::kernel_handle::KernelHandle;
 use crate::mcp;
+use crate::runtime_execution::{
+    execute_external_mcp_tool as execute_admitted_external_mcp_tool, RuntimeToolExecution,
+};
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
@@ -561,6 +564,69 @@ pub async fn execute_tool(
             is_error: true,
         },
     }
+}
+
+/// Run an externally-originated MCP invocation behind durable runtime admission.
+///
+/// Agent-loop callers intentionally keep using `execute_tool`; this adapter is for
+/// the external transport boundary, where admission must precede every inner policy.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_external_mcp_tool_via_runner(
+    context: openfang_types::runtime_admission::RuntimeAdmissionContextV1,
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+    kernel: Arc<dyn KernelHandle>,
+    allowed_tools: Option<&[String]>,
+    caller_agent_id: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+    web_ctx: Option<&WebToolsContext>,
+    browser_ctx: Option<&crate::browser::BrowserManager>,
+    allowed_env_vars: Option<&[String]>,
+    workspace_root: Option<&Path>,
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    tts_engine: Option<&crate::tts::TtsEngine>,
+    docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
+    process_manager: Option<&crate::process_manager::ProcessManager>,
+) -> RuntimeToolExecution {
+    let dispatch_kernel = Arc::clone(&kernel);
+    let bound_tool_use_id = context.invocation_id.clone();
+    let bound_tool_name = context.tool_name.clone();
+    let bound_caller_agent_id = context.caller_agent_id.clone();
+    execute_admitted_external_mcp_tool(
+        kernel,
+        context,
+        tool_use_id,
+        tool_name,
+        input,
+        caller_agent_id,
+        allowed_tools,
+        move || async move {
+            execute_tool(
+                &bound_tool_use_id,
+                &bound_tool_name,
+                input,
+                Some(&dispatch_kernel),
+                allowed_tools,
+                Some(&bound_caller_agent_id),
+                skill_registry,
+                mcp_connections,
+                web_ctx,
+                browser_ctx,
+                allowed_env_vars,
+                workspace_root,
+                media_engine,
+                exec_policy,
+                tts_engine,
+                docker_config,
+                process_manager,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 /// Get definitions for all built-in tools.
@@ -4786,6 +4852,8 @@ mod tests {
         created: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
         cancelled: std::sync::Mutex<Vec<String>>,
         jobs: std::sync::Mutex<Vec<serde_json::Value>>,
+        runtime_admission_calls: std::sync::atomic::AtomicUsize,
+        runtime_dispatch_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeKernelHandle {
@@ -4794,6 +4862,8 @@ mod tests {
                 created: std::sync::Mutex::new(Vec::new()),
                 cancelled: std::sync::Mutex::new(Vec::new()),
                 jobs: std::sync::Mutex::new(Vec::new()),
+                runtime_admission_calls: std::sync::atomic::AtomicUsize::new(0),
+                runtime_dispatch_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -4814,6 +4884,25 @@ mod tests {
         }
         async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
             Err("not used".into())
+        }
+        async fn runtime_admit(
+            &self,
+            _context: openfang_types::runtime_admission::RuntimeAdmissionContextV1,
+        ) -> Result<openfang_types::runtime_admission::RuntimeAdmissionDecisionV1, String> {
+            self.runtime_admission_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("not admitted".into())
+        }
+        async fn runtime_mark_dispatching(
+            &self,
+            _invocation_id: &str,
+        ) -> Result<openfang_types::runtime_admission::ExecutionReceiptV1, String> {
+            self.runtime_dispatch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("not used".into())
+        }
+        fn runtime_receipt_max_bytes(&self) -> Result<usize, String> {
+            Ok(1_024)
         }
         fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
             vec![]
@@ -4897,6 +4986,73 @@ mod tests {
         async fn cron_cancel(&self, job_id: &str) -> Result<(), String> {
             self.cancelled.lock().unwrap().push(job_id.to_string());
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn external_runner_binding_mismatches_stop_before_admission() {
+        for mismatch in ["invocation", "tool", "caller", "digest", "scope"] {
+            let fake = Arc::new(FakeKernelHandle::new());
+            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+            let input = serde_json::json!({"b": 2, "a": 1});
+            let mut context = openfang_types::runtime_admission::RuntimeAdmissionContextV1 {
+                invocation_id: "invocation-1".into(),
+                caller_agent_id: "agent-1".into(),
+                approval_ref: "approval-1".into(),
+                cost_ref: "cost-1".into(),
+                tool_name: "file_read".into(),
+                arguments_sha256: crate::result_receipt::canonical_json_sha256(&input)
+                    .expect("digest"),
+            };
+            let mut tool_use_id = context.invocation_id.clone();
+            let mut tool_name = context.tool_name.clone();
+            let mut caller = Some(context.caller_agent_id.clone());
+            let mut allowed = Some(vec![context.tool_name.clone()]);
+            match mismatch {
+                "invocation" => tool_use_id = "other-invocation".into(),
+                "tool" => tool_name = "file_list".into(),
+                "caller" => caller = Some("other-agent".into()),
+                "digest" => context.arguments_sha256 = "b".repeat(64),
+                "scope" => allowed = Some(vec!["file_list".into()]),
+                _ => unreachable!(),
+            }
+
+            let outcome = execute_external_mcp_tool_via_runner(
+                context,
+                &tool_use_id,
+                &tool_name,
+                &input,
+                handle,
+                allowed.as_deref(),
+                caller.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+            assert!(matches!(
+                outcome,
+                crate::runtime_execution::RuntimeToolExecution::Denied { .. }
+            ));
+            assert_eq!(
+                fake.runtime_admission_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                fake.runtime_dispatch_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
         }
     }
 

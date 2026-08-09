@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -360,4 +364,132 @@ mod tests {
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap(); // Should not error
     }
+
+    #[test]
+    fn migration_v9_creates_runtime_authority_tables_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+
+        for table in [
+            "runtime_approvals",
+            "cost_reservations",
+            "execution_receipts",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table} must be created exactly once");
+        }
+
+        let approval_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(runtime_approvals)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(approval_columns.contains(&"ttl_seconds".to_string()));
+
+        let indexed_table: String = conn
+            .query_row(
+                "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = 'idx_cost_reservations_approval_status_expiry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_table, "cost_reservations");
+
+        let cost_index_columns: Vec<String> = conn
+            .prepare("PRAGMA index_info(idx_cost_reservations_approval_status_expiry)")
+            .unwrap()
+            .query_map([], |row| row.get(2))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            cost_index_columns,
+            vec!["approval_ref", "status", "expires_at"]
+        );
+    }
+}
+
+/// Version 9: Persist fail-closed runtime authority state.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS runtime_approvals (
+            approval_ref TEXT PRIMARY KEY,
+            correlation_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            space_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            max_plan_cost_microusd INTEGER NOT NULL CHECK (max_plan_cost_microusd >= 0),
+            ttl_seconds INTEGER NOT NULL CHECK (ttl_seconds > 0),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'expired')),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            resolved_at TEXT,
+            UNIQUE (plan_id, plan_revision, space_id, agent_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_runtime_approvals_status_expiry
+            ON runtime_approvals(status, expires_at);
+
+        CREATE TABLE IF NOT EXISTS cost_reservations (
+            cost_ref TEXT PRIMARY KEY,
+            approval_ref TEXT NOT NULL,
+            invocation_id TEXT NOT NULL UNIQUE,
+            correlation_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            space_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            reserved_micro_usd INTEGER NOT NULL CHECK (reserved_micro_usd >= 0),
+            ttl_seconds INTEGER NOT NULL CHECK (ttl_seconds > 0),
+            actual_cost_micro_usd INTEGER,
+            status TEXT NOT NULL CHECK (status IN ('reserved', 'consumed', 'released', 'settled', 'held_unknown')),
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY (approval_ref) REFERENCES runtime_approvals(approval_ref)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cost_reservations_status_expiry
+            ON cost_reservations(status, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_cost_reservations_approval_status_expiry
+            ON cost_reservations(approval_ref, status, expires_at);
+
+        CREATE TABLE IF NOT EXISTS execution_receipts (
+            invocation_id TEXT PRIMARY KEY,
+            correlation_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL CHECK (plan_revision > 0),
+            space_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            arguments_sha256 TEXT NOT NULL,
+            approval_ref TEXT NOT NULL,
+            cost_ref TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK (status IN ('prepared', 'dispatching', 'succeeded', 'failed', 'outcome_unknown')),
+            result_sha256 TEXT,
+            result_storage_mode TEXT CHECK (result_storage_mode IN ('redacted_envelope', 'digest_only')),
+            result_envelope TEXT,
+            error_class TEXT,
+            prepared_at TEXT NOT NULL,
+            dispatch_started_at TEXT,
+            finished_at TEXT,
+            FOREIGN KEY (approval_ref) REFERENCES runtime_approvals(approval_ref),
+            FOREIGN KEY (cost_ref) REFERENCES cost_reservations(cost_ref)
+        );
+        CREATE INDEX IF NOT EXISTS idx_execution_receipts_status
+            ON execution_receipts(status);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (9, datetime('now'), 'Persist runtime authority approvals, costs, and receipts');
+        ",
+    )?;
+    Ok(())
 }

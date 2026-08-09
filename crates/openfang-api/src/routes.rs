@@ -1,7 +1,7 @@
 //! Route handlers for the OpenFang API.
 
 use crate::types::*;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Extension, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -14,9 +14,19 @@ use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
+use openfang_types::runtime_admission::{
+    RuntimeAdmissionContextV1, RuntimeCostReservationRequestV1, RuntimePlanApprovalRequestV1,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+
+/// Test-only observer for the point immediately before an admitted MCP
+/// invocation enters the real runtime tool runner. It is installed only as a
+/// request extension on the special integration-test router.
+#[doc(hidden)]
+pub type RuntimeMcpDispatchObserver =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Shared application state.
 ///
@@ -7011,6 +7021,214 @@ pub async fn a2a_external_task_status(
 // ── MCP HTTP Endpoint ───────────────────────────────────────────────────
 
 const MCP_CALLER_AGENT_ID_HEADER: &str = "x-openfang-agent-id";
+const MCP_APPROVAL_REF_HEADER: &str = "x-openfang-approval-ref";
+const MCP_COST_REF_HEADER: &str = "x-openfang-cost-ref";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeApprovalResolveRequest {
+    approval_ref: String,
+    decision: RuntimeApprovalDecision,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeApprovalDecision {
+    Approved,
+    Denied,
+}
+
+fn runtime_route_error(status: StatusCode, code: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({"error": code})))
+}
+
+fn runtime_control_plane_unauthorized() -> axum::response::Response {
+    runtime_route_error(
+        StatusCode::UNAUTHORIZED,
+        "runtime_control_plane_unauthorized",
+    )
+    .into_response()
+}
+
+/// Runtime authority is an administrative control-plane boundary. A valid
+/// configured API key may select a registered agent, but the agent header is
+/// identity context only and is never accepted as a credential.
+fn require_runtime_control_plane_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), axum::response::Response> {
+    let configured = state.kernel.config.api_key.trim();
+    if configured.is_empty() {
+        return Err(runtime_control_plane_unauthorized());
+    }
+
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let x_api_key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok());
+    let valid = bearer.into_iter().chain(x_api_key).any(|candidate| {
+        use subtle::ConstantTimeEq;
+        candidate.len() == configured.len()
+            && bool::from(candidate.as_bytes().ct_eq(configured.as_bytes()))
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(runtime_control_plane_unauthorized())
+    }
+}
+
+fn runtime_service_error(error: &str) -> (StatusCode, Json<serde_json::Value>) {
+    let normalized = error.to_ascii_lowercase();
+    let is_conflict = normalized.starts_with("agent is in invalid state")
+        || normalized.contains("not found")
+        || normalized.contains("expired")
+        || normalized.contains("already resolved")
+        || normalized.contains("not pending")
+        || normalized.contains("binding mismatch")
+        || normalized.contains("conflict");
+    if is_conflict {
+        runtime_route_error(StatusCode::CONFLICT, "runtime_authority_conflict")
+    } else if normalized.starts_with("invalid input:") {
+        runtime_route_error(StatusCode::BAD_REQUEST, "invalid_runtime_authority_request")
+    } else {
+        // Disabled services, memory/IO/internal failures, and unrecognized
+        // infrastructure failures are retryable only at the service boundary.
+        runtime_route_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_authority_unavailable",
+        )
+    }
+}
+
+fn parse_runtime_body<T: serde::de::DeserializeOwned>(
+    body: serde_json::Value,
+) -> Result<T, (StatusCode, Json<serde_json::Value>)> {
+    serde_json::from_value(body).map_err(|_| {
+        runtime_route_error(StatusCode::BAD_REQUEST, "invalid_runtime_authority_request")
+    })
+}
+
+/// POST /api/runtime/approvals/admit — issue or retrieve plan approval authority.
+pub async fn runtime_admit_plan_approval(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(response) = require_runtime_control_plane_auth(&state, &headers) {
+        return response;
+    }
+    let request: RuntimePlanApprovalRequestV1 = match parse_runtime_body(body) {
+        Ok(request) => request,
+        Err(response) => return response.into_response(),
+    };
+    if request.validate().is_err() {
+        return runtime_route_error(StatusCode::BAD_REQUEST, "invalid_runtime_authority_request")
+            .into_response();
+    }
+    match state
+        .kernel
+        .runtime_admission
+        .request_plan_approval(request, state.kernel.config.approval.auto_approve)
+    {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(outcome).unwrap_or_default()),
+        )
+            .into_response(),
+        Err(error) => runtime_service_error(&error).into_response(),
+    }
+}
+
+/// POST /api/runtime/approvals/resolve — resolve one pending approval.
+pub async fn runtime_resolve_plan_approval(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(response) = require_runtime_control_plane_auth(&state, &headers) {
+        return response;
+    }
+    let request: RuntimeApprovalResolveRequest = match parse_runtime_body(body) {
+        Ok(request) => request,
+        Err(response) => return response.into_response(),
+    };
+    let approval_ref = request.approval_ref.trim();
+    if approval_ref.is_empty() {
+        return runtime_route_error(StatusCode::BAD_REQUEST, "invalid_runtime_authority_request")
+            .into_response();
+    }
+    let approved = matches!(request.decision, RuntimeApprovalDecision::Approved);
+    match state
+        .kernel
+        .runtime_admission
+        .resolve(approval_ref, approved)
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "resolved"})),
+        )
+            .into_response(),
+        Err(error) => runtime_service_error(&error).into_response(),
+    }
+}
+
+/// POST /api/runtime/cost-reservations — reserve bounded cost for one invocation.
+pub async fn runtime_reserve_cost(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(response) = require_runtime_control_plane_auth(&state, &headers) {
+        return response;
+    }
+    let request: RuntimeCostReservationRequestV1 = match parse_runtime_body(body) {
+        Ok(request) => request,
+        Err(response) => return response.into_response(),
+    };
+    if request.validate().is_err() {
+        return runtime_route_error(StatusCode::BAD_REQUEST, "invalid_runtime_authority_request")
+            .into_response();
+    }
+    match state.kernel.runtime_admission.reserve(request) {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(outcome).unwrap_or_default()),
+        )
+            .into_response(),
+        Err(error) => runtime_service_error(&error).into_response(),
+    }
+}
+
+/// GET /api/runtime/receipts/{invocation_id} — read durable receipt evidence.
+pub async fn runtime_read_receipt(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(invocation_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(response) = require_runtime_control_plane_auth(&state, &headers) {
+        return response;
+    }
+    let invocation_id = invocation_id.trim();
+    if invocation_id.is_empty() {
+        return runtime_route_error(StatusCode::BAD_REQUEST, "invalid_runtime_invocation_id")
+            .into_response();
+    }
+    match state.kernel.runtime_admission.read_receipt(invocation_id) {
+        Ok(Some(receipt)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(receipt).unwrap_or_default()),
+        )
+            .into_response(),
+        Ok(None) => {
+            runtime_route_error(StatusCode::NOT_FOUND, "runtime_receipt_not_found").into_response()
+        }
+        Err(error) => runtime_service_error(&error).into_response(),
+    }
+}
 
 /// Resolve the agent authority selected by an authenticated MCP request.
 ///
@@ -7059,15 +7277,147 @@ fn mcp_error(request: &serde_json::Value, error: serde_json::Value) -> serde_jso
     })
 }
 
+fn runtime_mcp_error(
+    request: &serde_json::Value,
+    authority_status: &str,
+    invocation_id: Option<&str>,
+    arguments_sha256: Option<&str>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({"authority_status": authority_status});
+    if let Some(invocation_id) = invocation_id {
+        data["invocation_id"] = serde_json::json!(invocation_id);
+    }
+    if let Some(arguments_sha256) = arguments_sha256 {
+        data["arguments_sha256"] = serde_json::json!(arguments_sha256);
+    }
+    mcp_error(
+        request,
+        serde_json::json!({
+            "code": -32040,
+            "message": "Runtime authority denied tool execution",
+            "data": data,
+        }),
+    )
+}
+
+fn required_runtime_header(headers: &HeaderMap, name: &'static str) -> Result<String, ()> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or(())
+}
+
+fn runtime_mcp_context(
+    request: &serde_json::Value,
+    headers: &HeaderMap,
+    caller_agent_id: &str,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Result<RuntimeAdmissionContextV1, ()> {
+    let invocation_id = request
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or(())?;
+    let context = RuntimeAdmissionContextV1 {
+        invocation_id,
+        caller_agent_id: caller_agent_id.to_owned(),
+        approval_ref: required_runtime_header(headers, MCP_APPROVAL_REF_HEADER)?,
+        cost_ref: required_runtime_header(headers, MCP_COST_REF_HEADER)?,
+        tool_name: tool_name.to_owned(),
+        arguments_sha256: openfang_runtime::result_receipt::canonical_json_sha256(arguments)
+            .map_err(|_| ())?,
+    };
+    context.validate().map_err(|_| ())?;
+    Ok(context)
+}
+
+fn runtime_replay_result(
+    invocation_id: String,
+    status: openfang_types::runtime_admission::ExecutionReceiptStatus,
+    result_sha256: Option<String>,
+    result_storage_mode: Option<openfang_types::runtime_admission::ResultStorageMode>,
+    redacted_envelope: Option<String>,
+) -> Option<serde_json::Value> {
+    let is_error = match status {
+        openfang_types::runtime_admission::ExecutionReceiptStatus::Succeeded => false,
+        openfang_types::runtime_admission::ExecutionReceiptStatus::Failed => true,
+        _ => return None,
+    };
+    let result_available = redacted_envelope.is_some();
+    let content = match (status, result_storage_mode, redacted_envelope) {
+        (
+            openfang_types::runtime_admission::ExecutionReceiptStatus::Succeeded,
+            Some(openfang_types::runtime_admission::ResultStorageMode::RedactedEnvelope),
+            Some(envelope),
+        ) => {
+            // Re-parse and re-redact the persisted envelope before exposing it.
+            // The runtime already validates the receipt; this additional pass
+            // makes replay fail closed if an unexpected stored value is unsafe.
+            let parsed = serde_json::from_str::<serde_json::Value>(&envelope).ok()?;
+            let content = serde_json::to_string(&parsed).ok()?;
+            let payload = openfang_runtime::result_receipt::receipt_payload(
+                &openfang_types::tool::ToolResult {
+                    tool_use_id: "runtime-replay".into(),
+                    content,
+                    is_error: false,
+                },
+                65_536,
+            )
+            .ok()?;
+            match payload {
+                openfang_runtime::result_receipt::ReceiptPayload {
+                    storage_mode:
+                        openfang_types::runtime_admission::ResultStorageMode::RedactedEnvelope,
+                    envelope: Some(envelope),
+                    ..
+                } => vec![serde_json::json!({"type": "text", "text": envelope})],
+                _ => return None,
+            }
+        }
+        (
+            openfang_types::runtime_admission::ExecutionReceiptStatus::Succeeded,
+            Some(openfang_types::runtime_admission::ResultStorageMode::DigestOnly),
+            None,
+        )
+        | (openfang_types::runtime_admission::ExecutionReceiptStatus::Failed, None, None) => {
+            vec![]
+        }
+        _ => return None,
+    };
+    Some(serde_json::json!({
+        "content": content,
+        "isError": is_error,
+        "_meta": {
+            "runtime_admission": {
+                "replayed": true,
+                "invocation_id": invocation_id,
+                "receipt": {
+                    "status": status,
+                    "result_sha256": result_sha256,
+                    "result_storage_mode": result_storage_mode,
+                    "result_available": result_available,
+                }
+            }
+        }
+    }))
+}
+
 /// POST /mcp — Handle MCP JSON-RPC requests over HTTP.
 ///
 /// Exposes the same MCP protocol normally served via stdio, allowing
 /// external MCP clients to connect over HTTP instead.
 pub async fn mcp_http(
     State(state): State<Arc<AppState>>,
+    observer: Option<Extension<RuntimeMcpDispatchObserver>>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     // Gather all available tools (builtin + skills + MCP)
     let mut tools = builtin_tool_definitions();
     {
@@ -7093,16 +7443,23 @@ pub async fn mcp_http(
     // available without an execution identity.
     let method = request["method"].as_str().unwrap_or("");
     if matches!(method, "tools/list" | "tools/call") {
+        // Runtime authority credentials protect only invocation. MCP protocol
+        // setup and caller-scoped discovery retain their existing behavior.
+        if method == "tools/call" && state.kernel.config.runtime_admission.enabled {
+            if let Err(response) = require_runtime_control_plane_auth(&state, &headers) {
+                return response;
+            }
+        }
         let caller = match resolve_mcp_caller(&state, &headers) {
             Ok(caller) => caller,
-            Err(error) => return Json(mcp_error(&request, error)),
+            Err(error) => return Json(mcp_error(&request, error)).into_response(),
         };
         let caller_tools = state.kernel.available_tools(caller.id);
 
         if method == "tools/list" {
             let response =
                 openfang_runtime::mcp_server::handle_mcp_request(&request, &caller_tools).await;
-            return Json(response);
+            return Json(response).into_response();
         }
 
         let tool_name = request["params"]["name"].as_str().unwrap_or("");
@@ -7122,11 +7479,170 @@ pub async fn mcp_http(
                     "code": -32602,
                     "message": format!("Tool not permitted for caller agent: {tool_name}")
                 }),
-            ));
+            ))
+            .into_response();
         }
         let caller_tool_names: Vec<String> =
             caller_tools.iter().map(|tool| tool.name.clone()).collect();
         let caller_agent_id = caller.id.to_string();
+
+        if state.kernel.config.runtime_admission.enabled {
+            let context = match runtime_mcp_context(
+                &request,
+                &headers,
+                &caller_agent_id,
+                tool_name,
+                &arguments,
+            ) {
+                Ok(context) => context,
+                Err(()) => {
+                    return Json(runtime_mcp_error(&request, "denied", None, None)).into_response()
+                }
+            };
+            let invocation_id = context.invocation_id.clone();
+            let arguments_sha256 = context.arguments_sha256.clone();
+
+            // Snapshot skill registry before the adapter awaits. The adapter
+            // re-checks caller, tool, scope, ID and digest before admission.
+            let skill_snapshot = state
+                .kernel
+                .skill_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot();
+            let kernel_handle: Arc<dyn openfang_runtime::kernel_handle::KernelHandle> =
+                state.kernel.clone() as Arc<dyn openfang_runtime::kernel_handle::KernelHandle>;
+            let dispatch_kernel = Arc::clone(&kernel_handle);
+            let dispatch_tool_use_id = context.invocation_id.clone();
+            let dispatch_tool_name = context.tool_name.clone();
+            let dispatch_caller_agent_id = context.caller_agent_id.clone();
+            let dispatch_arguments = arguments.clone();
+            let dispatch_caller_tool_names = caller_tool_names.clone();
+            let dispatch_observer = observer.map(|Extension(observer)| observer);
+            let execution = openfang_runtime::runtime_execution::execute_external_mcp_tool(
+                kernel_handle,
+                context,
+                &invocation_id,
+                tool_name,
+                &arguments,
+                Some(&caller_agent_id),
+                Some(&caller_tool_names),
+                move || async move {
+                    if let Some(observer) = dispatch_observer {
+                        observer().await;
+                    }
+                    openfang_runtime::tool_runner::execute_tool(
+                        &dispatch_tool_use_id,
+                        &dispatch_tool_name,
+                        &dispatch_arguments,
+                        Some(&dispatch_kernel),
+                        Some(&dispatch_caller_tool_names),
+                        Some(&dispatch_caller_agent_id),
+                        Some(&skill_snapshot),
+                        Some(&state.kernel.mcp_connections),
+                        Some(&state.kernel.web_ctx),
+                        Some(&state.kernel.browser_ctx),
+                        None,
+                        None,
+                        Some(&state.kernel.media_engine),
+                        caller.manifest.exec_policy.as_ref(),
+                        if state.kernel.config.tts.enabled {
+                            Some(&state.kernel.tts_engine)
+                        } else {
+                            None
+                        },
+                        if state.kernel.config.docker.enabled {
+                            Some(&state.kernel.config.docker)
+                        } else {
+                            None
+                        },
+                        Some(&*state.kernel.process_manager),
+                    )
+                    .await
+                },
+            )
+            .await;
+
+            let response = match execution {
+                openfang_runtime::runtime_execution::RuntimeToolExecution::Completed(result) => {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id").cloned(),
+                        "result": {
+                            "content": [{"type": "text", "text": result.content}],
+                            "isError": result.is_error,
+                            "_meta": {"runtime_admission": {"replayed": false}}
+                        }
+                    })
+                }
+                openfang_runtime::runtime_execution::RuntimeToolExecution::Replay {
+                    invocation_id,
+                    status,
+                    result_sha256,
+                    result_storage_mode,
+                    redacted_envelope,
+                } => match runtime_replay_result(
+                    invocation_id.clone(),
+                    status,
+                    result_sha256,
+                    result_storage_mode,
+                    redacted_envelope,
+                ) {
+                    Some(result) => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id").cloned(),
+                        "result": result,
+                    }),
+                    None => runtime_mcp_error(
+                        &request,
+                        "outcome_unknown",
+                        Some(&invocation_id),
+                        Some(&arguments_sha256),
+                    ),
+                },
+                openfang_runtime::runtime_execution::RuntimeToolExecution::Pending { .. } => {
+                    runtime_mcp_error(
+                        &request,
+                        "pending_approval",
+                        Some(&invocation_id),
+                        Some(&arguments_sha256),
+                    )
+                }
+                openfang_runtime::runtime_execution::RuntimeToolExecution::Denied { .. } => {
+                    runtime_mcp_error(
+                        &request,
+                        "denied",
+                        Some(&invocation_id),
+                        Some(&arguments_sha256),
+                    )
+                }
+                openfang_runtime::runtime_execution::RuntimeToolExecution::CostUnavailable {
+                    ..
+                } => runtime_mcp_error(
+                    &request,
+                    "cost_unavailable",
+                    Some(&invocation_id),
+                    Some(&arguments_sha256),
+                ),
+                openfang_runtime::runtime_execution::RuntimeToolExecution::InProgress {
+                    ..
+                } => runtime_mcp_error(
+                    &request,
+                    "in_progress",
+                    Some(&invocation_id),
+                    Some(&arguments_sha256),
+                ),
+                openfang_runtime::runtime_execution::RuntimeToolExecution::OutcomeUnknown {
+                    ..
+                } => runtime_mcp_error(
+                    &request,
+                    "outcome_unknown",
+                    Some(&invocation_id),
+                    Some(&arguments_sha256),
+                ),
+            };
+            return Json(response).into_response();
+        }
 
         // Snapshot skill registry before async call (RwLockReadGuard is !Send)
         let skill_snapshot = state
@@ -7175,12 +7691,13 @@ pub async fn mcp_http(
                 "content": [{"type": "text", "text": result.content}],
                 "isError": result.is_error,
             }
-        }));
+        }))
+        .into_response();
     }
 
     // For non-tools/call methods (initialize, tools/list, etc.), delegate to the handler
     let response = openfang_runtime::mcp_server::handle_mcp_request(&request, &tools).await;
-    Json(response)
+    Json(response).into_response()
 }
 
 // ── Multi-Session Endpoints ─────────────────────────────────────────────

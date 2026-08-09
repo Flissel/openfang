@@ -18,6 +18,7 @@ pub mod media;
 pub mod memory;
 pub mod message;
 pub mod model_catalog;
+pub mod runtime_admission;
 pub mod scheduler;
 pub mod serde_compat;
 pub mod taint;
