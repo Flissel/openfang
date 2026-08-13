@@ -1734,4 +1734,34 @@ memory_write = ["self.*"]
             transport => panic!("expected stdio transport for spaces-rowboat, got {transport:?}"),
         }
     }
+
+    #[test]
+    fn test_vibemind_golden_path_servers_whitelist_supabase_env() {
+        // Stdio MCP servers are spawned with a cleared environment; only the
+        // names in the entry-level `env` array are passed through
+        // (openfang-runtime/src/mcp.rs). Without this whitelist the Supabase
+        // credentials never reach spaces-ideas / vibemind-db (blocker B1,
+        // runbook openfang-mcp-registration-activation.md step 0).
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let expected: &[(&str, &[&str])] = &[
+            ("spaces-ideas", &["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]),
+            ("vibemind-db", &["SUPABASE_URL", "SUPABASE_ANON_KEY"]),
+        ];
+
+        for file in ["openfang.vibemind.toml.template", "openfang.vibemind.toml"] {
+            let contents = std::fs::read_to_string(repository_root.join(file)).unwrap();
+            let config: KernelConfig = toml::from_str(&contents).unwrap();
+            for (name, env) in expected {
+                let server = config
+                    .mcp_servers
+                    .iter()
+                    .find(|server| server.name == *name)
+                    .unwrap_or_else(|| panic!("{file} must declare MCP server {name}"));
+                assert_eq!(
+                    server.env, *env,
+                    "{file}: {name} must whitelist exactly {env:?}"
+                );
+            }
+        }
+    }
 }

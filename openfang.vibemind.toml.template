@@ -352,6 +352,7 @@ args = ["-y", "@kazuph/mcp-taskmanager"]
 [[mcp_servers]]
 name = "vibemind-db"
 timeout_secs = 10
+env = ["SUPABASE_URL", "SUPABASE_ANON_KEY"]
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
@@ -386,6 +387,7 @@ args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/desktop/Automation_ui/backend/moire
 [[mcp_servers]]
 name = "spaces-ideas"
 timeout_secs = 60
+env = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
