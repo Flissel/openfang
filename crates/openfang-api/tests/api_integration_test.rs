@@ -42,6 +42,100 @@ async fn start_test_server() -> TestServer {
     start_test_server_with_provider("ollama", "test-model", "OLLAMA_API_KEY").await
 }
 
+/// Start the real MCP HTTP route with the model-free runtime profile.  The
+/// default model configuration remains default-valued so profile validation
+/// permits boot while the kernel never constructs a model runtime.
+async fn start_tool_only_test_server() -> TestServer {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let mut config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        ..KernelConfig::default()
+    };
+    config.runtime.tool_only = true;
+    let kernel =
+        Arc::new(OpenFangKernel::boot_with_config(config).expect("tool-only kernel boots"));
+    kernel.set_self_handle();
+
+    let state = Arc::new(AppState {
+        kernel,
+        started_at: Instant::now(),
+        peer_registry: None,
+        bridge_manager: tokio::sync::Mutex::new(None),
+        channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config: Arc::new(tokio::sync::RwLock::new(Default::default())),
+    });
+    let app = Router::new()
+        .route("/mcp", axum::routing::post(routes::mcp_http))
+        .route(
+            "/api/agents",
+            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
+        )
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test server");
+    let addr = listener.local_addr().expect("test listener address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test server should serve");
+    });
+    TestServer {
+        base_url: format!("http://{addr}"),
+        state,
+        _tmp: tmp,
+    }
+}
+
+/// Start the production router with both the tool-only profile and runtime
+/// admission enabled. The existing lifecycle-owned dispatch observer proves
+/// that rejected model tools stop before the real tool runner.
+async fn start_tool_only_runtime_admission_test_server_with_dispatch_probe(
+    probe: Arc<RuntimeMcpDispatchProbe>,
+) -> TestServer {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let mut config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        api_key: "runtime-admission-test-key".to_string(),
+        ..KernelConfig::default()
+    };
+    config.runtime.tool_only = true;
+    config.runtime_admission.enabled = true;
+    config.approval.auto_approve = true;
+
+    let kernel =
+        Arc::new(OpenFangKernel::boot_with_config(config).expect("tool-only kernel boots"));
+    kernel.set_self_handle();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test server");
+    let addr = listener.local_addr().expect("test listener address");
+    let (app, state) = openfang_api::server::build_router_with_runtime_mcp_dispatch_observer(
+        kernel,
+        addr,
+        probe.observer(),
+    )
+    .await;
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("test server should serve");
+    });
+    TestServer {
+        base_url: format!("http://{addr}"),
+        state,
+        _tmp: tmp,
+    }
+}
+
 /// Start the production router with runtime admission enabled. Unlike the
 /// lightweight general-purpose test router, this retains the API-key middleware
 /// so authority endpoints exercise the same authenticated boundary as daemon
@@ -718,6 +812,118 @@ async fn test_mcp_tools_list_filters_catalog_to_caller_scope() {
         .collect();
     assert!(names.contains(&"file_read"));
     assert!(!names.contains(&"file_write"));
+}
+
+/// Model-backed builtins are not discoverable from an MCP caller connected to
+/// a tool-only kernel, even when the caller declares unrestricted tools.
+#[tokio::test]
+async fn tool_only_mcp_tools_list_excludes_model_inference_tools() {
+    let server = start_tool_only_test_server().await;
+    let caller_id = spawn_test_agent_with_manifest(
+        &server,
+        TEST_MANIFEST
+            .replace("tools = [\"file_read\"]", "tools = [\"*\"]")
+            .as_str(),
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/mcp", server.base_url))
+        .header("X-OpenFang-Agent-Id", caller_id)
+        .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .send()
+        .await
+        .expect("MCP route responds");
+    let body: serde_json::Value = response.json().await.expect("MCP response JSON");
+    let names: Vec<&str> = body["result"]["tools"]
+        .as_array()
+        .expect("tools/list result")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"file_read"));
+    for model_tool in [
+        "media_describe",
+        "media_transcribe",
+        "image_generate",
+        "text_to_speech",
+        "speech_to_text",
+    ] {
+        assert!(!names.contains(&model_tool), "{model_tool} must be hidden");
+    }
+}
+
+/// The same filter rejects an attempted model-tool invocation before it reaches
+/// runtime admission or the runtime tool runner.  There is no model fallback.
+#[tokio::test]
+async fn tool_only_mcp_tools_call_rejects_model_inference_before_dispatch() {
+    let probe = RuntimeMcpDispatchProbe::new();
+    let server =
+        start_tool_only_runtime_admission_test_server_with_dispatch_probe(probe.clone()).await;
+    let caller_id = spawn_runtime_test_agent_with_manifest(
+        &server,
+        TEST_MANIFEST
+            .replace("tools = [\"file_read\"]", "tools = [\"*\"]")
+            .as_str(),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+
+    // Positive control: the lifecycle-owned observer sees an admitted
+    // deterministic invocation. If the tool-only filter were removed, the
+    // model-tool request below would reach this same observer.
+    let (allowed_approval, allowed_cost) =
+        runtime_approved_refs(&server, &client, &caller_id, "tool-only-allowed").await;
+    let allowed = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!("tool-only-allowed"),
+        Some(&allowed_approval),
+        Some(&allowed_cost),
+        "file_read",
+        serde_json::json!({"path": "does-not-exist"}),
+    )
+    .send()
+    .await
+    .expect("admitted deterministic MCP request responds");
+    assert_eq!(allowed.status(), 200);
+    probe.wait_for_call().await;
+    assert_eq!(probe.calls(), 1, "positive control reaches tool runner");
+
+    let (rejected_approval, rejected_cost) =
+        runtime_approved_refs(&server, &client, &caller_id, "tool-only-model").await;
+    let before = runtime_authority_row_counts(&server);
+    let response = runtime_mcp_call(
+        &client,
+        &server,
+        &caller_id,
+        serde_json::json!("tool-only-model"),
+        Some(&rejected_approval),
+        Some(&rejected_cost),
+        "media_describe",
+        serde_json::json!({"path": "never-read.png"}),
+    )
+    .send()
+    .await
+    .expect("MCP route responds");
+    let body: serde_json::Value = response.json().await.expect("MCP response JSON");
+    assert_eq!(
+        runtime_authority_row_counts(&server),
+        before,
+        "model-tool rejection must not enter runtime admission"
+    );
+    assert_eq!(
+        probe.calls(),
+        1,
+        "model-tool rejection must not enter the runtime tool runner"
+    );
+    assert_eq!(body["error"]["code"], -32602);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not permitted"));
 }
 
 #[tokio::test]
@@ -2746,6 +2952,23 @@ async fn spawn_test_agent(server: &TestServer) -> String {
     assert_eq!(resp.status(), 201);
     let body: serde_json::Value = resp.json().await.unwrap();
     body["agent_id"].as_str().unwrap().to_string()
+}
+
+async fn spawn_test_agent_with_manifest(server: &TestServer, manifest: &str) -> String {
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/agents", server.base_url))
+        .json(&serde_json::json!({"manifest_toml": manifest}))
+        .send()
+        .await
+        .expect("spawn test agent");
+    assert_eq!(response.status(), 201);
+    response
+        .json::<serde_json::Value>()
+        .await
+        .expect("spawn response JSON")["agent_id"]
+        .as_str()
+        .expect("spawned agent id")
+        .to_string()
 }
 
 /// POST /api/schedules with all four `CronDeliveryTarget` variants should

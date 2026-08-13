@@ -1285,6 +1285,9 @@ pub struct KernelConfig {
     /// Runtime-admission dispatch bounds. Disabled by default.
     #[serde(default)]
     pub runtime_admission: RuntimeAdmissionConfig,
+    /// Runtime execution profile.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
     ///
     /// When a skill declares a `config:` section in its SKILL.md frontmatter,
@@ -1301,6 +1304,18 @@ pub struct KernelConfig {
     /// ```
     #[serde(default)]
     pub skills: HashMap<String, HashMap<String, String>>,
+}
+
+/// Runtime execution profile.
+///
+/// Set `[runtime] tool_only = true` to run OpenFang exclusively as an
+/// authenticated tool-execution control plane. Model drivers, model discovery,
+/// embeddings, and agent loops are disabled by the kernel in this profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    /// Disable every model-backed execution path and retain only tool/control-plane runtime.
+    pub tool_only: bool,
 }
 
 /// Bounds for admission-controlled runtime dispatch.
@@ -1562,12 +1577,75 @@ impl Default for KernelConfig {
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
             runtime_admission: RuntimeAdmissionConfig::default(),
+            runtime: RuntimeConfig::default(),
             skills: HashMap::new(),
         }
     }
 }
 
 impl KernelConfig {
+    /// Reject explicit model-runtime configuration when the tool-only profile is enabled.
+    ///
+    /// Default model values remain representable so existing configs can opt into the
+    /// profile without duplicating defaults; the kernel never constructs or uses them.
+    pub fn validate_runtime_profile(&self) -> Result<(), String> {
+        if !self.runtime.tool_only {
+            return Ok(());
+        }
+
+        let default_model = DefaultModelConfig::default();
+        let default_memory = MemoryConfig::default();
+        let mut conflicts = Vec::new();
+
+        if self.default_model.provider != default_model.provider
+            || self.default_model.model != default_model.model
+            || self.default_model.api_key_env != default_model.api_key_env
+            || self.default_model.base_url.is_some()
+            || self.default_model.subprocess_timeout_secs.is_some()
+        {
+            conflicts.push("default_model");
+        }
+        if !self.fallback_providers.is_empty() {
+            conflicts.push("fallback_providers");
+        }
+        if self.memory.embedding_provider.is_some()
+            || self.memory.embedding_api_key_env.is_some()
+            || self.memory.embedding_model != default_memory.embedding_model
+        {
+            conflicts.push("memory.embedding_*");
+        }
+        if !self.provider_urls.is_empty() {
+            conflicts.push("provider_urls");
+        }
+        if !self.provider_api_keys.is_empty() {
+            conflicts.push("provider_api_keys");
+        }
+        if !self.auth_profiles.is_empty() {
+            conflicts.push("auth_profiles");
+        }
+        if self.tts.enabled {
+            conflicts.push("tts.enabled");
+        }
+        if self.media.image_provider.is_some()
+            || self.media.audio_provider.is_some()
+            || self.media.audio_base_url.is_some()
+            || self.media.tts_openai_base_url.is_some()
+            || self.media.tts_elevenlabs_base_url.is_some()
+            || self.media.image_gen_base_url.is_some()
+        {
+            conflicts.push("media model provider settings");
+        }
+
+        if conflicts.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "[runtime] tool_only = true rejects model runtime configuration: {}",
+                conflicts.join(", ")
+            ))
+        }
+    }
+
     /// Resolved workspaces root directory.
     pub fn effective_workspaces_dir(&self) -> PathBuf {
         self.workspaces_dir
@@ -1682,6 +1760,7 @@ impl std::fmt::Debug for KernelConfig {
             )
             .field("auth", &format!("enabled={}", self.auth.enabled))
             .field("runtime_admission", &self.runtime_admission)
+            .field("runtime", &self.runtime)
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
             .finish()
     }
@@ -4751,5 +4830,55 @@ shell_env_passthrough = ["*"]
             config.memory.embedding_api_key_env.as_deref(),
             Some("OPENAI_API_KEY")
         );
+    }
+
+    #[test]
+    fn tool_only_runtime_profile_is_explicit_and_disabled_by_default() {
+        let default_config = KernelConfig::default();
+        let default_json = serde_json::to_value(default_config).expect("config serializes");
+        assert_eq!(
+            default_json["runtime"]["tool_only"].as_bool(),
+            Some(false),
+            "the runtime profile must make the legacy model-enabled default explicit"
+        );
+
+        let configured: KernelConfig = toml::from_str(
+            r#"
+[runtime]
+tool_only = true
+"#,
+        )
+        .expect("tool-only runtime profile deserializes");
+        let configured_json = serde_json::to_value(configured).expect("config serializes");
+        assert_eq!(
+            configured_json["runtime"]["tool_only"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn tool_only_runtime_profile_rejects_explicit_model_and_embedding_configuration() {
+        let config: KernelConfig = toml::from_str(
+            r#"
+[runtime]
+tool_only = true
+
+[default_model]
+provider = "openai"
+model = "gpt-5"
+api_key_env = "OPENAI_API_KEY"
+
+[memory]
+embedding_provider = "openai"
+embedding_model = "text-embedding-3-small"
+"#,
+        )
+        .expect("configuration deserializes before profile validation");
+
+        let error = config
+            .validate_runtime_profile()
+            .expect_err("tool-only must reject active model configuration");
+        assert!(error.contains("default_model"));
+        assert!(error.contains("memory.embedding_*"));
     }
 }

@@ -72,6 +72,7 @@ async fn build_router_inner(
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone())),
     });
+    let tool_only = kernel.config.runtime.tool_only;
 
     // Start WS cron broadcaster — subscribes to kernel event bus and pushes
     // cron job results to all connected WebSocket clients in real-time.
@@ -821,6 +822,10 @@ async fn build_router_inner(
         .route("/api/auth/login", axum::routing::post(routes::auth_login))
         .route("/api/auth/logout", axum::routing::post(routes::auth_logout))
         .route("/api/auth/check", axum::routing::get(routes::auth_check))
+        .layer(axum::middleware::from_fn_with_state(
+            tool_only,
+            middleware::tool_only_model_routes,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             middleware::auth,

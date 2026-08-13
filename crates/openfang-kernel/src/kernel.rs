@@ -28,7 +28,9 @@ use openfang_runtime::llm_driver::{
 use openfang_runtime::python_runtime::{self, PythonConfig};
 use openfang_runtime::routing::ModelRouter;
 use openfang_runtime::sandbox::{SandboxConfig, WasmSandbox};
-use openfang_runtime::tool_runner::builtin_tool_definitions;
+use openfang_runtime::tool_runner::{
+    builtin_tool_definitions, builtin_tool_runtime_requirement, BuiltinToolRuntimeRequirement,
+};
 use openfang_types::agent::*;
 use openfang_types::capability::Capability;
 use openfang_types::config::{KernelConfig, OutputFormat};
@@ -63,6 +65,15 @@ impl LlmDriver for StubDriver {
     }
 }
 
+/// Execute model-runtime initialization only for profiles that permit models.
+///
+/// Keeping this branch at the construction boundary makes `tool_only` a hard
+/// gate: callers can pass raising test guards and prove that no model factory
+/// is reached.
+fn model_runtime_if_enabled<T>(tool_only: bool, initialize: impl FnOnce() -> T) -> Option<T> {
+    (!tool_only).then(initialize)
+}
+
 pub struct OpenFangKernel {
     /// Kernel configuration.
     pub config: KernelConfig,
@@ -90,8 +101,8 @@ pub struct OpenFangKernel {
     pub audit_log: Arc<AuditLog>,
     /// Cost metering engine.
     pub metering: Arc<MeteringEngine>,
-    /// Default LLM driver (from kernel config).
-    default_driver: Arc<dyn LlmDriver>,
+    /// Default LLM driver (absent in the tool-only runtime profile).
+    default_driver: Option<Arc<dyn LlmDriver>>,
     /// WASM sandbox engine (shared across all WASM agent executions).
     wasm_sandbox: WasmSandbox,
     /// RBAC authentication manager.
@@ -135,10 +146,10 @@ pub struct OpenFangKernel {
     pub web_ctx: openfang_runtime::web_search::WebToolsContext,
     /// Browser automation manager (Playwright bridge sessions).
     pub browser_ctx: openfang_runtime::browser::BrowserManager,
-    /// Media understanding engine (image description, audio transcription).
-    pub media_engine: openfang_runtime::media_understanding::MediaEngine,
-    /// Text-to-speech engine.
-    pub tts_engine: openfang_runtime::tts::TtsEngine,
+    /// Media understanding engine (absent in the tool-only runtime profile).
+    pub media_engine: Option<openfang_runtime::media_understanding::MediaEngine>,
+    /// Text-to-speech engine (absent in the tool-only runtime profile).
+    pub tts_engine: Option<openfang_runtime::tts::TtsEngine>,
     /// Device pairing manager.
     pub pairing: crate::pairing::PairingManager,
     /// Embedding driver for vector similarity search (None = text fallback).
@@ -650,6 +661,9 @@ impl OpenFangKernel {
         }
 
         // Validate configuration and log warnings
+        config
+            .validate_runtime_profile()
+            .map_err(KernelError::BootFailed)?;
         let warnings = config.validate();
         for w in &warnings {
             warn!("Config: {}", w);
@@ -710,137 +724,142 @@ impl OpenFangKernel {
             openfang_extensions::credentials::CredentialResolver::new(vault, Some(&dotenv_path))
         };
 
-        // Create LLM driver.
-        // For the API key, try: 1) credential resolver (vault → dotenv → env var),
-        // 2) provider_api_keys mapping, 3) convention {PROVIDER}_API_KEY.
-        let default_api_key = {
-            let env_var = if !config.default_model.api_key_env.is_empty() {
-                config.default_model.api_key_env.clone()
-            } else {
-                config.resolve_api_key_env(&config.default_model.provider)
-            };
-            credential_resolver
-                .resolve(&env_var)
-                .map(|z: zeroize::Zeroizing<String>| z.to_string())
-        };
-        let driver_config = DriverConfig {
-            provider: config.default_model.provider.clone(),
-            api_key: default_api_key,
-            base_url: config.default_model.base_url.clone().or_else(|| {
-                config
-                    .provider_urls
-                    .get(&config.default_model.provider)
-                    .cloned()
-            }),
-            skip_permissions: true,
-            subprocess_timeout_secs: config.default_model.subprocess_timeout_secs,
-        };
-        // Primary driver failure is non-fatal: the dashboard should remain accessible
-        // even if the LLM provider is misconfigured. Users can fix config via dashboard.
-        let primary_result = drivers::create_driver(&driver_config);
-        let mut driver_chain: Vec<Arc<dyn LlmDriver>> = Vec::new();
-
-        match &primary_result {
-            Ok(d) => driver_chain.push(d.clone()),
-            Err(e) => {
-                warn!(
-                    provider = %config.default_model.provider,
-                    error = %e,
-                    "Primary LLM driver init failed — trying auto-detect"
-                );
-                // Auto-detect: scan env for any configured provider key
-                if let Some((provider, model, env_var)) = drivers::detect_available_provider() {
-                    let auto_config = DriverConfig {
-                        provider: provider.to_string(),
-                        api_key: credential_resolver
-                            .resolve(env_var)
-                            .map(|z: zeroize::Zeroizing<String>| z.to_string()),
-                        base_url: config.provider_urls.get(provider).cloned(),
-                        skip_permissions: true,
-                        // Inherit operator's default-model timeout intent: auto-detect
-                        // is replacing the *provider*, not the timeout policy.
-                        subprocess_timeout_secs: config.default_model.subprocess_timeout_secs,
-                    };
-                    match drivers::create_driver(&auto_config) {
-                        Ok(d) => {
-                            info!(
-                                provider = %provider,
-                                model = %model,
-                                "Auto-detected provider from {} — using as default",
-                                env_var
-                            );
-                            driver_chain.push(d);
-                            // Update the running config so agents get the right model
-                            config.default_model.provider = provider.to_string();
-                            config.default_model.model = model.to_string();
-                            config.default_model.api_key_env = env_var.to_string();
-                        }
-                        Err(e2) => {
-                            warn!(provider = %provider, error = %e2, "Auto-detected provider also failed");
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add fallback providers to the chain (with model names for cross-provider fallback)
-        let mut model_chain: Vec<(Arc<dyn LlmDriver>, String)> = Vec::new();
-        // Primary driver uses empty model name (uses the request's model field as-is)
-        for d in &driver_chain {
-            model_chain.push((d.clone(), String::new()));
-        }
-        for fb in &config.fallback_providers {
-            let fb_api_key = {
-                let env_var = if !fb.api_key_env.is_empty() {
-                    fb.api_key_env.clone()
+        let driver = model_runtime_if_enabled(config.runtime.tool_only, || {
+            // Create LLM driver.
+            // For the API key, try: 1) credential resolver (vault → dotenv → env var),
+            // 2) provider_api_keys mapping, 3) convention {PROVIDER}_API_KEY.
+            let default_api_key = {
+                let env_var = if !config.default_model.api_key_env.is_empty() {
+                    config.default_model.api_key_env.clone()
                 } else {
-                    config.resolve_api_key_env(&fb.provider)
+                    config.resolve_api_key_env(&config.default_model.provider)
                 };
                 credential_resolver
                     .resolve(&env_var)
                     .map(|z: zeroize::Zeroizing<String>| z.to_string())
             };
-            let fb_config = DriverConfig {
-                provider: fb.provider.clone(),
-                api_key: fb_api_key,
-                base_url: fb
-                    .base_url
-                    .clone()
-                    .or_else(|| config.provider_urls.get(&fb.provider).cloned()),
+            let driver_config = DriverConfig {
+                provider: config.default_model.provider.clone(),
+                api_key: default_api_key,
+                base_url: config.default_model.base_url.clone().or_else(|| {
+                    config
+                        .provider_urls
+                        .get(&config.default_model.provider)
+                        .cloned()
+                }),
                 skip_permissions: true,
-                subprocess_timeout_secs: fb.subprocess_timeout_secs,
+                subprocess_timeout_secs: config.default_model.subprocess_timeout_secs,
             };
-            match drivers::create_driver(&fb_config) {
-                Ok(d) => {
-                    info!(
-                        provider = %fb.provider,
-                        model = %fb.model,
-                        "Fallback provider configured"
-                    );
-                    driver_chain.push(d.clone());
-                    model_chain.push((d, strip_provider_prefix(&fb.model, &fb.provider)));
-                }
+            // Primary driver failure is non-fatal: the dashboard should remain accessible
+            // even if the LLM provider is misconfigured. Users can fix config via dashboard.
+            let primary_result = drivers::create_driver(&driver_config);
+            let mut driver_chain: Vec<Arc<dyn LlmDriver>> = Vec::new();
+
+            match &primary_result {
+                Ok(d) => driver_chain.push(d.clone()),
                 Err(e) => {
                     warn!(
-                        provider = %fb.provider,
+                        provider = %config.default_model.provider,
                         error = %e,
-                        "Fallback provider init failed — skipped"
+                        "Primary LLM driver init failed — trying auto-detect"
                     );
+                    // Auto-detect: scan env for any configured provider key
+                    if let Some((provider, model, env_var)) = drivers::detect_available_provider() {
+                        let auto_config = DriverConfig {
+                            provider: provider.to_string(),
+                            api_key: credential_resolver
+                                .resolve(env_var)
+                                .map(|z: zeroize::Zeroizing<String>| z.to_string()),
+                            base_url: config.provider_urls.get(provider).cloned(),
+                            skip_permissions: true,
+                            // Inherit operator's default-model timeout intent: auto-detect
+                            // is replacing the *provider*, not the timeout policy.
+                            subprocess_timeout_secs: config.default_model.subprocess_timeout_secs,
+                        };
+                        match drivers::create_driver(&auto_config) {
+                            Ok(d) => {
+                                info!(
+                                    provider = %provider,
+                                    model = %model,
+                                    "Auto-detected provider from {} — using as default",
+                                    env_var
+                                );
+                                driver_chain.push(d);
+                                // Update the running config so agents get the right model
+                                config.default_model.provider = provider.to_string();
+                                config.default_model.model = model.to_string();
+                                config.default_model.api_key_env = env_var.to_string();
+                            }
+                            Err(e2) => {
+                                warn!(provider = %provider, error = %e2, "Auto-detected provider also failed");
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        // Use the chain, or create a stub driver if everything failed
-        let driver: Arc<dyn LlmDriver> = if driver_chain.len() > 1 {
-            Arc::new(openfang_runtime::drivers::fallback::FallbackDriver::with_models(model_chain))
-        } else if let Some(single) = driver_chain.into_iter().next() {
-            single
-        } else {
-            // All drivers failed — use a stub that returns a helpful error.
-            // The kernel boots, dashboard is accessible, users can fix their config.
-            warn!("No LLM drivers available — agents will return errors until a provider is configured");
-            Arc::new(StubDriver) as Arc<dyn LlmDriver>
-        };
+            // Add fallback providers to the chain (with model names for cross-provider fallback)
+            let mut model_chain: Vec<(Arc<dyn LlmDriver>, String)> = Vec::new();
+            // Primary driver uses empty model name (uses the request's model field as-is)
+            for d in &driver_chain {
+                model_chain.push((d.clone(), String::new()));
+            }
+            for fb in &config.fallback_providers {
+                let fb_api_key = {
+                    let env_var = if !fb.api_key_env.is_empty() {
+                        fb.api_key_env.clone()
+                    } else {
+                        config.resolve_api_key_env(&fb.provider)
+                    };
+                    credential_resolver
+                        .resolve(&env_var)
+                        .map(|z: zeroize::Zeroizing<String>| z.to_string())
+                };
+                let fb_config = DriverConfig {
+                    provider: fb.provider.clone(),
+                    api_key: fb_api_key,
+                    base_url: fb
+                        .base_url
+                        .clone()
+                        .or_else(|| config.provider_urls.get(&fb.provider).cloned()),
+                    skip_permissions: true,
+                    subprocess_timeout_secs: fb.subprocess_timeout_secs,
+                };
+                match drivers::create_driver(&fb_config) {
+                    Ok(d) => {
+                        info!(
+                            provider = %fb.provider,
+                            model = %fb.model,
+                            "Fallback provider configured"
+                        );
+                        driver_chain.push(d.clone());
+                        model_chain.push((d, strip_provider_prefix(&fb.model, &fb.provider)));
+                    }
+                    Err(e) => {
+                        warn!(
+                            provider = %fb.provider,
+                            error = %e,
+                            "Fallback provider init failed — skipped"
+                        );
+                    }
+                }
+            }
+
+            // Use the chain, or create a stub driver if everything failed
+            let driver: Arc<dyn LlmDriver> = if driver_chain.len() > 1 {
+                Arc::new(
+                    openfang_runtime::drivers::fallback::FallbackDriver::with_models(model_chain),
+                )
+            } else if let Some(single) = driver_chain.into_iter().next() {
+                single
+            } else {
+                // All drivers failed — use a stub that returns a helpful error.
+                // The kernel boots, dashboard is accessible, users can fix their config.
+                warn!("No LLM drivers available — agents will return errors until a provider is configured");
+                Arc::new(StubDriver) as Arc<dyn LlmDriver>
+            };
+            driver
+        });
 
         // Initialize metering engine (shares the same SQLite connection as the memory substrate)
         let metering = Arc::new(MeteringEngine::new(Arc::new(
@@ -862,31 +881,33 @@ impl OpenFangKernel {
 
         // Initialize model catalog, detect provider auth, and apply URL overrides
         let mut model_catalog = openfang_runtime::model_catalog::ModelCatalog::new();
-        model_catalog.detect_auth();
-        // Env-var overrides for local providers (OLLAMA_HOST, LMSTUDIO_BASE_URL, etc.).
-        // Applied before `provider_urls` so explicit config.toml entries win. See #1154.
-        model_catalog.apply_local_env_overrides();
-        if !config.provider_urls.is_empty() {
-            model_catalog.apply_url_overrides(&config.provider_urls);
-            info!(
-                "applied {} provider URL override(s)",
-                config.provider_urls.len()
-            );
-        }
-        // Load user's custom models from ~/.openfang/custom_models.json
-        let custom_models_path = config.home_dir.join("custom_models.json");
-        model_catalog.load_custom_models(&custom_models_path);
+        if !config.runtime.tool_only {
+            model_catalog.detect_auth();
+            // Env-var overrides for local providers (OLLAMA_HOST, LMSTUDIO_BASE_URL, etc.).
+            // Applied before `provider_urls` so explicit config.toml entries win. See #1154.
+            model_catalog.apply_local_env_overrides();
+            if !config.provider_urls.is_empty() {
+                model_catalog.apply_url_overrides(&config.provider_urls);
+                info!(
+                    "applied {} provider URL override(s)",
+                    config.provider_urls.len()
+                );
+            }
+            // Load user's custom models from ~/.openfang/custom_models.json
+            let custom_models_path = config.home_dir.join("custom_models.json");
+            model_catalog.load_custom_models(&custom_models_path);
 
-        // Fetch live Copilot models if authenticated
-        if openfang_runtime::drivers::copilot::copilot_auth_available(&config.home_dir) {
-            let copilot_dir = config.home_dir.clone();
-            match Self::fetch_copilot_models(&copilot_dir) {
-                Ok(models) => {
-                    info!(count = models.len(), "Fetched live Copilot model catalog");
-                    model_catalog.merge_discovered_models("github-copilot", &models);
-                }
-                Err(e) => {
-                    warn!("Failed to fetch Copilot models (will use static catalog): {e}");
+            // Fetch live Copilot models if authenticated
+            if openfang_runtime::drivers::copilot::copilot_auth_available(&config.home_dir) {
+                let copilot_dir = config.home_dir.clone();
+                match Self::fetch_copilot_models(&copilot_dir) {
+                    Ok(models) => {
+                        info!(count = models.len(), "Fetched live Copilot model catalog");
+                        model_catalog.merge_discovered_models("github-copilot", &models);
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch Copilot models (will use static catalog): {e}");
+                    }
                 }
             }
         }
@@ -1012,6 +1033,7 @@ impl OpenFangKernel {
         };
 
         // Auto-detect embedding driver for vector similarity search
+        let embedding_driver = model_runtime_if_enabled(config.runtime.tool_only, || {
         let embedding_driver: Option<
             Arc<dyn openfang_runtime::embedding::EmbeddingDriver + Send + Sync>,
         > = {
@@ -1116,18 +1138,24 @@ impl OpenFangKernel {
                 }
             }
         };
+        embedding_driver
+        })
+        .flatten();
 
         let browser_ctx = openfang_runtime::browser::BrowserManager::new(config.browser.clone());
 
-        // Initialize media understanding engine
-        let media_engine =
-            openfang_runtime::media_understanding::MediaEngine::new(config.media.clone());
+        // Initialize model-backed media engines only when the execution profile permits them.
+        let media_engine = model_runtime_if_enabled(config.runtime.tool_only, || {
+            openfang_runtime::media_understanding::MediaEngine::new(config.media.clone())
+        });
         // Closes #1051: thread MediaConfig URL overrides into the TTS engine
         // so local OpenAI/ElevenLabs-compatible services can be targeted.
-        let tts_engine = openfang_runtime::tts::TtsEngine::new(config.tts.clone()).with_base_urls(
-            config.media.tts_openai_base_url.clone(),
-            config.media.tts_elevenlabs_base_url.clone(),
-        );
+        let tts_engine = model_runtime_if_enabled(config.runtime.tool_only, || {
+            openfang_runtime::tts::TtsEngine::new(config.tts.clone()).with_base_urls(
+                config.media.tts_openai_base_url.clone(),
+                config.media.tts_elevenlabs_base_url.clone(),
+            )
+        });
         let mut pairing = crate::pairing::PairingManager::new(config.pairing.clone());
 
         // Load paired devices from database and set up persistence callback
@@ -1938,6 +1966,12 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
     ) -> KernelResult<AgentLoopResult> {
+        if self.config.runtime.tool_only {
+            return Err(KernelError::OpenFang(OpenFangError::Config(
+                "agent execution is disabled by [runtime] tool_only = true".to_string(),
+            )));
+        }
+
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
         // succession (e.g. rapid voice messages via Telegram). Messages for different
@@ -2036,6 +2070,12 @@ impl OpenFangKernel {
         tokio::sync::mpsc::Receiver<StreamEvent>,
         tokio::task::JoinHandle<KernelResult<AgentLoopResult>>,
     )> {
+        if self.config.runtime.tool_only {
+            return Err(KernelError::OpenFang(OpenFangError::Config(
+                "agent execution is disabled by [runtime] tool_only = true".to_string(),
+            )));
+        }
+
         // Enforce quota before spawning the streaming task
         self.scheduler
             .check_quota(agent_id)
@@ -2401,9 +2441,9 @@ impl OpenFangKernel {
                 kernel_clone.embedding_driver.as_deref(),
                 manifest.workspace.as_deref(),
                 Some(&phase_cb),
-                Some(&kernel_clone.media_engine),
+                kernel_clone.media_engine.as_ref(),
                 if kernel_clone.config.tts.enabled {
-                    Some(&kernel_clone.tts_engine)
+                    kernel_clone.tts_engine.as_ref()
                 } else {
                     None
                 },
@@ -2987,9 +3027,9 @@ impl OpenFangKernel {
             self.embedding_driver.as_deref(),
             manifest.workspace.as_deref(),
             None, // on_phase callback
-            Some(&self.media_engine),
+            self.media_engine.as_ref(),
             if self.config.tts.enabled {
-                Some(&self.tts_engine)
+                self.tts_engine.as_ref()
             } else {
                 None
             },
@@ -4159,6 +4199,8 @@ impl OpenFangKernel {
         if let Err(errors) = validate_config_for_reload(&new_config) {
             return Err(format!("Validation failed: {}", errors.join("; ")));
         }
+
+        new_config.validate_runtime_profile()?;
 
         // Build the reload plan
         let plan = build_reload_plan(&self.config, &new_config);
@@ -5601,6 +5643,12 @@ impl OpenFangKernel {
     }
 
     fn resolve_driver(&self, manifest: &AgentManifest) -> KernelResult<Arc<dyn LlmDriver>> {
+        if self.config.runtime.tool_only {
+            return Err(KernelError::OpenFang(OpenFangError::Config(
+                "model execution is disabled by [runtime] tool_only = true".to_string(),
+            )));
+        }
+
         let agent_provider = &manifest.model.provider;
 
         // Use the effective default model: hot-reloaded override takes priority
@@ -5709,7 +5757,11 @@ impl OpenFangKernel {
                             error = %e,
                             "Fresh driver creation failed, falling back to boot-time default"
                         );
-                        Arc::clone(&self.default_driver)
+                        self.default_driver.clone().ok_or_else(|| {
+                            KernelError::OpenFang(OpenFangError::Config(
+                                "no default model driver is available".to_string(),
+                            ))
+                        })?
                     } else {
                         return Err(KernelError::BootFailed(format!(
                             "Agent LLM driver init failed: {e}"
@@ -6236,6 +6288,18 @@ impl OpenFangKernel {
                 .into_iter()
                 .filter(|t| !t.name.starts_with("browser_"))
                 .collect()
+        };
+
+        let all_builtins: Vec<ToolDefinition> = if self.config.runtime.tool_only {
+            all_builtins
+                .into_iter()
+                .filter(|tool| {
+                    builtin_tool_runtime_requirement(&tool.name)
+                        != BuiltinToolRuntimeRequirement::ModelInference
+                })
+                .collect()
+        } else {
+            all_builtins
         };
 
         // Look up agent entry for profile, skill/MCP allowlists, and declared tools
@@ -8091,6 +8155,132 @@ mod tests {
     use super::*;
     use openfang_types::config::ExecPolicy;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn tool_only_bootstrap_never_calls_model_initializer() {
+        let mut config = KernelConfig::default();
+        config.runtime.tool_only = true;
+        let constructor_calls = AtomicUsize::new(0);
+
+        let initialized = model_runtime_if_enabled(config.runtime.tool_only, || {
+            constructor_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("tool-only boot must never initialize a model runtime");
+        });
+
+        assert!(initialized.is_none());
+        assert_eq!(constructor_calls.load(Ordering::SeqCst), 0);
+
+        let media_or_tts = model_runtime_if_enabled(config.runtime.tool_only, || {
+            constructor_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("tool-only boot must never initialize vision or speech runtimes");
+        });
+        assert!(media_or_tts.is_none());
+        assert_eq!(constructor_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tool_only_available_tools_excludes_every_model_inference_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = KernelConfig {
+            home_dir: tmp.path().join("openfang-tool-only-tools"),
+            data_dir: tmp.path().join("openfang-tool-only-tools-data"),
+            ..KernelConfig::default()
+        };
+        config.runtime.tool_only = true;
+        let kernel = OpenFangKernel::boot_with_config(config).expect("tool-only kernel boots");
+
+        let manifest = test_manifest("tool-only-unrestricted", "tool-only filter", vec![]);
+        let agent_id = kernel
+            .spawn_agent(manifest)
+            .expect("unrestricted agent registers");
+        let names: Vec<String> = kernel
+            .available_tools(agent_id)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        for model_tool in [
+            "media_describe",
+            "media_transcribe",
+            "image_generate",
+            "text_to_speech",
+            "speech_to_text",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == model_tool),
+                "{model_tool} must not be projected by a tool-only kernel"
+            );
+        }
+        assert!(names.iter().any(|name| name == "file_read"));
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn tool_only_reload_rejects_model_configuration_before_hot_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = KernelConfig {
+            home_dir: tmp.path().join("openfang-tool-only-reload"),
+            data_dir: tmp.path().join("openfang-tool-only-reload-data"),
+            ..KernelConfig::default()
+        };
+        config.runtime.tool_only = true;
+        let kernel =
+            OpenFangKernel::boot_with_config(config.clone()).expect("tool-only kernel boots");
+
+        let mut invalid_reload = config;
+        invalid_reload.default_model.provider = "openai".to_string();
+        std::fs::write(
+            kernel.config.home_dir.join("config.toml"),
+            toml::to_string(&invalid_reload).expect("test config serializes"),
+        )
+        .expect("test config writes");
+
+        let error = kernel
+            .reload_config()
+            .expect_err("tool-only reload must reject model configuration");
+        assert!(error.contains("tool_only"));
+        assert!(error.contains("default_model"));
+
+        kernel.shutdown();
+    }
+
+    #[tokio::test]
+    async fn tool_only_boot_keeps_model_handles_absent_and_rejects_agent_loops() {
+        let home = tempfile::tempdir().expect("temporary home should exist");
+        let mut config = KernelConfig {
+            home_dir: home.path().to_path_buf(),
+            data_dir: home.path().join("data"),
+            ..KernelConfig::default()
+        };
+        config.runtime.tool_only = true;
+
+        let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("tool-only boots"));
+        assert!(kernel.default_driver.is_none());
+        assert!(kernel.embedding_driver.is_none());
+        assert!(kernel.media_engine.is_none());
+        assert!(kernel.tts_engine.is_none());
+
+        let agent_id = AgentId::new();
+        let error = kernel
+            .send_message(agent_id, "must not enter the agent loop")
+            .await
+            .expect_err("tool-only rejects non-streaming agent execution");
+        assert!(error.to_string().contains("tool_only"));
+
+        let error = kernel
+            .send_message_streaming(
+                agent_id,
+                "must not enter the streaming agent loop",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect_err("tool-only rejects streaming agent execution");
+        assert!(error.to_string().contains("tool_only"));
+    }
 
     #[test]
     fn test_manifest_to_capabilities() {
