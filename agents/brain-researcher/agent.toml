@@ -4,12 +4,12 @@ description = "Web research + summarization into ideas."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:research"]
-mcp_servers = ["vibemind-db", "fetch", "qdrant"]
+mcp_servers = ["fetch", "spaces-ideas", "qdrant"]
 
 [model]
 provider = "openai"
-model = "gpt-4o-mini"
-max_tokens = 4096
+model = "gpt-4o"
+max_tokens = 16384
 temperature = 0.2
 system_prompt = """You are brain-researcher, the VibeMind agent for the "research" space.
 
@@ -37,7 +37,7 @@ max_llm_tokens_per_hour = 100000
 max_concurrent_tools = 5
 
 [capabilities]
-tools = ["memory_store", "memory_recall"]
+tools = ["memory_store", "memory_recall", "mcp_fetch_fetch", "mcp_spaces_ideas_idea_create", "mcp_spaces_ideas_idea_update"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
