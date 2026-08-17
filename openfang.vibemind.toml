@@ -393,6 +393,15 @@ type = "stdio"
 command = "python"
 args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/ideas/mcp_server.py"]
 
+[[mcp_servers]]
+name = "spaces-minibook"
+timeout_secs = 10
+env = ["MINIBOOK_STATUS_URL"]
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/minibook/mcp_server.py"]
+
 # ═══════════════════════════════════════════════════════════════════
 # n8n — workflow automation (third-party engine)
 # Registry-routed MCP tool surface for the eight canonical n8n.* events
