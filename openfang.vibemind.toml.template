@@ -403,6 +403,34 @@ command = "python"
 args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/rowboat/mcp_server.py"]
 
 # ═══════════════════════════════════════════════════════════════════
+# n8n — workflow automation (third-party engine)
+# Registry-routed MCP tool surface for the eight canonical n8n.* events
+# scoped by the brain-n8n agent (agents/brain-n8n/agent.toml:7;
+# vibemind-os/config/space_agent_registry.yml:269-286). There is no
+# VibeMind-owned n8n Space application — every tool call is executed by
+# the third-party n8n engine, reached through the `n8n-mcp` npm package
+# (vibemind-os/docs/mcp-archive/MCP_SERVER_INVENTORY.md:103-108). The one
+# in-repo launch of this server uses `npx -y n8n-mcp`, sets N8N_API_URL,
+# N8N_API_KEY, MCP_MODE=stdio and LOG_LEVEL=error, and allows 120 s per
+# request (vibemind-os/security/poc_n8n/agent.py:139-155).
+#
+# NOTE: `env` lists variable NAMES only — never values. OpenFang spawns
+# stdio MCP servers with a cleared environment and forwards exactly these
+# names from the host (crates/openfang-runtime/src/mcp.rs). The values,
+# including MCP_MODE=stdio, must therefore already exist in the host
+# environment / root .env; OpenFang cannot inject them.
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "n8n"
+timeout_secs = 120
+env = ["N8N_API_URL", "N8N_API_KEY", "MCP_MODE", "LOG_LEVEL"]
+[mcp_servers.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "n8n-mcp"]
+
+# ═══════════════════════════════════════════════════════════════════
 # Phase 11.B — Multiverse Navigation (Smart 3-layer resolver)
 # Maps natural-language queries to one of 14 spaces and broadcasts
 # navigation events to the Electron UI. Layers: alias → Qwen3 embedding
