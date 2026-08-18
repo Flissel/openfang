@@ -1511,8 +1511,14 @@ memory_write = ["self.*"]
             ),
             (
                 "agents/brain-researcher/agent.toml",
-                &["vibemind-db", "fetch", "qdrant"][..],
-                &["memory_store", "memory_recall"][..],
+                &["fetch", "spaces-ideas", "qdrant"][..],
+                &[
+                    "memory_store",
+                    "memory_recall",
+                    "mcp_fetch_fetch",
+                    "mcp_spaces_ideas_idea_create",
+                    "mcp_spaces_ideas_idea_update",
+                ][..],
             ),
             (
                 "agents/brain-knowledge/agent.toml",
