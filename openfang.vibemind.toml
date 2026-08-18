@@ -209,7 +209,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/devops/poc_backup_sync/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/devops/backup_sync/mcp_server.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # BUSINESS PoC MCP Servers (vibemind-os/business/)

@@ -73,7 +73,7 @@ These ship with VibeMind and only need Python:
 | `scheduled-tasks` | List, create, enable | `system/poc_scheduled_tasks/` |
 | `update-manager` | Windows Update control | `system/poc_update_manager/` |
 | `env-manager` | Environment variables | `system/poc_env_manager/` |
-| `backup-sync` | Backup, cloud sync | `devops/poc_backup_sync/` |
+| `backup-sync` | Backup, cloud sync | `devops/backup_sync/` |
 | `pitch-deck` | Pitch deck generator | `business/poc_pitch_deck/` |
 | `space-navigator` | 14-space multiverse navigation (Qwen3 + LLM) | `spaces/_navigator/` |
 
