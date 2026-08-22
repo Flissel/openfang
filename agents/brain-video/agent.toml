@@ -4,7 +4,7 @@ description = "Video generation, vision, lipsync."
 author = "vibemind"
 module = "builtin:chat"
 tags = ["vibemind", "brain-routed", "space:video"]
-mcp_servers = ["vibemind-db"]
+mcp_servers = ["laura", "vibemind-db"]
 
 [model]
 provider = "openai"
