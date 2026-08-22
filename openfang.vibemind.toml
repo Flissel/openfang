@@ -392,6 +392,23 @@ type = "stdio"
 command = "python"
 args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_mcp.py"]
 
+# 2026-08-22: Laura-MCP (28 Tools, lokaler Videoeditor auf 127.0.0.1:8765).
+# WIRKSAM wird der Eintrag erst in ~/.openfang/config.toml — diese Datei ist
+# die versionierte Vorlage. Beide muessen uebereinstimmen.
+[[mcp_servers]]
+name = "laura"
+env = ["LAURA_TOKEN"]
+
+[mcp_servers.transport]
+type = "stdio"
+command = "uv"
+args = [
+    "run",
+    "--directory",
+    "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/video/laura/services/mcp",
+    "laura-mcp",
+]
+
 # ═══════════════════════════════════════════════════════════════════
 # Desktop Automation (handoff multi-agent system)
 # ═══════════════════════════════════════════════════════════════════
