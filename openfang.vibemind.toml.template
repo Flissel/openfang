@@ -358,6 +358,21 @@ type = "stdio"
 command = "python"
 args = ["${VIBEMIND_ROOT}/vibemind-os/voice/python/vibemind_db_mcp.py"]
 
+# Laura MCP (local video editor on 127.0.0.1:8765).
+[[mcp_servers]]
+name = "laura"
+env = ["LAURA_TOKEN"]
+
+[mcp_servers.transport]
+type = "stdio"
+command = "uv"
+args = [
+    "run",
+    "--directory",
+    "${VIBEMIND_ROOT}/vibemind-os/spaces/video/laura/services/mcp",
+    "laura-mcp",
+]
+
 # ═══════════════════════════════════════════════════════════════════
 # Desktop Automation (handoff multi-agent system)
 # ═══════════════════════════════════════════════════════════════════

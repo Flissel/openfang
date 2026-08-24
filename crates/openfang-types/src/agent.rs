@@ -1535,7 +1535,7 @@ memory_write = ["self.*"]
             ),
             (
                 "agents/brain-video/agent.toml",
-                &["vibemind-db"][..],
+                &["laura", "vibemind-db"][..],
                 &["memory_store", "memory_recall"][..],
             ),
             (
