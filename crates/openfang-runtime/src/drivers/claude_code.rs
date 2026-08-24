@@ -272,23 +272,36 @@ struct SystemPromptFile {
 impl SystemPromptFile {
     fn create(bytes: &[u8]) -> Result<Self, std::io::Error> {
         use std::io::Write;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("openfang-sysprompt-{nanos:x}.txt"));
-        let write_result = (|| {
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(bytes)?;
-            file.flush()
-        })();
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
+        for _ in 0..4 {
+            let path = std::env::temp_dir()
+                .join(format!("openfang-sysprompt-{}.txt", uuid::Uuid::new_v4()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            let mut file = match options.open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = file.write_all(bytes).and_then(|()| file.flush()) {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            drop(file);
+            return Ok(Self { path });
         }
-        Ok(Self { path })
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique system-prompt tempfile",
+        ))
     }
 
     fn path(&self) -> &std::path::Path {
@@ -893,6 +906,50 @@ mod tests {
             !path.exists(),
             "system prompt tempfile must not leak after drop"
         );
+    }
+
+    #[test]
+    fn test_system_prompt_files_use_unique_uuid_names_and_owner_scoped_cleanup() {
+        let first = SystemPromptFile::create(b"first prompt").expect("create first prompt file");
+        let second = SystemPromptFile::create(b"second prompt").expect("create second prompt file");
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+
+        assert_ne!(first_path, second_path);
+        for path in [&first_path, &second_path] {
+            let filename = path.file_name().and_then(|name| name.to_str()).unwrap();
+            let uuid = filename
+                .strip_prefix("openfang-sysprompt-")
+                .and_then(|name| name.strip_suffix(".txt"))
+                .expect("random prompt filename");
+            uuid::Uuid::parse_str(uuid).expect("UUID prompt filename");
+        }
+
+        drop(first);
+        assert!(
+            !first_path.exists(),
+            "first owner removes only its own tempfile"
+        );
+        assert!(
+            second_path.exists(),
+            "second owner tempfile remains available"
+        );
+        drop(second);
+        assert!(!second_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_prompt_file_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let prompt_file = SystemPromptFile::create(b"private prompt").expect("create prompt file");
+        let mode = std::fs::metadata(prompt_file.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
