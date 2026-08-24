@@ -5,11 +5,23 @@ author = "vibemind"
 module = "builtin:chat"
 tags = ["coding", "vibemind", "brain-routed"]
 memory_profile = "coding"
+mcp_servers = [
+  "vibemind-db",
+  "filesystem",
+  "git",
+  "github",
+  "context7",
+  "qdrant",
+  "fetch",
+  "brain",
+  "issue-detector",
+  "memory-search"
+]
 
 [model]
 provider = "claude-code"
 model = "claude-code/sonnet"
-base_url = "scripts/openfang_opencode_wrapper.cmd"
+base_url = "openfang_opencode_wrapper.cmd"
 max_tokens = 8192
 temperature = 0.3
 system_prompt = '''{{MEMORY}}
@@ -42,17 +54,3 @@ network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*"]
 shell = ["cargo *", "git *", "npm *", "python *", "pip *", "pytest *"]
-
-[mcp_allowed]
-servers = [
-  "vibemind-db",
-  "filesystem",
-  "git",
-  "github",
-  "context7",
-  "qdrant",
-  "fetch",
-  "brain",
-  "issue-detector",
-  "memory-search"
-]

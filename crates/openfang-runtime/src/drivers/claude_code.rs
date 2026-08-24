@@ -261,30 +261,76 @@ struct ClaudeStreamEvent {
     usage: Option<ClaudeUsage>,
 }
 
-/// Write `bytes` to a fresh tempfile under the system temp dir and return the
-/// path. Used to ferry long system prompts (>8191 chars on Windows) to the
-/// Claude Code CLI via `--system-prompt-file <path>` instead of argv.
+/// Owned system-prompt tempfile for one CLI invocation.
 ///
-/// The caller is responsible for cleanup; we deliberately don't auto-delete
-/// because the subprocess reads the file lazily after spawn returns. Files
-/// land in `%TEMP%` which Windows cleans periodically.
-fn write_temp_file(
-    bytes: &[u8],
-    prefix: &str,
-    suffix: &str,
-) -> Result<std::path::PathBuf, std::io::Error> {
-    use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// The wrapper receives only this path. Its contents never enter argv or logs,
+/// and the owner removes the file on every normal or early-return path.
+struct SystemPromptFile {
+    path: std::path::PathBuf,
+}
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("{prefix}{nanos:x}{suffix}"));
-    let mut f = std::fs::File::create(&path)?;
-    f.write_all(bytes)?;
-    f.flush()?;
-    Ok(path)
+impl SystemPromptFile {
+    fn create(bytes: &[u8]) -> Result<Self, std::io::Error> {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("openfang-sysprompt-{nanos:x}.txt"));
+        let write_result = (|| {
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(bytes)?;
+            file.flush()
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for SystemPromptFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(error = %error, "Failed to remove Claude Code system-prompt tempfile");
+            }
+        }
+    }
+}
+
+fn build_cli_args(
+    model: Option<&str>,
+    system_prompt_file: Option<&std::path::Path>,
+    skip_permissions: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        "--input-format".to_string(),
+        "text".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+    ];
+    if let Some(path) = system_prompt_file {
+        args.push("--system-prompt-file".to_string());
+        args.push(path.to_string_lossy().into_owned());
+    }
+    if skip_permissions {
+        args.push("--dangerously-skip-permissions".to_string());
+    }
+    if let Some(model) = model {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    args
 }
 
 /// Build a `tokio::process::Command` for the Claude Code CLI.
@@ -318,6 +364,16 @@ impl LlmDriver for ClaudeCodeDriver {
         let model_flag = Self::model_flag(&request.model);
 
         let mut cmd = build_cli_command(&self.cli_path);
+        let sys_prompt_tempfile = request
+            .system
+            .as_deref()
+            .map(|system_prompt| SystemPromptFile::create(system_prompt.as_bytes()))
+            .transpose()
+            .map_err(|error| {
+                warn!(error = %error, "Failed to create Claude Code system-prompt tempfile");
+                LlmError::Http("Failed to prepare Claude Code system prompt".to_string())
+            })?;
+
         // Prompt is fed via stdin (`--input-format text`) instead of `-p <prompt>`
         // argv. Windows enforces a ~8191 char command-line limit; voice/agent
         // prompts with conversation history blow past it easily. Stdin has no
@@ -327,39 +383,11 @@ impl LlmDriver for ClaudeCodeDriver {
         // text, which hid whether the model invoked any skills/tools. We still
         // return only the final text (behaviour preserved); the tool_use blocks
         // are logged for observability. --verbose is required by stream-json.
-        cmd.arg("-p")
-            .arg("--input-format")
-            .arg("text")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
-
-        // System prompt is routed through a tempfile (`--system-prompt-file`)
-        // so it doesn't compete with the user prompt for argv length. Tool
-        // definitions easily push system prompts past the Windows 8191 cap.
-        let sys_prompt_tempfile = if let Some(ref sys) = request.system {
-            match write_temp_file(sys.as_bytes(), "openfang-sysprompt-", ".txt") {
-                Ok(path) => {
-                    cmd.arg("--system-prompt-file").arg(&path);
-                    Some(path)
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to write system-prompt tempfile, falling back to argv");
-                    cmd.arg("--system-prompt").arg(sys);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        if self.skip_permissions {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-
-        if let Some(ref model) = model_flag {
-            cmd.arg("--model").arg(model);
-        }
+        cmd.args(build_cli_args(
+            model_flag.as_deref(),
+            sys_prompt_tempfile.as_ref().map(SystemPromptFile::path),
+            self.skip_permissions,
+        ));
 
         Self::apply_env_filter(&mut cmd);
 
@@ -373,7 +401,7 @@ impl LlmDriver for ClaudeCodeDriver {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        debug!(cli = %self.cli_path, skip_permissions = self.skip_permissions, prompt_bytes = prompt.len(), sys_tempfile = ?sys_prompt_tempfile, "Spawning Claude Code CLI");
+        debug!(cli = %self.cli_path, skip_permissions = self.skip_permissions, prompt_bytes = prompt.len(), has_system_prompt = sys_prompt_tempfile.is_some(), "Spawning Claude Code CLI");
 
         // Spawn child process instead of cmd.output() so we can track PID and timeout
         let mut child = cmd.spawn().map_err(|e| {
@@ -593,38 +621,22 @@ impl LlmDriver for ClaudeCodeDriver {
         let model_flag = Self::model_flag(&request.model);
 
         let mut cmd = build_cli_command(&self.cli_path);
+        let sys_prompt_tempfile = request
+            .system
+            .as_deref()
+            .map(|system_prompt| SystemPromptFile::create(system_prompt.as_bytes()))
+            .transpose()
+            .map_err(|error| {
+                warn!(error = %error, "Failed to create Claude Code system-prompt tempfile");
+                LlmError::Http("Failed to prepare Claude Code system prompt".to_string())
+            })?;
+
         // See `complete()` above for why prompt is routed via stdin instead of argv.
-        cmd.arg("-p")
-            .arg("--input-format")
-            .arg("text")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
-
-        // System prompt via tempfile — see `complete()` above for rationale.
-        let _sys_prompt_tempfile = if let Some(ref sys) = request.system {
-            match write_temp_file(sys.as_bytes(), "openfang-sysprompt-", ".txt") {
-                Ok(path) => {
-                    cmd.arg("--system-prompt-file").arg(&path);
-                    Some(path)
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to write system-prompt tempfile, falling back to argv");
-                    cmd.arg("--system-prompt").arg(sys);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        if self.skip_permissions {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-
-        if let Some(ref model) = model_flag {
-            cmd.arg("--model").arg(model);
-        }
+        cmd.args(build_cli_args(
+            model_flag.as_deref(),
+            sys_prompt_tempfile.as_ref().map(SystemPromptFile::path),
+            self.skip_permissions,
+        ));
 
         Self::apply_env_filter(&mut cmd);
 
@@ -706,15 +718,11 @@ impl LlmDriver for ClaudeCodeDriver {
                                             .join("")
                                     })
                                     .unwrap_or_default();
-                                let text_chunk =
-                                    if !chunk.is_empty() { chunk } else { nested };
+                                let text_chunk = if !chunk.is_empty() { chunk } else { nested };
                                 if !text_chunk.is_empty() {
                                     full_text.push_str(&text_chunk);
-                                    let _ = tx
-                                        .send(StreamEvent::TextDelta {
-                                            text: text_chunk,
-                                        })
-                                        .await;
+                                    let _ =
+                                        tx.send(StreamEvent::TextDelta { text: text_chunk }).await;
                                 }
                             }
                             "result" | "done" | "complete" => {
@@ -866,6 +874,59 @@ fn home_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_system_prompt_file_is_removed_when_owner_drops() {
+        let path = {
+            let prompt_file = SystemPromptFile::create(b"subscription system sentinel")
+                .expect("create system prompt tempfile");
+            let path = prompt_file.path().to_path_buf();
+            assert!(path.is_file());
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "subscription system sentinel"
+            );
+            path
+        };
+
+        assert!(
+            !path.exists(),
+            "system prompt tempfile must not leak after drop"
+        );
+    }
+
+    #[test]
+    fn test_custom_wrapper_argv_preserves_system_prompt_file_abi() {
+        let model = ClaudeCodeDriver::model_flag("claude-code/sonnet");
+        let args = build_cli_args(
+            model.as_deref(),
+            Some(std::path::Path::new("C:/temp/openfang-sysprompt.txt")),
+            true,
+        );
+
+        assert_eq!(
+            args,
+            [
+                "-p",
+                "--input-format",
+                "text",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--system-prompt-file",
+                "C:/temp/openfang-sysprompt.txt",
+                "--dangerously-skip-permissions",
+                "--model",
+                "sonnet",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("subscription system sentinel")));
+    }
 
     #[test]
     fn test_build_prompt_simple() {
