@@ -357,17 +357,74 @@ fn build_cli_args(
 ///
 /// On non-Windows platforms (or when the CLI path is not a `.cmd`/`.bat`),
 /// fall back to spawning the binary directly.
-fn build_cli_command(cli_path: &str) -> tokio::process::Command {
+const SUBSCRIPTION_WRAPPERS: [&str; 2] = [
+    "openfang_opencode_wrapper.cmd",
+    "openfang_claude_subscription_wrapper.cmd",
+];
+
+fn resolve_subscription_wrapper(
+    cli_path: &str,
+    configured_directory: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    let directory = configured_directory.ok_or_else(subscription_wrapper_config_error)?;
+    if !directory.is_absolute() {
+        return Err(subscription_wrapper_config_error());
+    }
+    let canonical_directory = directory
+        .canonicalize()
+        .map_err(|_| subscription_wrapper_config_error())?;
+    if !canonical_directory.is_dir() {
+        return Err(subscription_wrapper_config_error());
+    }
+    let canonical_wrapper = canonical_directory
+        .join(cli_path)
+        .canonicalize()
+        .map_err(|_| subscription_wrapper_config_error())?;
+    if !canonical_wrapper.is_file()
+        || canonical_wrapper.parent() != Some(canonical_directory.as_path())
+    {
+        return Err(subscription_wrapper_config_error());
+    }
+    Ok(canonical_wrapper)
+}
+
+fn subscription_wrapper_config_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "subscription wrapper configuration is invalid",
+    )
+}
+
+fn build_cli_command(cli_path: &str) -> Result<tokio::process::Command, LlmError> {
+    let configured_wrapper = if SUBSCRIPTION_WRAPPERS.contains(&cli_path) {
+        let configured_directory =
+            std::env::var_os("VIBEMIND_SUBSCRIPTION_WRAPPER_DIR").map(std::path::PathBuf::from);
+        Some(
+            resolve_subscription_wrapper(cli_path, configured_directory.as_deref()).map_err(
+                |_| LlmError::Http("Subscription wrapper configuration is invalid".to_string()),
+            )?,
+        )
+    } else {
+        None
+    };
     #[cfg(windows)]
     {
-        let lower = cli_path.to_ascii_lowercase();
+        let command_path = configured_wrapper
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .unwrap_or(cli_path);
+        let lower = command_path.to_ascii_lowercase();
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
             let mut cmd = tokio::process::Command::new("cmd.exe");
-            cmd.arg("/C").arg(cli_path);
-            return cmd;
+            cmd.arg("/C").arg(command_path);
+            return Ok(cmd);
         }
     }
-    tokio::process::Command::new(cli_path)
+    Ok(tokio::process::Command::new(
+        configured_wrapper
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(cli_path)),
+    ))
 }
 
 #[async_trait]
@@ -376,7 +433,7 @@ impl LlmDriver for ClaudeCodeDriver {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
 
-        let mut cmd = build_cli_command(&self.cli_path);
+        let mut cmd = build_cli_command(&self.cli_path)?;
         let sys_prompt_tempfile = request
             .system
             .as_deref()
@@ -633,7 +690,7 @@ impl LlmDriver for ClaudeCodeDriver {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
 
-        let mut cmd = build_cli_command(&self.cli_path);
+        let mut cmd = build_cli_command(&self.cli_path)?;
         let sys_prompt_tempfile = request
             .system
             .as_deref()
@@ -983,6 +1040,54 @@ mod tests {
         assert!(!args
             .iter()
             .any(|arg| arg.contains("subscription system sentinel")));
+    }
+
+    #[test]
+    fn test_subscription_wrappers_resolve_only_from_trusted_absolute_directory() {
+        let trusted = tempfile::tempdir().unwrap();
+        let malicious = tempfile::tempdir().unwrap();
+        for name in [
+            "openfang_opencode_wrapper.cmd",
+            "openfang_claude_subscription_wrapper.cmd",
+        ] {
+            let trusted_wrapper = trusted.path().join(name);
+            let malicious_wrapper = malicious.path().join(name);
+            std::fs::write(&trusted_wrapper, "@echo trusted").unwrap();
+            std::fs::write(&malicious_wrapper, "@echo malicious").unwrap();
+
+            let resolved = resolve_subscription_wrapper(name, Some(trusted.path())).unwrap();
+            assert_eq!(resolved, trusted_wrapper.canonicalize().unwrap());
+            assert_ne!(resolved, malicious_wrapper.canonicalize().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_subscription_wrapper_resolution_rejects_missing_relative_nonexistent_and_escape_paths()
+    {
+        let trusted = tempfile::tempdir().unwrap();
+        assert!(resolve_subscription_wrapper("openfang_opencode_wrapper.cmd", None).is_err());
+        assert!(resolve_subscription_wrapper(
+            "openfang_opencode_wrapper.cmd",
+            Some(std::path::Path::new("relative/scripts")),
+        )
+        .is_err());
+        assert!(resolve_subscription_wrapper(
+            "openfang_opencode_wrapper.cmd",
+            Some(trusted.path())
+        )
+        .is_err());
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let escaped = trusted.path().join("openfang_opencode_wrapper.cmd");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(outside.path(), &escaped).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &escaped).unwrap();
+        assert!(resolve_subscription_wrapper(
+            "openfang_opencode_wrapper.cmd",
+            Some(trusted.path())
+        )
+        .is_err());
     }
 
     #[test]
