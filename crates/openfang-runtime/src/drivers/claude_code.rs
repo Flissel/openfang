@@ -407,24 +407,33 @@ fn build_cli_command(cli_path: &str) -> Result<tokio::process::Command, LlmError
     } else {
         None
     };
+    Ok(build_cli_command_for_path(
+        cli_path,
+        configured_wrapper.as_deref(),
+    ))
+}
+
+fn build_cli_command_for_path(
+    cli_path: &str,
+    configured_wrapper: Option<&std::path::Path>,
+) -> tokio::process::Command {
     #[cfg(windows)]
     {
-        let command_path = configured_wrapper
-            .as_deref()
-            .and_then(std::path::Path::to_str)
-            .unwrap_or(cli_path);
-        let lower = command_path.to_ascii_lowercase();
+        if let Some(wrapper) = configured_wrapper {
+            let mut cmd = tokio::process::Command::new("cmd.exe");
+            cmd.arg("/C").arg(wrapper);
+            return cmd;
+        }
+        let lower = cli_path.to_ascii_lowercase();
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
             let mut cmd = tokio::process::Command::new("cmd.exe");
-            cmd.arg("/C").arg(command_path);
-            return Ok(cmd);
+            cmd.arg("/C").arg(cli_path);
+            return cmd;
         }
     }
-    Ok(tokio::process::Command::new(
-        configured_wrapper
-            .as_deref()
-            .unwrap_or_else(|| std::path::Path::new(cli_path)),
-    ))
+    tokio::process::Command::new(
+        configured_wrapper.unwrap_or_else(|| std::path::Path::new(cli_path)),
+    )
 }
 
 #[async_trait]
@@ -1088,6 +1097,20 @@ mod tests {
             Some(trusted.path())
         )
         .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_trusted_wrapper_command_uses_resolved_os_path_not_bare_name() {
+        let trusted = tempfile::tempdir().unwrap();
+        let wrapper = trusted.path().join("openfang_opencode_wrapper.cmd");
+        std::fs::write(&wrapper, "@echo trusted").unwrap();
+        let resolved = wrapper.canonicalize().unwrap();
+
+        let command = build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved));
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert_eq!(args, vec![std::ffi::OsStr::new("/C"), resolved.as_os_str()]);
+        assert!(!args.contains(&std::ffi::OsStr::new("openfang_opencode_wrapper.cmd")));
     }
 
     #[test]
