@@ -7,6 +7,7 @@
 pub mod anthropic;
 pub mod bedrock;
 pub mod claude_code;
+pub mod codex_exec;
 pub mod copilot;
 pub mod fallback;
 pub mod gemini;
@@ -216,6 +217,13 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "",
             key_required: false,
         }),
+        // Codex CLI in subscription mode — subprocess-based, no API key.
+        // Distinct from "codex"/"openai-codex" above, which use the HTTP API.
+        "codex-cli" => Some(ProviderDefaults {
+            base_url: "",
+            api_key_env: "",
+            key_required: false,
+        }),
         "moonshot" | "kimi" | "kimi2" => Some(ProviderDefaults {
             base_url: MOONSHOT_BASE_URL,
             api_key_env: "MOONSHOT_API_KEY",
@@ -416,6 +424,19 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     if provider == "qwen-code" {
         let cli_path = config.base_url.clone();
         return Ok(Arc::new(qwen_code::QwenCodeDriver::new(
+            cli_path,
+            config.skip_permissions,
+        )));
+    }
+
+    // Codex CLI (subscription mode) — subprocess-based, spawns `codex exec`
+    // and strips OPENAI_API_KEY to force the ChatGPT subscription OAuth
+    // (flat-rate) instead of the metered platform API. Distinct from the
+    // "codex"/"openai-codex" provider above, which borrows a credential for
+    // the HTTP API and only works with a real API key.
+    if provider == "codex-cli" {
+        let cli_path = config.base_url.clone();
+        return Ok(Arc::new(codex_exec::CodexExecDriver::new(
             cli_path,
             config.skip_permissions,
         )));
@@ -691,6 +712,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "nvidia",
         "novita",
         "codex",
+        "codex-cli",
         "claude-code",
         "qwen-code",
         "azure",
