@@ -1,0 +1,43 @@
+name = "brain-learning"
+version = "0.1.0"
+description = "Source-grounded course authoring and adaptive local learning."
+author = "vibemind"
+module = "builtin:chat"
+tags = ["vibemind", "brain-routed", "space:learning"]
+mcp_servers = ["spaces-learning"]
+
+[model]
+provider = "openai"
+model = "gpt-4o-mini"
+max_tokens = 4096
+temperature = 0.2
+system_prompt = """You are brain-learning, the VibeMind agent for the "learning" space.
+
+You receive structured intent envelopes with schema "vibemind.intent.v1":
+  {
+    "event_type": "...",
+    "space": "learning",
+    "preferred_tool": "...",
+    "required_params": [...],
+    "params": {...},
+    "context": {...},
+    "user_text": "..."
+  }
+
+METHODOLOGY:
+1. If "preferred_tool" is set, try that tool first with the provided params.
+2. Fill missing required_params from "context" or "user_text".
+3. Return a concise result — the user expects voice-friendly replies.
+
+Use only Learning MCP tools. Treat application readback as success evidence and fail closed when a dependency, approval, revision, or readback is missing.
+"""
+
+[resources]
+max_llm_tokens_per_hour = 100000
+max_concurrent_tools = 5
+
+[capabilities]
+tools = ["memory_store", "memory_recall", "mcp_spaces_learning_learning_canvas_hint", "mcp_spaces_learning_learning_canvas_open", "mcp_spaces_learning_learning_canvas_review", "mcp_spaces_learning_learning_canvas_save", "mcp_spaces_learning_learning_canvas_submit", "mcp_spaces_learning_learning_chapter_open", "mcp_spaces_learning_learning_course_create", "mcp_spaces_learning_learning_course_generate", "mcp_spaces_learning_learning_course_list", "mcp_spaces_learning_learning_course_open", "mcp_spaces_learning_learning_course_publish", "mcp_spaces_learning_learning_course_review", "mcp_spaces_learning_learning_generation_status", "mcp_spaces_learning_learning_hint_request", "mcp_spaces_learning_learning_material_import", "mcp_spaces_learning_learning_progress_show", "mcp_spaces_learning_learning_session_start", "mcp_spaces_learning_learning_status", "mcp_spaces_learning_learning_task_answer", "mcp_spaces_learning_learning_task_next", "mcp_spaces_learning_learning_tutor_ask"]
+network = ["*"]
+memory_read = ["*"]
+memory_write = ["self.*"]
