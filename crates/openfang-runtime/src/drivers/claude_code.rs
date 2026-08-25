@@ -421,7 +421,7 @@ fn build_cli_command_for_path(
     {
         if let Some(wrapper) = configured_wrapper {
             let mut cmd = tokio::process::Command::new("cmd.exe");
-            cmd.arg("/C").arg(wrapper);
+            cmd.arg("/C").arg(path_for_cmd(wrapper));
             return cmd;
         }
         let lower = cli_path.to_ascii_lowercase();
@@ -434,6 +434,33 @@ fn build_cli_command_for_path(
     tokio::process::Command::new(
         configured_wrapper.unwrap_or_else(|| std::path::Path::new(cli_path)),
     )
+}
+
+#[cfg(windows)]
+fn path_for_cmd(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let extended_unc_prefix = [
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+    if let Some(unc_path) = wide.strip_prefix(&extended_unc_prefix) {
+        let mut normal_unc_path = vec![b'\\' as u16, b'\\' as u16];
+        normal_unc_path.extend_from_slice(unc_path);
+        return std::ffi::OsString::from_wide(&normal_unc_path).into();
+    }
+    let extended_length_prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    if let Some(normal_path) = wide.strip_prefix(&extended_length_prefix) {
+        return std::ffi::OsString::from_wide(normal_path).into();
+    }
+    path.to_path_buf()
 }
 
 #[async_trait]
@@ -1109,8 +1136,33 @@ mod tests {
 
         let command = build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved));
         let args = command.as_std().get_args().collect::<Vec<_>>();
-        assert_eq!(args, vec![std::ffi::OsStr::new("/C"), resolved.as_os_str()]);
+        assert_eq!(args, vec![std::ffi::OsStr::new("/C"), wrapper.as_os_str()]);
         assert!(!args.contains(&std::ffi::OsStr::new("openfang_opencode_wrapper.cmd")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_trusted_wrapper_command_removes_extended_length_prefix_before_cmd() {
+        let trusted = tempfile::tempdir().unwrap();
+        let wrapper = trusted.path().join("openfang_opencode_wrapper.cmd");
+        std::fs::write(&wrapper, "@echo trusted").unwrap();
+        let resolved = wrapper.canonicalize().unwrap();
+
+        let command = build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved));
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+
+        assert_eq!(args[1], wrapper.as_os_str());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_path_for_cmd_converts_extended_unc_path() {
+        let extended = std::path::Path::new(r"\\?\UNC\server\share\openfang_opencode_wrapper.cmd");
+
+        assert_eq!(
+            path_for_cmd(extended),
+            std::path::Path::new(r"\\server\share\openfang_opencode_wrapper.cmd")
+        );
     }
 
     #[test]
