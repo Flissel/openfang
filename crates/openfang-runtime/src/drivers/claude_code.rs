@@ -270,12 +270,15 @@ struct SystemPromptFile {
 }
 
 impl SystemPromptFile {
-    fn create(bytes: &[u8]) -> Result<Self, std::io::Error> {
+    fn create(bytes: &[u8], validate_for_cmd: bool) -> Result<Self, std::io::Error> {
         use std::io::Write;
 
         for _ in 0..4 {
             let path = std::env::temp_dir()
                 .join(format!("openfang-sysprompt-{}.txt", uuid::Uuid::new_v4()));
+            if validate_for_cmd {
+                validate_cmd_value(path.as_os_str())?;
+            }
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -395,6 +398,44 @@ fn subscription_wrapper_config_error() -> std::io::Error {
     )
 }
 
+fn cli_uses_windows_cmd(cli_path: &str) -> bool {
+    cfg!(windows)
+        && (SUBSCRIPTION_WRAPPERS.contains(&cli_path)
+            || cli_path.to_ascii_lowercase().ends_with(".cmd")
+            || cli_path.to_ascii_lowercase().ends_with(".bat"))
+}
+
+#[cfg(windows)]
+fn validate_cmd_value(value: &std::ffi::OsStr) -> Result<(), std::io::Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let unsafe_value = value.encode_wide().any(|unit| {
+        unit <= 0x1f
+            || unit == 0x7f
+            || matches!(
+                unit,
+                0x22 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x3c | 0x3e | 0x5e | 0x7c
+            )
+    });
+    if unsafe_value {
+        Err(subscription_wrapper_config_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn validate_cmd_value(_value: &std::ffi::OsStr) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+fn validate_cmd_args(args: &[String]) -> Result<(), std::io::Error> {
+    for arg in args {
+        validate_cmd_value(std::ffi::OsStr::new(arg))?;
+    }
+    Ok(())
+}
+
 fn build_cli_command(cli_path: &str) -> Result<tokio::process::Command, LlmError> {
     let configured_wrapper = if SUBSCRIPTION_WRAPPERS.contains(&cli_path) {
         let configured_directory =
@@ -418,14 +459,19 @@ fn build_cli_command_for_path(
     #[cfg(windows)]
     {
         if let Some(wrapper) = configured_wrapper {
+            validate_cmd_value(wrapper.as_os_str())?;
             let mut cmd = tokio::process::Command::new("cmd.exe");
-            cmd.arg("/C").arg(path_for_cmd(wrapper)?);
+            cmd.arg("/D")
+                .arg("/C")
+                .arg("call")
+                .arg(path_for_cmd(wrapper)?);
             return Ok(cmd);
         }
         let lower = cli_path.to_ascii_lowercase();
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            validate_cmd_value(std::ffi::OsStr::new(cli_path))?;
             let mut cmd = tokio::process::Command::new("cmd.exe");
-            cmd.arg("/C").arg(cli_path);
+            cmd.arg("/D").arg("/C").arg("call").arg(cli_path);
             return Ok(cmd);
         }
     }
@@ -486,12 +532,21 @@ impl LlmDriver for ClaudeCodeDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
+        let uses_cmd = cli_uses_windows_cmd(&self.cli_path);
+        if uses_cmd {
+            validate_cmd_value(std::ffi::OsStr::new(
+                model_flag.as_deref().unwrap_or_default(),
+            ))
+            .map_err(|_| {
+                LlmError::Http("Subscription wrapper arguments are invalid".to_string())
+            })?;
+        }
 
         let mut cmd = build_cli_command(&self.cli_path)?;
         let sys_prompt_tempfile = request
             .system
             .as_deref()
-            .map(|system_prompt| SystemPromptFile::create(system_prompt.as_bytes()))
+            .map(|system_prompt| SystemPromptFile::create(system_prompt.as_bytes(), uses_cmd))
             .transpose()
             .map_err(|error| {
                 warn!(error = %error, "Failed to create Claude Code system-prompt tempfile");
@@ -507,11 +562,17 @@ impl LlmDriver for ClaudeCodeDriver {
         // text, which hid whether the model invoked any skills/tools. We still
         // return only the final text (behaviour preserved); the tool_use blocks
         // are logged for observability. --verbose is required by stream-json.
-        cmd.args(build_cli_args(
+        let cli_args = build_cli_args(
             model_flag.as_deref(),
             sys_prompt_tempfile.as_ref().map(SystemPromptFile::path),
             self.skip_permissions,
-        ));
+        );
+        if uses_cmd {
+            validate_cmd_args(&cli_args).map_err(|_| {
+                LlmError::Http("Subscription wrapper arguments are invalid".to_string())
+            })?;
+        }
+        cmd.args(cli_args);
 
         Self::apply_env_filter(&mut cmd);
 
@@ -743,12 +804,21 @@ impl LlmDriver for ClaudeCodeDriver {
     ) -> Result<CompletionResponse, LlmError> {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
+        let uses_cmd = cli_uses_windows_cmd(&self.cli_path);
+        if uses_cmd {
+            validate_cmd_value(std::ffi::OsStr::new(
+                model_flag.as_deref().unwrap_or_default(),
+            ))
+            .map_err(|_| {
+                LlmError::Http("Subscription wrapper arguments are invalid".to_string())
+            })?;
+        }
 
         let mut cmd = build_cli_command(&self.cli_path)?;
         let sys_prompt_tempfile = request
             .system
             .as_deref()
-            .map(|system_prompt| SystemPromptFile::create(system_prompt.as_bytes()))
+            .map(|system_prompt| SystemPromptFile::create(system_prompt.as_bytes(), uses_cmd))
             .transpose()
             .map_err(|error| {
                 warn!(error = %error, "Failed to create Claude Code system-prompt tempfile");
@@ -756,11 +826,17 @@ impl LlmDriver for ClaudeCodeDriver {
             })?;
 
         // See `complete()` above for why prompt is routed via stdin instead of argv.
-        cmd.args(build_cli_args(
+        let cli_args = build_cli_args(
             model_flag.as_deref(),
             sys_prompt_tempfile.as_ref().map(SystemPromptFile::path),
             self.skip_permissions,
-        ));
+        );
+        if uses_cmd {
+            validate_cmd_args(&cli_args).map_err(|_| {
+                LlmError::Http("Subscription wrapper arguments are invalid".to_string())
+            })?;
+        }
+        cmd.args(cli_args);
 
         Self::apply_env_filter(&mut cmd);
 
@@ -999,10 +1075,167 @@ fn home_dir() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn subscription_test_request() -> CompletionRequest {
+        use openfang_types::message::{Message, MessageContent};
+
+        CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::text("local producer gate test"),
+            }],
+            tools: vec![],
+            max_tokens: 32,
+            temperature: 0.0,
+            system: Some("non-secret system fixture".to_string()),
+            thinking: None,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_gate_behavior_child() {
+        let Some(mode) = std::env::var_os("OPENFANG_CMD_GATE_CHILD") else {
+            return;
+        };
+        let marker = std::path::PathBuf::from(
+            std::env::var_os("OPENFANG_CMD_GATE_MARKER").expect("child marker path"),
+        );
+        let driver = ClaudeCodeDriver::with_timeout(
+            Some("openfang_claude_subscription_wrapper.cmd".to_string()),
+            true,
+            5,
+        );
+        let mut request = subscription_test_request();
+        if mode == "model" {
+            request.model = "claude-code/sonnet&echo injected".to_string();
+        }
+        let result = tokio_test::block_on(driver.complete(request));
+
+        match mode.to_str() {
+            Some("temp") | Some("model") => {
+                assert!(result.is_err());
+                assert!(
+                    !marker.exists(),
+                    "unsafe value must fail before wrapper spawn"
+                );
+            }
+            Some("safe") => assert_eq!(result.unwrap().text(), "SAFE_OK"),
+            _ => panic!("invalid child mode"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn run_cmd_gate_child(
+        root: &std::path::Path,
+        wrapper_dir: &std::path::Path,
+        temp_dir: &std::path::Path,
+        marker: &std::path::Path,
+        mode: &str,
+    ) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("drivers::claude_code::tests::cmd_gate_behavior_child")
+            .arg("--nocapture")
+            .current_dir(root)
+            .env("VIBEMIND_SUBSCRIPTION_WRAPPER_DIR", wrapper_dir)
+            .env("TEMP", temp_dir)
+            .env("TMP", temp_dir)
+            .env("OPENFANG_CMD_GATE_CHILD", mode)
+            .env("OPENFANG_CMD_GATE_MARKER", marker)
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated cmd gate child failed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_cmd_wrapper_rejects_injected_temp_before_spawn_and_allows_safe_spaces_unicode() {
+        let root = tempfile::tempdir().unwrap();
+        let wrapper_dir = root.path().join("trusted wrappers ü space");
+        std::fs::create_dir(&wrapper_dir).unwrap();
+        let wrapper = wrapper_dir.join("openfang_claude_subscription_wrapper.cmd");
+        std::fs::write(
+            &wrapper,
+            "@echo off\r\necho {\"type\":\"result\",\"result\":\"SAFE_OK\"}\r\n",
+        )
+        .unwrap();
+        let marker_name = format!("openfang-cmd-marker-{}.tmp", uuid::Uuid::new_v4());
+        let marker = root.path().join(&marker_name);
+        let injected_temp = root.path().join(format!("unsafe&copy NUL {marker_name}&"));
+        std::fs::create_dir(&injected_temp).unwrap();
+        run_cmd_gate_child(root.path(), &wrapper_dir, &injected_temp, &marker, "temp");
+
+        let safe_temp = root.path().join("safe temp ü space");
+        std::fs::create_dir(&safe_temp).unwrap();
+        let spawned_marker = root.path().join("model-spawned.tmp");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "@echo off\r\necho spawned>\"{}\"\r\n",
+                spawned_marker.display()
+            ),
+        )
+        .unwrap();
+        run_cmd_gate_child(
+            root.path(),
+            &wrapper_dir,
+            &safe_temp,
+            &spawned_marker,
+            "model",
+        );
+
+        std::fs::write(
+            &wrapper,
+            "@echo off\r\necho {\"type\":\"result\",\"result\":\"SAFE_OK\"}\r\n",
+        )
+        .unwrap();
+        run_cmd_gate_child(
+            root.path(),
+            &wrapper_dir,
+            &safe_temp,
+            &spawned_marker,
+            "safe",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_cmd_argument_gate_rejects_shell_and_control_hazards() {
+        for hazard in [
+            "&", "|", "<", ">", "^", "%", "!", "(", ")", "\r", "\n", "\t", "\"",
+        ] {
+            let candidate = format!("safe{hazard}unsafe");
+            assert!(
+                validate_cmd_value(std::ffi::OsStr::new(&candidate)).is_err(),
+                "hazard must be rejected"
+            );
+        }
+        assert!(validate_cmd_value(std::ffi::OsStr::new(r"C:\safe path ü\name=value.txt")).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_cmd_wrapper_path_rejects_metacharacters_before_command_build() {
+        let root = tempfile::tempdir().unwrap();
+        let unsafe_directory = root.path().join("unsafe&wrapper");
+        std::fs::create_dir(&unsafe_directory).unwrap();
+        let wrapper = unsafe_directory.join("openfang_claude_subscription_wrapper.cmd");
+        std::fs::write(&wrapper, "@echo must-not-run").unwrap();
+        let resolved = wrapper.canonicalize().unwrap();
+
+        assert!(build_cli_command_for_path(
+            "openfang_claude_subscription_wrapper.cmd",
+            Some(&resolved)
+        )
+        .is_err());
+    }
+
     #[test]
     fn test_system_prompt_file_is_removed_when_owner_drops() {
         let path = {
-            let prompt_file = SystemPromptFile::create(b"subscription system sentinel")
+            let prompt_file = SystemPromptFile::create(b"subscription system sentinel", false)
                 .expect("create system prompt tempfile");
             let path = prompt_file.path().to_path_buf();
             assert!(path.is_file());
@@ -1021,8 +1254,10 @@ mod tests {
 
     #[test]
     fn test_system_prompt_files_use_unique_uuid_names_and_owner_scoped_cleanup() {
-        let first = SystemPromptFile::create(b"first prompt").expect("create first prompt file");
-        let second = SystemPromptFile::create(b"second prompt").expect("create second prompt file");
+        let first =
+            SystemPromptFile::create(b"first prompt", false).expect("create first prompt file");
+        let second =
+            SystemPromptFile::create(b"second prompt", false).expect("create second prompt file");
         let first_path = first.path().to_path_buf();
         let second_path = second.path().to_path_buf();
 
@@ -1054,7 +1289,8 @@ mod tests {
     fn test_system_prompt_file_has_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let prompt_file = SystemPromptFile::create(b"private prompt").expect("create prompt file");
+        let prompt_file =
+            SystemPromptFile::create(b"private prompt", false).expect("create prompt file");
         let mode = std::fs::metadata(prompt_file.path())
             .unwrap()
             .permissions()
@@ -1155,7 +1391,15 @@ mod tests {
         let command =
             build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved)).unwrap();
         let args = command.as_std().get_args().collect::<Vec<_>>();
-        assert_eq!(args, vec![std::ffi::OsStr::new("/C"), wrapper.as_os_str()]);
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("/D"),
+                std::ffi::OsStr::new("/C"),
+                std::ffi::OsStr::new("call"),
+                wrapper.as_os_str(),
+            ]
+        );
         assert!(!args.contains(&std::ffi::OsStr::new("openfang_opencode_wrapper.cmd")));
     }
 
@@ -1171,7 +1415,7 @@ mod tests {
             build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved)).unwrap();
         let args = command.as_std().get_args().collect::<Vec<_>>();
 
-        assert_eq!(args[1], wrapper.as_os_str());
+        assert_eq!(args[3], wrapper.as_os_str());
     }
 
     #[cfg(windows)]
