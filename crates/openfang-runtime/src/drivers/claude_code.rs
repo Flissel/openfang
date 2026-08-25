@@ -407,37 +407,48 @@ fn build_cli_command(cli_path: &str) -> Result<tokio::process::Command, LlmError
     } else {
         None
     };
-    Ok(build_cli_command_for_path(
-        cli_path,
-        configured_wrapper.as_deref(),
-    ))
+    build_cli_command_for_path(cli_path, configured_wrapper.as_deref())
+        .map_err(|_| LlmError::Http("Subscription wrapper configuration is invalid".to_string()))
 }
 
 fn build_cli_command_for_path(
     cli_path: &str,
     configured_wrapper: Option<&std::path::Path>,
-) -> tokio::process::Command {
+) -> Result<tokio::process::Command, std::io::Error> {
     #[cfg(windows)]
     {
         if let Some(wrapper) = configured_wrapper {
             let mut cmd = tokio::process::Command::new("cmd.exe");
-            cmd.arg("/C").arg(path_for_cmd(wrapper));
-            return cmd;
+            cmd.arg("/C").arg(path_for_cmd(wrapper)?);
+            return Ok(cmd);
         }
         let lower = cli_path.to_ascii_lowercase();
         if lower.ends_with(".cmd") || lower.ends_with(".bat") {
             let mut cmd = tokio::process::Command::new("cmd.exe");
             cmd.arg("/C").arg(cli_path);
-            return cmd;
+            return Ok(cmd);
         }
     }
-    tokio::process::Command::new(
+    Ok(tokio::process::Command::new(
         configured_wrapper.unwrap_or_else(|| std::path::Path::new(cli_path)),
-    )
+    ))
 }
 
 #[cfg(windows)]
-fn path_for_cmd(path: &std::path::Path) -> std::path::PathBuf {
+fn path_for_cmd(path: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
+    let candidate =
+        normalized_extended_path_for_cmd(path).ok_or_else(subscription_wrapper_config_error)?;
+    let canonical_candidate = candidate
+        .canonicalize()
+        .map_err(|_| subscription_wrapper_config_error())?;
+    if canonical_candidate != path {
+        return Err(subscription_wrapper_config_error());
+    }
+    Ok(candidate)
+}
+
+#[cfg(windows)]
+fn normalized_extended_path_for_cmd(path: &std::path::Path) -> Option<std::path::PathBuf> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -454,13 +465,20 @@ fn path_for_cmd(path: &std::path::Path) -> std::path::PathBuf {
     if let Some(unc_path) = wide.strip_prefix(&extended_unc_prefix) {
         let mut normal_unc_path = vec![b'\\' as u16, b'\\' as u16];
         normal_unc_path.extend_from_slice(unc_path);
-        return std::ffi::OsString::from_wide(&normal_unc_path).into();
+        return Some(std::ffi::OsString::from_wide(&normal_unc_path).into());
     }
     let extended_length_prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
     if let Some(normal_path) = wide.strip_prefix(&extended_length_prefix) {
-        return std::ffi::OsString::from_wide(normal_path).into();
+        let is_drive_path = normal_path.len() >= 3
+            && ((b'A' as u16..=b'Z' as u16).contains(&normal_path[0])
+                || (b'a' as u16..=b'z' as u16).contains(&normal_path[0]))
+            && normal_path[1] == b':' as u16
+            && normal_path[2] == b'\\' as u16;
+        if is_drive_path {
+            return Some(std::ffi::OsString::from_wide(normal_path).into());
+        }
     }
-    path.to_path_buf()
+    None
 }
 
 #[async_trait]
@@ -1134,7 +1152,8 @@ mod tests {
         std::fs::write(&wrapper, "@echo trusted").unwrap();
         let resolved = wrapper.canonicalize().unwrap();
 
-        let command = build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved));
+        let command =
+            build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved)).unwrap();
         let args = command.as_std().get_args().collect::<Vec<_>>();
         assert_eq!(args, vec![std::ffi::OsStr::new("/C"), wrapper.as_os_str()]);
         assert!(!args.contains(&std::ffi::OsStr::new("openfang_opencode_wrapper.cmd")));
@@ -1148,7 +1167,8 @@ mod tests {
         std::fs::write(&wrapper, "@echo trusted").unwrap();
         let resolved = wrapper.canonicalize().unwrap();
 
-        let command = build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved));
+        let command =
+            build_cli_command_for_path("openfang_opencode_wrapper.cmd", Some(&resolved)).unwrap();
         let args = command.as_std().get_args().collect::<Vec<_>>();
 
         assert_eq!(args[1], wrapper.as_os_str());
@@ -1160,9 +1180,54 @@ mod tests {
         let extended = std::path::Path::new(r"\\?\UNC\server\share\openfang_opencode_wrapper.cmd");
 
         assert_eq!(
-            path_for_cmd(extended),
+            normalized_extended_path_for_cmd(extended).unwrap(),
             std::path::Path::new(r"\\server\share\openfang_opencode_wrapper.cmd")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_path_for_cmd_rejects_unsupported_extended_volume_path() {
+        let extended = std::path::Path::new(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\openfang_opencode_wrapper.cmd",
+        );
+
+        assert!(path_for_cmd(extended).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_normalized_extended_path_for_cmd_rejects_non_ascii_drive_letter() {
+        let extended = std::path::Path::new(r"\\?\Ń:\openfang_opencode_wrapper.cmd");
+
+        assert!(normalized_extended_path_for_cmd(extended).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_path_for_cmd_rejects_trailing_dot_alias_to_different_file() {
+        let trusted = tempfile::tempdir().unwrap();
+        let normal_wrapper = trusted.path().join("openfang_opencode_wrapper.cmd");
+        std::fs::write(&normal_wrapper, "@echo normal").unwrap();
+        let canonical_directory = trusted.path().canonicalize().unwrap();
+        let trailing_dot_wrapper = canonical_directory.join("openfang_opencode_wrapper.cmd.");
+        std::fs::write(&trailing_dot_wrapper, "@echo trailing dot").unwrap();
+        let canonical_trailing_dot_wrapper = trailing_dot_wrapper.canonicalize().unwrap();
+
+        let normalized_alias =
+            normalized_extended_path_for_cmd(&canonical_trailing_dot_wrapper).unwrap();
+        assert_eq!(
+            normalized_alias.canonicalize().unwrap(),
+            normal_wrapper.canonicalize().unwrap()
+        );
+        assert_ne!(
+            normalized_alias.canonicalize().unwrap(),
+            canonical_trailing_dot_wrapper
+        );
+        let result = path_for_cmd(&canonical_trailing_dot_wrapper);
+        std::fs::remove_file(&trailing_dot_wrapper).unwrap();
+
+        assert!(result.is_err());
     }
 
     #[test]
