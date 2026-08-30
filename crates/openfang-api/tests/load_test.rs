@@ -50,6 +50,7 @@ async fn start_test_server() -> TestServer {
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 
+    let budget = kernel.config.budget.clone();
     let state = Arc::new(AppState {
         kernel,
         started_at: Instant::now(),
@@ -59,6 +60,8 @@ async fn start_test_server() -> TestServer {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
+        issuable_credentials: Default::default(),
     });
 
     let app = Router::new()

@@ -11561,10 +11561,19 @@ pub async fn issue_credential(
         );
     }
 
-    // SECURITY: resolve unconditionally and check the allowlist afterwards, so
-    // that "not allowlisted" and "allowlisted but unresolvable" run the same
-    // work and take the same time. A caller must not be able to tell them
-    // apart from latency any more than from the status or the body.
+    // SECURITY: the order of these two lines is load-bearing. Resolving
+    // unconditionally and checking the allowlist afterwards is what makes
+    // "not allowlisted" and "allowlisted but unresolvable" run the same work
+    // and take the same time; a caller must not be able to tell them apart
+    // from latency any more than from the status or the body.
+    //
+    // DO NOT "optimise" this into an early return on the allowlist miss. That
+    // would skip the lookup, make the refusal measurably faster, and reopen
+    // the timing oracle that enumerates which secrets this daemon holds.
+    //
+    // The cost of that guarantee: an arbitrary caller-supplied name triggers a
+    // local vault/dotenv/env lookup. It is read-only and has no side effects,
+    // and the value is dropped unread in the refusal arm below.
     let resolved = state.kernel.resolve_credential(reference);
     let allowlisted = state.issuable_credentials.contains(reference);
 

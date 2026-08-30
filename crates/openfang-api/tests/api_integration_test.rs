@@ -1021,11 +1021,21 @@ async fn test_credential_issue_returns_value_with_no_store() {
         .unwrap();
 
     assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get("cache-control")
-            .and_then(|v| v.to_str().ok()),
-        Some("no-store")
+
+    // The handler sets exactly `no-store`. In the real daemon the
+    // `security_headers` middleware (crates/openfang-api/src/middleware.rs)
+    // overwrites this header with the wider `no-store, no-cache,
+    // must-revalidate`, and that layer is not mounted on this test router.
+    // Assert containment so the test holds in both worlds rather than
+    // describing something production never returns.
+    let cache_control = resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .expect("credential response must carry a cache-control header");
+    assert!(
+        cache_control.contains("no-store"),
+        "credential response must forbid storage, got: {cache_control}"
     );
 
     let body: serde_json::Value = resp.json().await.unwrap();
