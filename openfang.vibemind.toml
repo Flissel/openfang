@@ -89,7 +89,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_network_monitor/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/network_monitor/mcp_server.py"]
 
 [[mcp_servers]]
 name = "endpoint-hardening"
@@ -97,7 +97,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_endpoint_hardening/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/endpoint_hardening/mcp_server.py"]
 
 [[mcp_servers]]
 name = "event-log"
@@ -105,7 +105,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_event_log/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/event_log/mcp_server.py"]
 
 [[mcp_servers]]
 name = "firewall"
@@ -113,7 +113,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_firewall/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/firewall/mcp_server.py"]
 
 [[mcp_servers]]
 name = "botnet-detector"
@@ -121,7 +121,7 @@ timeout_secs = 60
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_botnet_detector/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/botnet_detector/mcp_server.py"]
 
 [[mcp_servers]]
 name = "site-verifier"
@@ -129,7 +129,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_site_verifier/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/offense/site_verifier/mcp_server.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # SYSTEM PoC MCP Servers (vibemind-os/system/)
@@ -209,7 +209,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/devops/poc_backup_sync/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/devops/backup_sync/mcp_server.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # BUSINESS PoC MCP Servers (vibemind-os/business/)
@@ -391,6 +391,23 @@ timeout_secs = 10
 type = "stdio"
 command = "python"
 args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_mcp.py"]
+
+# 2026-08-22: Laura-MCP (28 Tools, lokaler Videoeditor auf 127.0.0.1:8765).
+# WIRKSAM wird der Eintrag erst in ~/.openfang/config.toml — diese Datei ist
+# die versionierte Vorlage. Beide muessen uebereinstimmen.
+[[mcp_servers]]
+name = "laura"
+env = ["LAURA_TOKEN"]
+
+[mcp_servers.transport]
+type = "stdio"
+command = "uv"
+args = [
+    "run",
+    "--directory",
+    "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/video/laura/services/mcp",
+    "laura-mcp",
+]
 
 # ═══════════════════════════════════════════════════════════════════
 # Desktop Automation (handoff multi-agent system)
