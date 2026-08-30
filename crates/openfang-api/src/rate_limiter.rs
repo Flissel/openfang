@@ -25,6 +25,9 @@ pub fn operation_cost(method: &str, path: &str) -> NonZeroU32 {
         ("GET", p) if p.starts_with("/api/audit") => NonZeroU32::new(5).unwrap(),
         ("GET", p) if p.starts_with("/api/marketplace") => NonZeroU32::new(10).unwrap(),
         ("POST", "/api/agents") => NonZeroU32::new(50).unwrap(),
+        // Dispensing a stored secret is weighted like spawning an agent:
+        // at 500 tokens/min/IP that is 10 attempts a minute, not 100.
+        ("POST", "/api/credentials/issue") => NonZeroU32::new(50).unwrap(),
         ("POST", p) if p.contains("/message") => NonZeroU32::new(30).unwrap(),
         ("POST", p) if p.contains("/run") => NonZeroU32::new(100).unwrap(),
         ("POST", "/api/skills/install") => NonZeroU32::new(50).unwrap(),
@@ -88,6 +91,7 @@ mod tests {
         assert_eq!(operation_cost("GET", "/api/tools").get(), 1);
         assert_eq!(operation_cost("POST", "/api/agents/1/message").get(), 30);
         assert_eq!(operation_cost("POST", "/api/agents").get(), 50);
+        assert_eq!(operation_cost("POST", "/api/credentials/issue").get(), 50);
         assert_eq!(operation_cost("POST", "/api/workflows/1/run").get(), 100);
         assert_eq!(operation_cost("GET", "/api/agents/1/session").get(), 5);
         assert_eq!(operation_cost("GET", "/api/skills").get(), 2);
