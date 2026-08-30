@@ -42,6 +42,32 @@ pub async fn build_router(
     let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
 
     let channels_config = kernel.config.channels.clone();
+
+    // Credential references this daemon may hand out via
+    // POST /api/credentials/issue. Read once, here, so the handler never
+    // touches the process environment at request time. Unset or empty means
+    // the feature is off and every issuance request is refused.
+    let issuable_credentials: std::collections::HashSet<String> =
+        std::env::var("OPENFANG_ISSUABLE_CREDENTIALS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+    if issuable_credentials.is_empty() {
+        info!("Credential issuance disabled (OPENFANG_ISSUABLE_CREDENTIALS unset or empty)");
+    } else {
+        // Reference NAMES only — the values are never read here, let alone logged.
+        let mut names: Vec<&str> = issuable_credentials.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        info!(
+            "Credential issuance enabled for {} reference(s): {}",
+            names.len(),
+            names.join(", ")
+        );
+    }
+
     let state = Arc::new(AppState {
         kernel: kernel.clone(),
         started_at: Instant::now(),
@@ -52,6 +78,7 @@ pub async fn build_router(
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone())),
+        issuable_credentials,
     });
 
     // CORS: allow localhost origins by default. If API key is set, the API
@@ -703,6 +730,13 @@ pub async fn build_router(
         .route(
             "/v1/models",
             axum::routing::get(crate::openai_compat::list_models),
+        )
+        // Credential issuance — one credential per call, bounded by the
+        // OPENFANG_ISSUABLE_CREDENTIALS allowlist. Not a public path: with an
+        // API key configured this requires the bearer token.
+        .route(
+            "/api/credentials/issue",
+            axum::routing::post(routes::issue_credential),
         )
         // Dashboard authentication endpoints
         .route("/api/auth/login", axum::routing::post(routes::auth_login))
