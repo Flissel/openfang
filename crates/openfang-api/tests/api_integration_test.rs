@@ -67,6 +67,7 @@ async fn start_tool_only_test_server() -> TestServer {
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        issuable_credentials: Default::default(),
     });
     let app = Router::new()
         .route("/mcp", axum::routing::post(routes::mcp_http))
@@ -470,6 +471,7 @@ async fn start_test_server_with_provider(
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 
+    let budget = kernel.config.budget.clone();
     let state = Arc::new(AppState {
         kernel,
         started_at: Instant::now(),
@@ -479,7 +481,8 @@ async fn start_test_server_with_provider(
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
-        budget_config: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
+        issuable_credentials: Default::default(),
     });
 
     let app = Router::new()
@@ -2594,6 +2597,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 
+    let budget = kernel.config.budget.clone();
     let state = Arc::new(AppState {
         kernel,
         started_at: Instant::now(),
@@ -2603,7 +2607,8 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
-        budget_config: Arc::new(tokio::sync::RwLock::new(Default::default())),
+        budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
+        issuable_credentials: Default::default(),
     });
 
     let api_key = state.kernel.config.api_key.trim().to_string();
@@ -3493,4 +3498,440 @@ async fn test_clone_agent_empty_name_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+// ---------------------------------------------------------------------------
+// Credential issuance tests -- POST /api/credentials/issue
+// ---------------------------------------------------------------------------
+
+/// Bearer token every credential-issuance test server is configured with.
+const CRED_API_KEY: &str = "cred-test-key-123";
+
+/// Start a test server that mounts `POST /api/credentials/issue` behind the
+/// real auth middleware.
+///
+/// `issuable` is the server-side allowlist. It is threaded through `AppState`
+/// rather than read from `std::env` at request time, so tests running in
+/// parallel cannot race each other over one process-wide variable.
+///
+/// `credentials` are written to `<home>/.env` *before* the kernel boots -- that
+/// dotenv file is the credential resolver's second lookup source, so it seeds
+/// `Kernel::resolve_credential` per test without touching the process
+/// environment either.
+async fn start_credential_test_server(
+    issuable: &[&str],
+    credentials: &[(&str, &str)],
+) -> TestServer {
+    start_credential_test_server_with_key(CRED_API_KEY, issuable, credentials).await
+}
+
+/// Same, but with the daemon's `api_key` under the test's control.
+///
+/// Passing `""` reproduces the fail-open configuration: `middleware::auth`
+/// waves every request through, exactly as a local daemon with no `api_key`
+/// and no dashboard auth would.
+async fn start_credential_test_server_with_key(
+    api_key: &str,
+    issuable: &[&str],
+    credentials: &[(&str, &str)],
+) -> TestServer {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+
+    if !credentials.is_empty() {
+        let dotenv: String = credentials
+            .iter()
+            .map(|(k, v)| format!("{k}={v}\n"))
+            .collect();
+        std::fs::write(tmp.path().join(".env"), dotenv).expect("Failed to write test .env");
+    }
+
+    let config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        api_key: api_key.to_string(),
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+            subprocess_timeout_secs: None,
+        },
+        ..KernelConfig::default()
+    };
+
+    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = Arc::new(kernel);
+    kernel.set_self_handle();
+
+    let budget = kernel.config.budget.clone();
+    let state = Arc::new(AppState {
+        kernel,
+        started_at: Instant::now(),
+        peer_registry: None,
+        bridge_manager: tokio::sync::Mutex::new(None),
+        channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
+        issuable_credentials: issuable.iter().map(|s| s.to_string()).collect(),
+    });
+
+    let api_key = state.kernel.config.api_key.trim().to_string();
+    let auth_state = middleware::AuthState {
+        api_key: api_key.clone(),
+        auth_enabled: state.kernel.config.auth.enabled,
+        session_secret: api_key.clone(),
+        // Test harness only. This router is not built with
+        // `into_make_service_with_connect_info`, so `middleware::auth` cannot
+        // observe that the caller is loopback and would fail closed with 401
+        // on the empty-api_key case. Opting out here is what lets the request
+        // REACH `issue_credential`, so its own fail-open refusal (404) is the
+        // thing actually asserted. Mainline's start_test_server_with_auth sets
+        // this the same way. Production is unaffected: server.rs derives it
+        // from OPENFANG_ALLOW_NO_AUTH, which defaults to false.
+        allow_no_auth: true,
+    };
+
+    let app = Router::new()
+        .route(
+            "/api/credentials/issue",
+            axum::routing::post(routes::issue_credential),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            middleware::auth,
+        ))
+        .layer(axum::middleware::from_fn(middleware::request_logging))
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test server");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    TestServer {
+        base_url: format!("http://{}", addr),
+        state,
+        _tmp: tmp,
+    }
+}
+
+/// The endpoint is a write route and is deliberately NOT in the middleware's
+/// public-path allowlist, so an unauthenticated call is rejected before the
+/// handler ever sees the reference.
+#[tokio::test]
+async fn test_credential_issue_requires_auth() {
+    let server =
+        start_credential_test_server(&["ROWBOAT_TEST_TOKEN"], &[("ROWBOAT_TEST_TOKEN", "seeded")])
+            .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // The middleware's own error shape, not anything credential-shaped.
+    assert!(body["error"].as_str().unwrap().contains("Missing"));
+    assert!(
+        body["value"].is_null(),
+        "unauthenticated 401 body must not carry a credential field"
+    );
+}
+
+/// An allowlisted, resolvable reference is issued, and the response is marked
+/// uncacheable.
+#[tokio::test]
+async fn test_credential_issue_returns_value_with_no_store() {
+    const SEEDED: &str = "test-value-not-a-real-secret";
+    let server =
+        start_credential_test_server(&["ROWBOAT_TEST_TOKEN"], &[("ROWBOAT_TEST_TOKEN", SEEDED)])
+            .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    // The handler sets exactly `no-store`. In the real daemon the
+    // `security_headers` middleware (crates/openfang-api/src/middleware.rs)
+    // overwrites this header with the wider `no-store, no-cache,
+    // must-revalidate`, and that layer is not mounted on this test router.
+    // Assert containment so the test holds in both worlds rather than
+    // describing something production never returns.
+    let cache_control = resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .expect("credential response must carry a cache-control header");
+    assert!(
+        cache_control.contains("no-store"),
+        "credential response must forbid storage, got: {cache_control}"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["reference"], "ROWBOAT_TEST_TOKEN");
+    // Compared without printing either side into the failure output.
+    assert!(
+        body["value"].as_str() == Some(SEEDED),
+        "issued value did not match the credential the kernel resolves"
+    );
+    // Nothing that pretends a scoped, expiring token was minted.
+    assert!(body["expires_at"].is_null());
+}
+
+/// Allowlisted, but the kernel cannot resolve it.
+#[tokio::test]
+async fn test_credential_issue_allowlisted_but_unresolvable() {
+    let server = start_credential_test_server(&["ROWBOAT_ALLOWED_MISSING"], &[]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_ALLOWED_MISSING"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "credential_unavailable");
+}
+
+/// The load-bearing one: a reference the kernel CAN resolve but that is not on
+/// the allowlist must be refused, and that refusal must be byte-identical to
+/// the refusal for an allowlisted-but-unresolvable reference. Anything less
+/// turns the endpoint into an oracle that enumerates the daemon's secrets.
+#[tokio::test]
+async fn test_credential_issue_refusals_are_indistinguishable() {
+    const SECRET: &str = "must-not-be-issued";
+    let server = start_credential_test_server(
+        &["ROWBOAT_ALLOWED_MISSING"],
+        &[("ROWBOAT_SECRET_NOT_ALLOWED", SECRET)],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // Resolvable by the kernel, but not allowlisted.
+    let not_allowlisted = client
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_SECRET_NOT_ALLOWED"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Allowlisted, but unresolvable.
+    let unresolvable = client
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_ALLOWED_MISSING"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(not_allowlisted.status(), 404);
+    assert_eq!(not_allowlisted.status(), unresolvable.status());
+    assert_eq!(
+        not_allowlisted
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        unresolvable
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+    );
+
+    let not_allowlisted_body = not_allowlisted.text().await.unwrap();
+    let unresolvable_body = unresolvable.text().await.unwrap();
+    assert_eq!(
+        not_allowlisted_body,
+        "{\"error\":\"credential_unavailable\"}"
+    );
+    assert_eq!(not_allowlisted_body, unresolvable_body);
+    assert!(
+        !not_allowlisted_body.contains(SECRET),
+        "refusal body leaked the credential value"
+    );
+}
+
+/// An empty allowlist means the feature is off: even a well-formed, resolvable
+/// reference is refused.
+#[tokio::test]
+async fn test_credential_issue_empty_allowlist_refuses_everything() {
+    let server =
+        start_credential_test_server(&[], &[("ROWBOAT_TEST_TOKEN", "seeded-but-unreachable")])
+            .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert_eq!(body, "{\"error\":\"credential_unavailable\"}");
+    assert!(!body.contains("seeded-but-unreachable"));
+}
+
+/// A reference that could never be an env-var name is a caller bug, not a fact
+/// about which secrets exist -- so it gets its own status.
+#[tokio::test]
+async fn test_credential_issue_rejects_malformed_reference() {
+    let server =
+        start_credential_test_server(&["ROWBOAT_TEST_TOKEN"], &[("ROWBOAT_TEST_TOKEN", "seeded")])
+            .await;
+    let client = reqwest::Client::new();
+
+    let too_long = "A".repeat(200);
+    for reference in ["a b", "", too_long.as_str(), "../../etc/passwd"] {
+        let resp = client
+            .post(format!("{}/api/credentials/issue", server.base_url))
+            .bearer_auth(CRED_API_KEY)
+            .json(&serde_json::json!({"reference": reference}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "malformed reference of length {} should be rejected",
+            reference.len()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "reference_invalid");
+    }
+}
+
+/// A daemon with no `api_key` and no dashboard auth runs `middleware::auth` in
+/// pass-through mode: nothing authenticates the caller. An endpoint that
+/// dispenses stored secrets must not operate in that configuration — and its
+/// refusal must be the ordinary one, or the refusal itself would advertise
+/// how the daemon is configured.
+#[tokio::test]
+async fn test_credential_issue_refused_when_daemon_has_no_auth() {
+    const SEEDED: &str = "must-not-be-issued-without-auth";
+
+    // Fail-open daemon: empty api_key, and the reference IS allowlisted and IS
+    // resolvable — so only the guard can be what refuses it.
+    let open = start_credential_test_server_with_key(
+        "",
+        &["ROWBOAT_TEST_TOKEN"],
+        &[("ROWBOAT_TEST_TOKEN", SEEDED)],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let refused_by_guard = client
+        .post(format!("{}/api/credentials/issue", open.base_url))
+        .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(refused_by_guard.status(), 404);
+
+    // The same refusal an authenticated caller gets for an unresolvable
+    // reference, from a normally configured daemon.
+    let guarded = start_credential_test_server(&["ROWBOAT_ALLOWED_MISSING"], &[]).await;
+    let ordinary_refusal = client
+        .post(format!("{}/api/credentials/issue", guarded.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_ALLOWED_MISSING"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(refused_by_guard.status(), ordinary_refusal.status());
+    assert_eq!(
+        refused_by_guard
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        ordinary_refusal
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+    );
+
+    let guard_body = refused_by_guard.text().await.unwrap();
+    let ordinary_body = ordinary_refusal.text().await.unwrap();
+    assert_eq!(guard_body, r#"{"error":"credential_unavailable"}"#);
+    assert_eq!(
+        guard_body, ordinary_body,
+        "the fail-open guard must be indistinguishable from an ordinary refusal"
+    );
+    assert!(
+        !guard_body.contains(SEEDED),
+        "guard refusal leaked the credential value"
+    );
+}
+
+/// The endpoint documents exactly two error bodies. A `reference` that is
+/// null, a number, or missing, and a body that is not JSON at all, must all
+/// produce `400 reference_invalid` — not axum's own text/plain 415/422.
+#[tokio::test]
+async fn test_credential_issue_rejects_non_string_and_unparseable_bodies() {
+    let server =
+        start_credential_test_server(&["ROWBOAT_TEST_TOKEN"], &[("ROWBOAT_TEST_TOKEN", "seeded")])
+            .await;
+    let client = reqwest::Client::new();
+
+    for body in [
+        serde_json::json!({"reference": null}),
+        serde_json::json!({"reference": 42}),
+        serde_json::json!({"reference": ["ROWBOAT_TEST_TOKEN"]}),
+        serde_json::json!({}),
+        serde_json::json!("ROWBOAT_TEST_TOKEN"),
+    ] {
+        let resp = client
+            .post(format!("{}/api/credentials/issue", server.base_url))
+            .bearer_auth(CRED_API_KEY)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400, "body {body} should be rejected");
+        let parsed: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(parsed["error"], "reference_invalid");
+    }
+
+    // No Content-Type: application/json, and not JSON either.
+    let resp = client
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .header("content-type", "text/plain")
+        .body("reference=ROWBOAT_TEST_TOKEN")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let parsed: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(parsed["error"], "reference_invalid");
 }

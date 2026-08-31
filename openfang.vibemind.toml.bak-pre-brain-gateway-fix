@@ -9,31 +9,6 @@
 # API server port (top-level field, NOT under [network])
 api_listen = "127.0.0.1:4200"
 
-# ── Heartbeat ───────────────────────────────────────────────────
-# 2026-05-29: raised from default 60s. brain-gateway routes Telegram
-# messages through Brain multihop_execute + visible browser
-# (openclaw-visible), which can legitimately take 30-300s. At 60s the
-# kernel marked agents "Crashed" mid-request — Brain.multihop_execute
-# returned response: "" because openclaw-visible was killed at the
-# 60s heartbeat *during* its Chrome-navigation call (~50s).
-# 360s > the claude_code driver's 300s subprocess timeout, so the
-# driver's own kill is the real ceiling. Without this block the
-# openclaw gateway over Telegram bot does not work.
-# Rollback: remove this block (default 60s, but agents will spuriously
-# crash on every long-running browser task).
-[heartbeat]
-default_timeout_secs = 360
-
-# ── Approval Policy ──────────────────────────────────────────────
-# 2026-06-17: VibeMind Marketing approval-gate needs 5min click-window
-# for human review. OpenFang's MAX_TIMEOUT_SECS is hard-capped at 300 in
-# crates/openfang-types/src/approval.rs — this is the max allowed value.
-# Default was 60 → operator couldn't reach the UI in time.
-# Used by: POST /api/approvals (marketing curator + bridge), shell_exec
-# Without this block, broadcast/reply approvals expire after 60s.
-[approval]
-timeout_secs = 300
-
 # ── Telegram Channel ─────────────────────────────────────────────
 # Enables polling for the @VibeMind_agent_bot bot. Without this block
 # OpenFang starts without a Telegram consumer and incoming messages pile
@@ -41,21 +16,11 @@ timeout_secs = 300
 [channels.telegram]
 bot_token_env = "TELEGRAM_BOT_TOKEN"
 allowed_users = ["1092040975"]
-# 2026-05-29: routed to brain-gateway so every Telegram message flows
-# through Brain's /api/multihop/execute capability pipeline
-# (browser_automation -> openclaw-visible, coding_task -> openclaude-coder,
-# desktop_skill -> ...). brain-gateway is a deterministic bridge agent
-# whose model.base_url points at scripts/openfang_brain_gateway_wrapper.cmd
-# — no intermediate LLM decision, no 368-tool tool-loop.
-#
-# Previous: default_agent = "desktop" (see .bak-pre-brain-gateway-fix).
-# That bypassed Brain capability routing — openclaw browser tasks did not
-# reach openclaw-visible.
-#
-# Note: ~/.openfang/config.toml already had default_agent = "brain-gateway"
-# but this file (--config openfang.vibemind.toml) takes precedence and
-# was still overriding it back to "desktop". Both now agree.
-default_agent = "brain-gateway"
+# Telegram routes to the dedicated `desktop` agent which has an MCP
+# allowlist of only the desktop-automation server (~20 tools, not 368).
+# This avoids the 60s heartbeat timeout caused by 368-tool tool-loops
+# and keeps replies focused on what the user actually wants from the bot.
+default_agent = "desktop"
 
 [default_model]
 provider = "claude-code"
@@ -89,7 +54,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/network_monitor/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_network_monitor/mcp_server.py"]
 
 [[mcp_servers]]
 name = "endpoint-hardening"
@@ -97,7 +62,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/endpoint_hardening/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_endpoint_hardening/mcp_server.py"]
 
 [[mcp_servers]]
 name = "event-log"
@@ -105,7 +70,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/event_log/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_event_log/mcp_server.py"]
 
 [[mcp_servers]]
 name = "firewall"
@@ -113,7 +78,7 @@ timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/firewall/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_firewall/mcp_server.py"]
 
 [[mcp_servers]]
 name = "botnet-detector"
@@ -121,7 +86,7 @@ timeout_secs = 60
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/defense/botnet_detector/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_botnet_detector/mcp_server.py"]
 
 [[mcp_servers]]
 name = "site-verifier"
@@ -129,7 +94,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/pocs/offense/site_verifier/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/security/poc_site_verifier/mcp_server.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # SYSTEM PoC MCP Servers (vibemind-os/system/)
@@ -209,7 +174,7 @@ timeout_secs = 30
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/devops/backup_sync/mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/devops/poc_backup_sync/mcp_server.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # BUSINESS PoC MCP Servers (vibemind-os/business/)
@@ -387,28 +352,10 @@ args = ["-y", "@kazuph/mcp-taskmanager"]
 [[mcp_servers]]
 name = "vibemind-db"
 timeout_secs = 10
-env = ["SUPABASE_URL", "SUPABASE_ANON_KEY"]
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
 args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_mcp.py"]
-
-# 2026-08-22: Laura-MCP (28 Tools, lokaler Videoeditor auf 127.0.0.1:8765).
-# WIRKSAM wird der Eintrag erst in ~/.openfang/config.toml — diese Datei ist
-# die versionierte Vorlage. Beide muessen uebereinstimmen.
-[[mcp_servers]]
-name = "laura"
-env = ["LAURA_TOKEN"]
-
-[mcp_servers.transport]
-type = "stdio"
-command = "uv"
-args = [
-    "run",
-    "--directory",
-    "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/video/laura/services/mcp",
-    "laura-mcp",
-]
 
 # ═══════════════════════════════════════════════════════════════════
 # Desktop Automation (handoff multi-agent system)
@@ -419,77 +366,17 @@ args = [
 # consumers — OpenClaw ACP sessions, coding-engine, brain — share one
 # warm process instead of paying the SentenceTransformer/Torch cold-start
 # 10–30 s per agent.
-# DECOMMISSIONED 2026-06-02 — superseded by the 4-way split below
-# (data/document/perception/messenger). No agent references "desktop" anymore
-# (skill-coordinator, desktop, openclaude-coder all migrated). Kept commented
-# for trivial rollback: uncomment this block + revert the three agents'
-# mcp_servers to ["desktop"] + restart. See plans/pure-wishing-starlight.md.
-# [[mcp_servers]]
-# name = "desktop-automation"
-# timeout_secs = 300
-# [mcp_servers.transport]
-# type = "stdio"
-# command = "python"
-# args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_handoff.py"]
-
-# ═══════════════════════════════════════════════════════════════════
-# 4-way split of desktop-automation (2026-06-02) — see
-# plans/pure-wishing-starlight.md. Each is a thin entrypoint over the
-# shared mcp_server_handoff library (no logic duplicated). desktop-automation
-# is kept above for parallel run during transition. Plain names → clean LLM
-# tool prefixes mcp_data_* / mcp_document_* / mcp_perception_* / mcp_messenger_*.
-# ═══════════════════════════════════════════════════════════════════
-
-# Knowledge / data-interpretation: rowboat_*, roarboot_*, file_evaluate.
 [[mcp_servers]]
-name = "data"
-timeout_secs = 120
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_data.py"]
-
-# Deterministic data->file with dynamic in-tool approval: xlsx/docx/csv create,
-# verify, paste, maximize. 300s so the internal approval poll can block.
-[[mcp_servers]]
-name = "document"
+name = "desktop-automation"
+# 300s so handoff_approval_request can block up to ~240s, plus headroom
+# for slow gpt-5.5 coordinator iterations on big tool-loops. Bumped
+# 180->300 (2026-05-08) — smart-skill loops were aborting with
+# "MCP-Tool-Timeout" because the 180s ceiling was too tight.
 timeout_secs = 300
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_document.py"]
-
-# Perception / desktop automation: handoff_*, vision_analyze, app_*, skill_*,
-# claude_cli_*. The only split with the heavy lazy singletons + DPI awareness.
-[[mcp_servers]]
-name = "perception"
-timeout_secs = 300
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_perception.py"]
-
-# Channels + human-in-the-loop: clawdbot_*, send_to_channel, clarify/approval.
-# 300s so handoff_approval_request can block up to ~240s.
-[[mcp_servers]]
-name = "messenger"
-timeout_secs = 300
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_messenger.py"]
-
-# rowboat-ui (2026-06-08) — talk to the Rowboat chat inside the VibeMind
-# Multiverse Electron app via CDP :9223 (rowboat_chat_send / rowboat_chat_read).
-# Needs websocket-client → explicit repo .venv python (PATH python may lack it).
-# Requires the Multiverse app open on the Rowboat space at runtime.
-[[mcp_servers]]
-name = "rowboat-ui"
-timeout_secs = 90
-[mcp_servers.transport]
-type = "stdio"
-command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_server_rowboat_ui.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/Automation_ui/backend/moire_agents/mcp_server_handoff.py"]
 
 # ═══════════════════════════════════════════════════════════════════
 # Phase 11.A — Spaces MCP Servers
@@ -499,48 +386,10 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_server_rowboat_ui.py"]
 [[mcp_servers]]
 name = "spaces-ideas"
 timeout_secs = 60
-env = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
 args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/ideas/mcp_server.py"]
-
-[[mcp_servers]]
-name = "spaces-minibook"
-timeout_secs = 10
-env = ["MINIBOOK_STATUS_URL"]
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/minibook/mcp_server.py"]
-
-# ═══════════════════════════════════════════════════════════════════
-# n8n — workflow automation (third-party engine)
-# Registry-routed MCP tool surface for the eight canonical n8n.* events
-# scoped by the brain-n8n agent (agents/brain-n8n/agent.toml:7;
-# vibemind-os/config/space_agent_registry.yml:269-286). There is no
-# VibeMind-owned n8n Space application — every tool call is executed by
-# the third-party n8n engine, reached through the `n8n-mcp` npm package
-# (vibemind-os/docs/mcp-archive/MCP_SERVER_INVENTORY.md:103-108). The one
-# in-repo launch of this server uses `npx -y n8n-mcp`, sets N8N_API_URL,
-# N8N_API_KEY, MCP_MODE=stdio and LOG_LEVEL=error, and allows 120 s per
-# request (vibemind-os/security/poc_n8n/agent.py:139-155).
-#
-# NOTE: `env` lists variable NAMES only — never values. OpenFang spawns
-# stdio MCP servers with a cleared environment and forwards exactly these
-# names from the host (crates/openfang-runtime/src/mcp.rs). The values,
-# including MCP_MODE=stdio, must therefore already exist in the host
-# environment / root .env; OpenFang cannot inject them.
-# ═══════════════════════════════════════════════════════════════════
-
-[[mcp_servers]]
-name = "n8n"
-timeout_secs = 120
-env = ["N8N_API_URL", "N8N_API_KEY", "MCP_MODE", "LOG_LEVEL"]
-[mcp_servers.transport]
-type = "stdio"
-command = "npx"
-args = ["-y", "n8n-mcp"]
 
 # ═══════════════════════════════════════════════════════════════════
 # Phase 11.B — Multiverse Navigation (Smart 3-layer resolver)

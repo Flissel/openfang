@@ -53,6 +53,15 @@ pub struct AppState {
     /// Thread-safe mutable budget config. Updated via PUT /api/budget.
     /// Initialized from `kernel.config.budget` at startup.
     pub budget_config: Arc<tokio::sync::RwLock<openfang_types::config::BudgetConfig>>,
+    /// Credential reference names this daemon is permitted to hand out via
+    /// `POST /api/credentials/issue`, read once at startup from
+    /// `OPENFANG_ISSUABLE_CREDENTIALS`.
+    ///
+    /// The API has no per-caller identity -- authorization is a single global
+    /// bearer token -- so without this bound one API token would be able to
+    /// mint every secret the daemon can resolve. An empty set means the
+    /// feature is off and every issuance request is refused.
+    pub issuable_credentials: std::collections::HashSet<String>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -13279,6 +13288,235 @@ fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Credential issuance
+// ---------------------------------------------------------------------------
+
+/// `^[A-Za-z_][A-Za-z0-9_]{0,127}$` -- the shape a credential reference must
+/// have. Hand-rolled because this crate does not depend on `regex`.
+fn is_valid_credential_reference(reference: &str) -> bool {
+    if reference.is_empty() || reference.len() > 128 {
+        return false;
+    }
+    let mut chars = reference.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Build a credential-endpoint response. Every response from this endpoint --
+/// success and refusal alike -- is marked `no-store` so no proxy or client
+/// cache ever retains an issued credential.
+fn credential_response(status: StatusCode, body: serde_json::Value) -> axum::response::Response {
+    (
+        status,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(body),
+    )
+        .into_response()
+}
+
+/// POST /api/credentials/issue — issue ONE credential for ONE call.
+///
+/// Body: `{"reference": "GITHUB_PAT_TOKEN"}` → `200 {"reference", "value"}`.
+///
+/// This exists so a caller such as the Rowboat plugin runtime holds no standing
+/// copy of any secret: it fetches per call, and revoking a credential in
+/// OpenFang takes effect on the very next call.
+///
+/// The value returned IS the stored credential — OpenFang holds long-lived
+/// secrets and cannot mint a scoped token on a third party's behalf. There is
+/// deliberately no `expires_at` or TTL field, because nothing here would
+/// enforce one.
+///
+/// SECURITY invariants:
+/// - The route is not in the middleware's public-path allowlist, so with an
+///   API key configured it requires the bearer token like any other write.
+/// - `state.issuable_credentials` bounds what can ever be issued. The API has
+///   no per-caller identity, so without that bound one token would mint every
+///   secret the daemon can resolve. Empty set → feature off.
+/// - Both refusals are identical. A reference that is not allowlisted and one
+///   that is allowlisted but unresolvable return the same status and the same
+///   body, and take the same code path — otherwise this endpoint becomes an
+///   oracle for enumerating which secrets the daemon holds.
+/// - The value goes into the response body and nowhere else: not into a log
+///   line, not into an error message, not into a URL.
+/// - It refuses outright when the daemon is running fail-open (no `api_key`
+///   and no dashboard auth), because in that mode nothing at all authenticates
+///   the caller. See the comment on that branch.
+///
+/// The endpoint answers with exactly two error bodies —
+/// `400 {"error":"reference_invalid"}` and `404 {"error":"credential_unavailable"}`
+/// — and never with a framework-generated one.
+pub async fn issue_credential(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    // Take the body as raw JSON and pull `reference` out by hand, so that a
+    // body which is not JSON, one sent without `Content-Type: application/json`,
+    // and one whose `reference` is absent, null, or not a string all land in
+    // the same `reference_invalid` branch below. With a typed extractor axum
+    // answers those itself with a text/plain 415/422, which is neither of the
+    // two error shapes this endpoint documents.
+    let reference = match &payload {
+        Ok(Json(body)) => body
+            .get("reference")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim(),
+        Err(_) => "",
+    };
+
+    // A reference that could never name an environment variable is a caller
+    // bug, not a fact about which secrets exist — so it gets its own status.
+    //
+    // This runs BEFORE anything logs `reference`, and that ordering matters:
+    // validation confines the name to [A-Za-z0-9_], which is what stops a
+    // caller from smuggling newlines or control characters into a log line.
+    if !is_valid_credential_reference(reference) {
+        return credential_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "reference_invalid"}),
+        );
+    }
+
+    // SECURITY: refuse outright when the daemon is running fail-open.
+    //
+    // `middleware::auth` runs every non-public route without any check when
+    // `api_key` is empty/whitespace AND `auth.enabled` is false. That mode is
+    // a supported choice for a local daemon, but it was written for an API
+    // that spawns agents, not one that dispenses secrets. In it the allowlist
+    // would be the ONLY thing between a stored PAT and any process on the
+    // host — and, with an unbound `api_listen`, any host on the LAN. Worse,
+    // in that same mode `build_router`'s CORS layer allows
+    // http://localhost:3000 and http://localhost:8080 with `Any` methods and
+    // `Any` headers, so a page served from either origin could make this POST
+    // cross-origin AND read the response body, sending no token because none
+    // is required.
+    //
+    // The refusal is the ordinary one — same status, same body, same headers
+    // — so this does not become a new signal either. A fail-open daemon is
+    // observationally identical to one with an empty allowlist.
+    if state.kernel.config.api_key.trim().is_empty() && !state.kernel.config.auth.enabled {
+        // Distinct message, reference name only: an operator wondering why
+        // issuance never works should learn it from the log, not by guessing.
+        tracing::warn!(
+            reference = %reference,
+            "Credential issuance refused: this daemon runs without authentication \
+             (api_key is empty and auth.enabled is false), which disables the \
+             endpoint. Set api_key, or enable auth, to use it."
+        );
+        return credential_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "credential_unavailable"}),
+        );
+    }
+
+    // SECURITY: the order of these two lines is load-bearing. Resolving
+    // unconditionally and checking the allowlist afterwards is what makes
+    // "not allowlisted" and "allowlisted but unresolvable" run the same work
+    // and take the same time; a caller must not be able to tell them apart
+    // from latency any more than from the status or the body.
+    //
+    // DO NOT "optimise" this into an early return on the allowlist miss. That
+    // would skip the lookup, make the refusal measurably faster, and reopen
+    // the timing oracle that enumerates which secrets this daemon holds.
+    //
+    // The cost of that guarantee: an arbitrary caller-supplied name triggers a
+    // local vault/dotenv/env lookup. It is read-only and has no side effects,
+    // and the value is dropped unread in the refusal arm below.
+    let resolved = state.kernel.resolve_credential(reference);
+    let allowlisted = state.issuable_credentials.contains(reference);
+
+    match (allowlisted, resolved) {
+        (true, Some(value)) => {
+            // The reference NAME is safe to log; the value never is.
+            tracing::info!(reference = %reference, "Credential issued");
+            credential_response(
+                StatusCode::OK,
+                serde_json::json!({"reference": reference, "value": value}),
+            )
+        }
+        // One arm, one message: the log must not distinguish the two refusals
+        // any more than the response does. Any resolved value is dropped here
+        // without ever being read.
+        _ => {
+            tracing::warn!(reference = %reference, "Credential issuance refused");
+            credential_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"error": "credential_unavailable"}),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_reference_tests {
+    use super::is_valid_credential_reference;
+
+    #[test]
+    fn accepts_an_ordinary_name() {
+        assert!(is_valid_credential_reference("GITHUB_PAT_TOKEN"));
+        assert!(is_valid_credential_reference("A"));
+    }
+
+    #[test]
+    fn accepts_a_leading_underscore() {
+        assert!(is_valid_credential_reference("_PRIVATE_TOKEN"));
+        assert!(is_valid_credential_reference("_"));
+    }
+
+    #[test]
+    fn rejects_a_leading_digit() {
+        assert!(!is_valid_credential_reference("1TOKEN"));
+        assert!(!is_valid_credential_reference("0"));
+    }
+
+    #[test]
+    fn accepts_digits_after_the_first_character() {
+        assert!(is_valid_credential_reference("TOKEN_1"));
+        assert!(is_valid_credential_reference("A0"));
+    }
+
+    /// The bound is `^[A-Za-z_][A-Za-z0-9_]{0,127}$`, i.e. 128 characters in
+    /// total. Both sides of the boundary are asserted, so an off-by-one in
+    /// either direction fails this test rather than sliding through.
+    #[test]
+    fn length_boundary_is_exactly_128_characters() {
+        let at_limit = "A".repeat(128);
+        let over_limit = "A".repeat(129);
+        assert_eq!(at_limit.len(), 128);
+        assert_eq!(over_limit.len(), 129);
+        assert!(
+            is_valid_credential_reference(&at_limit),
+            "128 characters is the last valid length"
+        );
+        assert!(
+            !is_valid_credential_reference(&over_limit),
+            "129 characters is one past the limit"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_whitespace_and_punctuation() {
+        assert!(!is_valid_credential_reference(""));
+        assert!(!is_valid_credential_reference(" "));
+        assert!(!is_valid_credential_reference("A B"));
+        assert!(!is_valid_credential_reference("A-B"));
+        assert!(!is_valid_credential_reference("../../etc/passwd"));
+    }
+
+    /// Newlines and control characters must never reach a log line.
+    #[test]
+    fn rejects_control_characters_and_non_ascii() {
+        assert!(!is_valid_credential_reference("TOKEN\nINFO fake log line"));
+        assert!(!is_valid_credential_reference("TOKEN\r"));
+        assert!(!is_valid_credential_reference("TOKE\u{d1}"));
+    }
 }
 
 #[cfg(test)]
