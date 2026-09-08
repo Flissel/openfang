@@ -45,14 +45,21 @@ pub struct AppState {
     /// Initialized from `kernel.config.budget` at startup.
     pub budget_config: Arc<tokio::sync::RwLock<openfang_types::config::BudgetConfig>>,
     /// Credential reference names this daemon is permitted to hand out via
-    /// `POST /api/credentials/issue`, read once at startup from
-    /// `OPENFANG_ISSUABLE_CREDENTIALS`.
+    /// `POST /api/credentials/issue`. Seeded at startup from
+    /// `OPENFANG_ISSUABLE_CREDENTIALS` unioned with whatever
+    /// `POST /api/credentials/store` has persisted to
+    /// `<home>/issuable_credentials.list` on a previous run (see
+    /// `seed_issuable_credentials`).
     ///
     /// The API has no per-caller identity -- authorization is a single global
     /// bearer token -- so without this bound one API token would be able to
     /// mint every secret the daemon can resolve. An empty set means the
     /// feature is off and every issuance request is refused.
-    pub issuable_credentials: std::collections::HashSet<String>,
+    ///
+    /// A `RwLock` because `store_credential` grants a reference at runtime:
+    /// `issue_credential` must see that grant on its very next call, in the
+    /// same process, without a restart.
+    pub issuable_credentials: tokio::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -11619,7 +11626,7 @@ pub async fn issue_credential(
     // local vault/dotenv/env lookup. It is read-only and has no side effects,
     // and the value is dropped unread in the refusal arm below.
     let resolved = state.kernel.resolve_credential(reference);
-    let allowlisted = state.issuable_credentials.contains(reference);
+    let allowlisted = state.issuable_credentials.read().await.contains(reference);
 
     match (allowlisted, resolved) {
         (true, Some(value)) => {
@@ -11641,6 +11648,223 @@ pub async fn issue_credential(
             )
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime issuable-credential allowlist (persisted)
+// ---------------------------------------------------------------------------
+
+/// Path to the persisted allowlist: one validated reference NAME per line,
+/// never a value. Lives next to `secrets.env`/`vault.enc` under the daemon's
+/// home directory, but is not itself a secret store.
+fn issuable_credentials_list_path(home_dir: &std::path::Path) -> std::path::PathBuf {
+    home_dir.join("issuable_credentials.list")
+}
+
+/// Read the persisted allowlist file. Missing file -> empty set (first boot,
+/// or a daemon that has never had a reference stored at runtime). Lines that
+/// no longer look like a valid reference -- a hand-edited or corrupted file
+/// -- are dropped rather than fed into the allowlist: defense in depth,
+/// since nothing downstream re-validates a name once it is in
+/// `AppState.issuable_credentials`.
+fn read_issuable_credentials_list(path: &std::path::Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && is_valid_credential_reference(l))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Build the boot-time issuable-credential allowlist: the
+/// `OPENFANG_ISSUABLE_CREDENTIALS` env var (unchanged from before), unioned
+/// with whatever a previous `POST /api/credentials/store` call persisted to
+/// `<home>/issuable_credentials.list`.
+///
+/// This is called both from `server.rs::build_router` (the real daemon) and
+/// from the integration tests that simulate a restart, so both exercise
+/// identical seeding logic -- a test that reimplemented this instead could
+/// pass even if the two had drifted apart.
+pub fn seed_issuable_credentials(
+    home_dir: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let mut set: std::collections::HashSet<String> =
+        std::env::var("OPENFANG_ISSUABLE_CREDENTIALS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+    set.extend(read_issuable_credentials_list(&issuable_credentials_list_path(home_dir)));
+    set
+}
+
+/// Idempotently append one reference name to the persisted allowlist file.
+/// Rewrites the whole (small) file sorted, matching the read-modify-write
+/// shape `write_secret_env` uses for the same directory's secret file.
+fn persist_issuable_credential(path: &std::path::Path, name: &str) -> std::io::Result<()> {
+    let mut set = read_issuable_credentials_list(path);
+    if !set.insert(name.to_string()) {
+        return Ok(()); // already persisted -- nothing to do
+    }
+
+    let mut names: Vec<&str> = set.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    let content = names.join("\n") + "\n";
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+
+    // SECURITY: Restrict file permissions on Unix, matching secrets.env.
+    // This file holds only NAMES, never values, but the names themselves are
+    // still worth keeping off a world-readable path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
+}
+
+/// POST /api/credentials/store — store ONE credential value so that it
+/// becomes issuable via `POST /api/credentials/issue`.
+///
+/// Body: `{"reference": "NAME", "value": "...", "overwrite": false}` (the
+/// `overwrite` field is optional and defaults to `false`).
+/// -> `200 {"reference": "NAME", "issuable": true}` — the value never comes
+/// back in the response, on success or on any refusal.
+///
+/// This is the write side of `issue_credential`: together they let a caller
+/// hand OpenFang a secret once and fetch it per call afterward, instead of
+/// holding a standing copy. It deliberately reuses `is_valid_credential_reference`
+/// and `credential_response` from that endpoint, so the two validation shapes
+/// cannot drift apart.
+///
+/// SECURITY invariants:
+/// - Not in the middleware's public-path allowlist -- same bearer-token gate
+///   as `issue_credential`.
+/// - The value is written to the encrypted vault ONLY. If no vault is
+///   unlocked for this daemon, the write is refused (`503`) rather than
+///   silently falling back to a lower-security store (dotenv/env) or
+///   claiming success for a write that never durably happened. There is,
+///   by design, exactly one custodian for a stored value.
+/// - A reference that already resolves to a value -- from the vault, the
+///   dotenv file, OR a process env var -- is left untouched unless the
+///   caller passes `overwrite: true`. Checking the FULL resolution chain
+///   (not just the vault) here matters: otherwise `/store` could silently
+///   shadow an operator-configured credential from a lower tier, and a
+///   caller would have no way to tell "nothing was there" from "something
+///   was there and I just replaced it".
+/// - The reference becomes issuable in THIS process immediately, and the
+///   name (never the value) is persisted so it survives a restart. If
+///   persisting the name fails, the in-memory grant is rolled back and the
+///   whole call is refused (`503`) -- the vault may be left holding an
+///   inert, not-yet-issuable value, but no caller can observe a partial
+///   success through the API: `issue_credential` still refuses it exactly
+///   like any other non-allowlisted reference.
+/// - Nothing here ever logs, echoes, or error-messages the value.
+pub async fn store_credential(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let body = match &payload {
+        Ok(Json(body)) => body,
+        Err(_) => {
+            return credential_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "reference_invalid"}),
+            );
+        }
+    };
+
+    let reference = body
+        .get("reference")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if !is_valid_credential_reference(reference) {
+        return credential_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "reference_invalid"}),
+        );
+    }
+
+    // A value that is missing, not a string, empty, or carries a NUL byte is
+    // just as much a caller bug as a malformed reference -- refused the same
+    // way, under the same documented error code, before anything is touched.
+    let value = match body.get("value").and_then(serde_json::Value::as_str) {
+        Some(v) if !v.is_empty() && !v.contains('\0') => v,
+        _ => {
+            return credential_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "reference_invalid"}),
+            );
+        }
+    };
+
+    let overwrite = body
+        .get("overwrite")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // SECURITY: checked BEFORE any write, against the full resolution chain
+    // (vault, dotenv, env var) -- not just the vault -- so this cannot
+    // silently shadow a value that came from somewhere else. The resolved
+    // value itself is dropped unread; only its presence matters.
+    if !overwrite && state.kernel.resolve_credential(reference).is_some() {
+        return credential_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "reference_exists"}),
+        );
+    }
+
+    if state
+        .kernel
+        .store_credential_checked(reference, value)
+        .is_err()
+    {
+        return credential_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "store_unavailable"}),
+        );
+    }
+
+    // Make it issuable in this process right away...
+    {
+        let mut allow = state.issuable_credentials.write().await;
+        allow.insert(reference.to_string());
+    }
+
+    // ...and persist the NAME so a restart doesn't silently drop it. If that
+    // fails, roll back the in-memory grant so nothing this call did is
+    // observable via the API -- fail closed rather than leave an allowlist
+    // entry that quietly disappears the next time the daemon restarts.
+    let list_path = issuable_credentials_list_path(&state.kernel.config.home_dir);
+    if persist_issuable_credential(&list_path, reference).is_err() {
+        state.issuable_credentials.write().await.remove(reference);
+        tracing::warn!(
+            reference = %reference,
+            "Credential stored but the issuable-credential allowlist could not be \
+             persisted to disk; refusing so the daemon's observable state stays \
+             consistent rather than granting issuance that would vanish on restart"
+        );
+        return credential_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "store_unavailable"}),
+        );
+    }
+
+    tracing::info!(reference = %reference, "Credential stored");
+    credential_response(
+        StatusCode::OK,
+        serde_json::json!({"reference": reference, "issuable": true}),
+    )
 }
 
 #[cfg(test)]

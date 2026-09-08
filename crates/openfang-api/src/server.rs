@@ -44,17 +44,14 @@ pub async fn build_router(
     let channels_config = kernel.config.channels.clone();
 
     // Credential references this daemon may hand out via
-    // POST /api/credentials/issue. Read once, here, so the handler never
-    // touches the process environment at request time. Unset or empty means
-    // the feature is off and every issuance request is refused.
-    let issuable_credentials: std::collections::HashSet<String> =
-        std::env::var("OPENFANG_ISSUABLE_CREDENTIALS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
+    // POST /api/credentials/issue: OPENFANG_ISSUABLE_CREDENTIALS unioned with
+    // whatever POST /api/credentials/store persisted to
+    // <home>/issuable_credentials.list on a previous run. Read once, here, so
+    // steady-state issuance never touches the process environment or the
+    // filesystem at request time -- store_credential mutates the in-memory
+    // AppState.issuable_credentials directly for that. Both empty means the
+    // feature is off and every issuance request is refused.
+    let issuable_credentials = routes::seed_issuable_credentials(&kernel.config.home_dir);
     if issuable_credentials.is_empty() {
         info!("Credential issuance disabled (OPENFANG_ISSUABLE_CREDENTIALS unset or empty)");
     } else {
@@ -78,7 +75,7 @@ pub async fn build_router(
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone())),
-        issuable_credentials,
+        issuable_credentials: tokio::sync::RwLock::new(issuable_credentials),
     });
 
     // CORS: allow localhost origins by default. If API key is set, the API
@@ -737,6 +734,12 @@ pub async fn build_router(
         .route(
             "/api/credentials/issue",
             axum::routing::post(routes::issue_credential),
+        )
+        // Write side of the above: stores a value so it becomes issuable.
+        // Same non-public path, same bearer-token gate.
+        .route(
+            "/api/credentials/store",
+            axum::routing::post(routes::store_credential),
         )
         // Dashboard authentication endpoints
         .route("/api/auth/login", axum::routing::post(routes::auth_login))

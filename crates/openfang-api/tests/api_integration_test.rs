@@ -948,7 +948,9 @@ async fn start_credential_test_server_with_key(
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
-        issuable_credentials: issuable.iter().map(|s| s.to_string()).collect(),
+        issuable_credentials: tokio::sync::RwLock::new(
+            issuable.iter().map(|s| s.to_string()).collect(),
+        ),
     });
 
     let api_key = state.kernel.config.api_key.trim().to_string();
@@ -962,6 +964,10 @@ async fn start_credential_test_server_with_key(
         .route(
             "/api/credentials/issue",
             axum::routing::post(routes::issue_credential),
+        )
+        .route(
+            "/api/credentials/store",
+            axum::routing::post(routes::store_credential),
         )
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -1299,4 +1305,360 @@ async fn test_credential_issue_rejects_non_string_and_unparseable_bodies() {
     assert_eq!(resp.status(), 400);
     let parsed: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(parsed["error"], "reference_invalid");
+}
+
+// ---------------------------------------------------------------------------
+// Credential store tests -- POST /api/credentials/store
+// ---------------------------------------------------------------------------
+//
+// `start_credential_test_server` above already mounts `/api/credentials/store`
+// alongside `/issue` behind the same auth middleware, so the four rejection
+// paths (Schritt 1) -- none of which ever reach the vault -- reuse it as-is.
+//
+// The other two tests need a REAL, decryptable vault, because the store
+// handler refuses (503) when there is nowhere durable to put the value. A
+// fixed test-only master key plus `OPENFANG_VAULT_KEY` is this codebase's own
+// documented headless/CI escape hatch (see the module doc on
+// `crates/openfang-extensions/src/vault.rs`) -- not a new mechanism invented
+// for this test.
+
+/// Fixed 32-byte vault master key used only by these tests. Never derived
+/// from anything secret, never written to the real OS keyring/keyring-file
+/// fallback (that path is only consulted if `OPENFANG_VAULT_KEY` is unset,
+/// which it never is here).
+const TEST_VAULT_KEY: [u8; 32] = [7u8; 32];
+
+fn test_vault_key_b64() -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, TEST_VAULT_KEY)
+}
+
+/// Guards every test that sets the process-wide `OPENFANG_VAULT_KEY` env var.
+///
+/// `CredentialVault::unlock()` (called once, synchronously, inside
+/// `OpenFangKernel::boot_with_config`) reads this var exactly once per boot.
+/// Holding this lock across "set the var, boot, unset the var" stops two
+/// vault-backed tests running concurrently on different threads from one
+/// reading the other's key mid-boot -- the same class of hazard the existing
+/// `start_credential_test_server` doc comment calls out for `issuable`.
+static VAULT_KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Create a vault at `<home>/vault.enc`, seeded with `entries`, using the
+/// fixed test key. Must run before `OpenFangKernel::boot_with_config` --
+/// the kernel only auto-unlocks a vault that already exists on disk.
+fn seed_vault(home: &std::path::Path, entries: &[(&str, &str)]) {
+    let mut vault = openfang_extensions::vault::CredentialVault::new(home.join("vault.enc"));
+    vault
+        .init_with_key(zeroize::Zeroizing::new(TEST_VAULT_KEY))
+        .expect("test vault should init with an explicit key");
+    for (k, v) in entries {
+        vault
+            .set((*k).to_string(), zeroize::Zeroizing::new((*v).to_string()))
+            .expect("test vault should accept a seeded entry");
+    }
+}
+
+/// Boot a credential-capable daemon (mounting both `/issue` and `/store`)
+/// against `home`, without creating a temp dir of its own -- the caller owns
+/// `home`'s lifetime. This is what lets the restart test boot a second,
+/// independent kernel against the very same `OPENFANG_HOME` the first one
+/// used.
+///
+/// `issuable` seeds the allowlist the same way `OPENFANG_ISSUABLE_CREDENTIALS`
+/// would in production; it is unioned with whatever
+/// `routes::seed_issuable_credentials` finds already persisted under `home`
+/// -- the exact same production code path `server.rs` calls at boot, so this
+/// helper cannot pass by exercising different logic than the real daemon.
+async fn boot_credential_server(
+    home: &std::path::Path,
+    issuable: &[&str],
+) -> (String, Arc<AppState>) {
+    let config = KernelConfig {
+        home_dir: home.to_path_buf(),
+        data_dir: home.join("data"),
+        api_key: CRED_API_KEY.to_string(),
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+        },
+        ..KernelConfig::default()
+    };
+
+    let kernel = {
+        let _guard = VAULT_KEY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded w.r.t. this var while `_guard` is held --
+        // every other reader/writer of OPENFANG_VAULT_KEY in this test binary
+        // takes the same lock first.
+        unsafe {
+            std::env::set_var("OPENFANG_VAULT_KEY", test_vault_key_b64());
+        }
+        let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+        unsafe {
+            std::env::remove_var("OPENFANG_VAULT_KEY");
+        }
+        kernel
+    };
+    let kernel = Arc::new(kernel);
+    kernel.set_self_handle();
+
+    let mut seeded: std::collections::HashSet<String> =
+        issuable.iter().map(|s| s.to_string()).collect();
+    seeded.extend(routes::seed_issuable_credentials(&kernel.config.home_dir));
+
+    let budget = kernel.config.budget.clone();
+    let state = Arc::new(AppState {
+        kernel,
+        started_at: Instant::now(),
+        peer_registry: None,
+        bridge_manager: tokio::sync::Mutex::new(None),
+        channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
+        issuable_credentials: tokio::sync::RwLock::new(seeded),
+    });
+
+    let api_key = state.kernel.config.api_key.trim().to_string();
+    let auth_state = middleware::AuthState {
+        api_key: api_key.clone(),
+        auth_enabled: state.kernel.config.auth.enabled,
+        session_secret: api_key.clone(),
+    };
+
+    let app = Router::new()
+        .route(
+            "/api/credentials/issue",
+            axum::routing::post(routes::issue_credential),
+        )
+        .route(
+            "/api/credentials/store",
+            axum::routing::post(routes::store_credential),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            middleware::auth,
+        ))
+        .layer(axum::middleware::from_fn(middleware::request_logging))
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test server");
+    let addr = listener.local_addr().unwrap();
+
+    let server_state = state.clone();
+    tokio::spawn(async move {
+        let _keep_alive = server_state;
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (format!("http://{}", addr), state)
+}
+
+/// Schritt 1: the four ways `/api/credentials/store` refuses a request.
+/// Grouped into one test against one server, because none of the four paths
+/// ever reach the vault -- they are all refused earlier, so there is nothing
+/// vault-specific to isolate per case.
+#[tokio::test]
+async fn test_credential_store_rejects_bad_requests() {
+    const EXISTING: &str = "already-there-not-a-real-secret";
+    let server = start_credential_test_server(
+        &["ROWBOAT_STORE_TOKEN", "ROWBOAT_EXISTING_TOKEN"],
+        &[("ROWBOAT_EXISTING_TOKEN", EXISTING)],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // 1. No bearer token.
+    let resp = client
+        .post(format!("{}/api/credentials/store", server.base_url))
+        .json(&serde_json::json!({
+            "reference": "ROWBOAT_STORE_TOKEN",
+            "value": "irrelevant-not-a-real-secret"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 2. Invalid reference name.
+    let resp = client
+        .post(format!("{}/api/credentials/store", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({
+            "reference": "not a valid name",
+            "value": "irrelevant-not-a-real-secret"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "reference_invalid");
+
+    // 3a. Empty value.
+    let resp = client
+        .post(format!("{}/api/credentials/store", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_STORE_TOKEN", "value": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "reference_invalid");
+
+    // 3b. NUL byte in value.
+    let resp = client
+        .post(format!("{}/api/credentials/store", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({
+            "reference": "ROWBOAT_STORE_TOKEN",
+            "value": "bad\u{0000}value"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "reference_invalid");
+
+    // 4. Reference already resolvable (seeded via `.env`), no `overwrite` --
+    // refused, and the existing value is unchanged afterward. Verified via
+    // `/issue` (the same resolution path a real caller would exercise)
+    // rather than by reading `.env` back, so this proves the API's view of
+    // the world, not just the file on disk.
+    let resp = client
+        .post(format!("{}/api/credentials/store", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({
+            "reference": "ROWBOAT_EXISTING_TOKEN",
+            "value": "attempted-overwrite-not-a-real-secret"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "reference_exists");
+    assert!(body.get("value").is_none() || body["value"].is_null());
+
+    let issue_resp = client
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_EXISTING_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issue_resp.status(), 200);
+    let issue_body: serde_json::Value = issue_resp.json().await.unwrap();
+    assert_eq!(
+        issue_body["value"].as_str(),
+        Some(EXISTING),
+        "the existing value must be unchanged after a refused overwrite"
+    );
+}
+
+/// Schritt 2 (the core test): a value stored via `/api/credentials/store` is
+/// issuable through `/api/credentials/issue` immediately -- same process, no
+/// restart -- and the issued value is exactly what was stored.
+#[tokio::test]
+async fn test_credential_store_then_issue_same_process() {
+    const STORED: &str = "stored-value-not-a-real-secret";
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    seed_vault(tmp.path(), &[]);
+    let (base_url, state) = boot_credential_server(tmp.path(), &["ROWBOAT_STORED_TOKEN"]).await;
+    let client = reqwest::Client::new();
+
+    let store_resp = client
+        .post(format!("{}/api/credentials/store", base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_STORED_TOKEN", "value": STORED}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(store_resp.status(), 200);
+    let cache_control = store_resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .expect("store response must carry a cache-control header")
+        .to_string();
+    assert!(cache_control.contains("no-store"));
+    let store_body: serde_json::Value = store_resp.json().await.unwrap();
+    assert_eq!(store_body["reference"], "ROWBOAT_STORED_TOKEN");
+    assert_eq!(store_body["issuable"], true);
+    assert!(
+        store_body.get("value").is_none() || store_body["value"].is_null(),
+        "the store response must never carry the value"
+    );
+
+    let issue_resp = client
+        .post(format!("{}/api/credentials/issue", base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_STORED_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(issue_resp.status(), 200);
+    let issue_body: serde_json::Value = issue_resp.json().await.unwrap();
+    assert_eq!(issue_body["value"].as_str(), Some(STORED));
+
+    state.kernel.shutdown();
+}
+
+/// Schritt 3 (the restart test): store a value, then boot an entirely new
+/// kernel + AppState against the SAME `OPENFANG_HOME` -- simulating a daemon
+/// restart -- and confirm issuance still works, with the second boot's
+/// `issuable` seed list deliberately empty. Nothing here relies on a process
+/// env var carrying the value or the allowlist membership across the
+/// "restart": the vault entry comes back by decrypting `vault.enc` fresh off
+/// disk, and the allowlist membership comes back by
+/// `routes::seed_issuable_credentials` re-reading
+/// `issuable_credentials.list` off disk -- both genuine disk round-trips, not
+/// something that would pass merely because both "boots" share one OS
+/// process.
+#[tokio::test]
+async fn test_credential_store_survives_restart() {
+    const STORED: &str = "restart-value-not-a-real-secret";
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    seed_vault(tmp.path(), &[]);
+
+    let (base_url_1, state_1) = boot_credential_server(tmp.path(), &[]).await;
+    let client = reqwest::Client::new();
+
+    let store_resp = client
+        .post(format!("{}/api/credentials/store", base_url_1))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_RESTART_TOKEN", "value": STORED}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(store_resp.status(), 200);
+
+    // "Restart": shut the first kernel down, then boot a second one against
+    // the same home_dir. The second boot is NOT told about
+    // ROWBOAT_RESTART_TOKEN via `issuable`, so the only way the assertion
+    // below can pass is if the store handler's own persistence worked.
+    state_1.kernel.shutdown();
+    let (base_url_2, state_2) = boot_credential_server(tmp.path(), &[]).await;
+
+    let issue_resp = client
+        .post(format!("{}/api/credentials/issue", base_url_2))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_RESTART_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(issue_resp.status(), 200);
+    let issue_body: serde_json::Value = issue_resp.json().await.unwrap();
+    assert_eq!(issue_body["value"].as_str(), Some(STORED));
+
+    state_2.kernel.shutdown();
 }

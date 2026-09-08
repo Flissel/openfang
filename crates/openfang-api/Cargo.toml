@@ -43,3 +43,4 @@ reqwest = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
