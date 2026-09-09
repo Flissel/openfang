@@ -62,6 +62,7 @@ async fn start_test_server() -> TestServer {
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
         issuable_credentials: Default::default(),
+        store_credential_lock: tokio::sync::Mutex::new(()),
     });
 
     let app = Router::new()

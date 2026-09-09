@@ -81,6 +81,7 @@ async fn start_test_server_with_provider(
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
         issuable_credentials: Default::default(),
+        store_credential_lock: tokio::sync::Mutex::new(()),
     });
 
     let app = Router::new()
@@ -713,6 +714,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
         issuable_credentials: Default::default(),
+        store_credential_lock: tokio::sync::Mutex::new(()),
     });
 
     let api_key = state.kernel.config.api_key.trim().to_string();
@@ -951,6 +953,7 @@ async fn start_credential_test_server_with_key(
         issuable_credentials: tokio::sync::RwLock::new(
             issuable.iter().map(|s| s.to_string()).collect(),
         ),
+        store_credential_lock: tokio::sync::Mutex::new(()),
     });
 
     let api_key = state.kernel.config.api_key.trim().to_string();
@@ -1315,46 +1318,69 @@ async fn test_credential_issue_rejects_non_string_and_unparseable_bodies() {
 // alongside `/issue` behind the same auth middleware, so the four rejection
 // paths (Schritt 1) -- none of which ever reach the vault -- reuse it as-is.
 //
-// The other two tests need a REAL, decryptable vault, because the store
-// handler refuses (503) when there is nowhere durable to put the value. A
-// fixed test-only master key plus `OPENFANG_VAULT_KEY` is this codebase's own
-// documented headless/CI escape hatch (see the module doc on
-// `crates/openfang-extensions/src/vault.rs`) -- not a new mechanism invented
-// for this test.
+// The other tests need a REAL, decryptable vault, because the store handler
+// refuses (503) when there is nowhere durable to put the value.
+//
+// Earlier revisions of this test infra relied on `OPENFANG_VAULT_KEY` and let
+// `OpenFangKernel::boot_with_config`'s own automatic vault-unlock pick it up
+// -- that is this codebase's documented headless/CI escape hatch (see the
+// module doc on `crates/openfang-extensions/src/vault.rs`). It turned out to
+// be unsound on a real dev machine: `CredentialVault::unlock()`'s key
+// resolution (`resolve_master_key` in vault.rs) checks the OS-keyring-file
+// fallback (`dirs::data_local_dir()/openfang/.keyring`, a MACHINE-GLOBAL path
+// with nothing to do with this test's own `OPENFANG_HOME`) BEFORE the env
+// var. On a machine where an unrelated OpenFang process has ever run
+// `vault init` for real, that file exists and silently wins, so the kernel's
+// automatic unlock attempts to decrypt this test's vault with the WRONG key
+// and gives up, leaving `vault: None` -- exactly the ambient
+// multi-session-on-one-machine hazard this repo's own coordination rules
+// warn about, and not something a test may fix by touching that file.
+//
+// `attach_test_vault` below sidesteps the whole mechanism: it boots the
+// kernel with no `vault.enc` present (so the flaky automatic unlock never
+// fires), then reaches into the already-public
+// `kernel.credential_resolver: Mutex<CredentialResolver>` and swaps in a
+// resolver built around a vault unlocked with an explicit, hardcoded test
+// key -- deterministic on any machine, CI included, and not a new escape
+// hatch invented for this test: `CredentialVault::init_with_key` /
+// `unlock_with_key` are the vault module's own documented
+// "for testing / programmatic use" API.
 
-/// Fixed 32-byte vault master key used only by these tests. Never derived
-/// from anything secret, never written to the real OS keyring/keyring-file
-/// fallback (that path is only consulted if `OPENFANG_VAULT_KEY` is unset,
-/// which it never is here).
+/// Fixed 32-byte vault master key used only by these tests, passed directly
+/// to `init_with_key`/`unlock_with_key` -- never resolved via env var or OS
+/// keyring, so it can't collide with, or be shadowed by, either.
 const TEST_VAULT_KEY: [u8; 32] = [7u8; 32];
 
-fn test_vault_key_b64() -> String {
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, TEST_VAULT_KEY)
-}
-
-/// Guards every test that sets the process-wide `OPENFANG_VAULT_KEY` env var.
+/// Replace `kernel`'s credential resolver with one backed by a real vault at
+/// `<home>/vault.enc`, unlocked (or, on a first call for this `home`,
+/// created) with `TEST_VAULT_KEY`. Must run once, right after boot, before
+/// any credential lookup.
 ///
-/// `CredentialVault::unlock()` (called once, synchronously, inside
-/// `OpenFangKernel::boot_with_config`) reads this var exactly once per boot.
-/// Holding this lock across "set the var, boot, unset the var" stops two
-/// vault-backed tests running concurrently on different threads from one
-/// reading the other's key mid-boot -- the same class of hazard the existing
-/// `start_credential_test_server` doc comment calls out for `issuable`.
-static VAULT_KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Create a vault at `<home>/vault.enc`, seeded with `entries`, using the
-/// fixed test key. Must run before `OpenFangKernel::boot_with_config` --
-/// the kernel only auto-unlocks a vault that already exists on disk.
-fn seed_vault(home: &std::path::Path, entries: &[(&str, &str)]) {
-    let mut vault = openfang_extensions::vault::CredentialVault::new(home.join("vault.enc"));
-    vault
-        .init_with_key(zeroize::Zeroizing::new(TEST_VAULT_KEY))
-        .expect("test vault should init with an explicit key");
-    for (k, v) in entries {
+/// If `vault.enc` already exists (a second call against a `home` a previous
+/// call already used -- the restart test's whole point), this unlocks the
+/// SAME on-disk file rather than creating a new one, so a value written in
+/// an earlier call is still a genuine decrypt of bytes that were actually on
+/// disk, not something carried over in memory.
+fn attach_test_vault(kernel: &OpenFangKernel, home: &std::path::Path) {
+    let vault_path = home.join("vault.enc");
+    let mut vault = openfang_extensions::vault::CredentialVault::new(vault_path.clone());
+    if vault_path.exists() {
         vault
-            .set((*k).to_string(), zeroize::Zeroizing::new((*v).to_string()))
-            .expect("test vault should accept a seeded entry");
+            .unlock_with_key(zeroize::Zeroizing::new(TEST_VAULT_KEY))
+            .expect("test vault should unlock with its own explicit key");
+    } else {
+        vault
+            .init_with_key(zeroize::Zeroizing::new(TEST_VAULT_KEY))
+            .expect("test vault should init with an explicit key");
     }
+
+    let dotenv_path = home.join(".env");
+    let resolver =
+        openfang_extensions::credentials::CredentialResolver::new(Some(vault), Some(&dotenv_path));
+    *kernel
+        .credential_resolver
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = resolver;
 }
 
 /// Boot a credential-capable daemon (mounting both `/issue` and `/store`)
@@ -1372,10 +1398,23 @@ async fn boot_credential_server(
     home: &std::path::Path,
     issuable: &[&str],
 ) -> (String, Arc<AppState>) {
+    boot_credential_server_with_key(home, CRED_API_KEY, issuable).await
+}
+
+/// Same as `boot_credential_server`, but with the daemon's `api_key` under
+/// the caller's control -- `""` reproduces the fail-open configuration
+/// (`middleware::auth` waves every request through unauthenticated), the
+/// same trick `start_credential_test_server_with_key` uses for the
+/// non-vault-backed tests.
+async fn boot_credential_server_with_key(
+    home: &std::path::Path,
+    api_key: &str,
+    issuable: &[&str],
+) -> (String, Arc<AppState>) {
     let config = KernelConfig {
         home_dir: home.to_path_buf(),
         data_dir: home.join("data"),
-        api_key: CRED_API_KEY.to_string(),
+        api_key: api_key.to_string(),
         default_model: DefaultModelConfig {
             provider: "ollama".to_string(),
             model: "test-model".to_string(),
@@ -1385,20 +1424,15 @@ async fn boot_credential_server(
         ..KernelConfig::default()
     };
 
-    let kernel = {
-        let _guard = VAULT_KEY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: single-threaded w.r.t. this var while `_guard` is held --
-        // every other reader/writer of OPENFANG_VAULT_KEY in this test binary
-        // takes the same lock first.
-        unsafe {
-            std::env::set_var("OPENFANG_VAULT_KEY", test_vault_key_b64());
-        }
-        let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
-        unsafe {
-            std::env::remove_var("OPENFANG_VAULT_KEY");
-        }
-        kernel
-    };
+    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    // No `vault.enc` exists yet on a first call for this `home`, so the
+    // kernel's own automatic vault-unlock is a no-op here -- `vault: None`
+    // until `attach_test_vault` swaps in a resolver we control below. On a
+    // restart-simulating second call, `vault.enc` DOES already exist, but
+    // the kernel's automatic unlock would try to decrypt it via
+    // `resolve_master_key()` (env var / OS keyring) rather than our explicit
+    // test key, so we replace the resolver unconditionally either way.
+    attach_test_vault(&kernel, home);
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 
@@ -1418,6 +1452,7 @@ async fn boot_credential_server(
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(budget)),
         issuable_credentials: tokio::sync::RwLock::new(seeded),
+        store_credential_lock: tokio::sync::Mutex::new(()),
     });
 
     let api_key = state.kernel.config.api_key.trim().to_string();
@@ -1570,7 +1605,6 @@ async fn test_credential_store_rejects_bad_requests() {
 async fn test_credential_store_then_issue_same_process() {
     const STORED: &str = "stored-value-not-a-real-secret";
     let tmp = tempfile::tempdir().expect("Failed to create temp dir");
-    seed_vault(tmp.path(), &[]);
     let (base_url, state) = boot_credential_server(tmp.path(), &["ROWBOAT_STORED_TOKEN"]).await;
     let client = reqwest::Client::new();
 
@@ -1627,7 +1661,6 @@ async fn test_credential_store_then_issue_same_process() {
 async fn test_credential_store_survives_restart() {
     const STORED: &str = "restart-value-not-a-real-secret";
     let tmp = tempfile::tempdir().expect("Failed to create temp dir");
-    seed_vault(tmp.path(), &[]);
 
     let (base_url_1, state_1) = boot_credential_server(tmp.path(), &[]).await;
     let client = reqwest::Client::new();
@@ -1661,4 +1694,156 @@ async fn test_credential_store_survives_restart() {
     assert_eq!(issue_body["value"].as_str(), Some(STORED));
 
     state_2.kernel.shutdown();
+}
+
+/// Review finding (Critical): `/store` needs the SAME fail-open guard
+/// `issue_credential` has -- see that function's SECURITY comment for the
+/// full threat model, and `test_credential_issue_refused_when_daemon_has_no_auth`
+/// for the sibling test this one mirrors.
+///
+/// Deliberately does NOT use a vault-backed server: the reference is seeded
+/// via `.env` instead (resolvable, exactly like the sibling `/issue` test
+/// does). That way, if the guard were missing, the request would proceed
+/// past it and hit the ORDINARY `409 reference_exists` conflict check
+/// (`overwrite` defaults to `false`) -- a different, distinguishable outcome
+/// from the guard's own `503`. Comparing against the identical call on a
+/// normally authenticated daemon (which DOES reach that 409) is what proves
+/// the `503` above comes from the auth guard specifically, not from the
+/// reference being unresolvable or some other unrelated cause.
+#[tokio::test]
+async fn test_credential_store_refused_when_daemon_has_no_auth() {
+    const SEEDED: &str = "must-not-be-touched-not-a-real-secret";
+    const ATTEMPT: &str = "attempted-overwrite-not-a-real-secret";
+
+    // Fail-open daemon: empty api_key, and the reference already resolves --
+    // so only the guard can be what refuses this with a `503` instead of the
+    // ordinary `409` a resolvable reference would otherwise hit.
+    let open = start_credential_test_server_with_key(
+        "",
+        &[],
+        &[("ROWBOAT_STORE_FAILOPEN_TOKEN", SEEDED)],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/credentials/store", open.base_url))
+        .json(&serde_json::json!({
+            "reference": "ROWBOAT_STORE_FAILOPEN_TOKEN",
+            "value": ATTEMPT
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 503);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "store_unavailable");
+
+    // Same call, same seed, against an ordinarily authenticated daemon: the
+    // guard doesn't apply, so this reaches the real conflict check instead --
+    // proving the 503 above was the guard, not an unrelated cause.
+    let guarded = start_credential_test_server(
+        &[],
+        &[("ROWBOAT_STORE_FAILOPEN_TOKEN", SEEDED)],
+    )
+    .await;
+    let ordinary = client
+        .post(format!("{}/api/credentials/store", guarded.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({
+            "reference": "ROWBOAT_STORE_FAILOPEN_TOKEN",
+            "value": ATTEMPT
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), 409);
+    let ordinary_body: serde_json::Value = ordinary.json().await.unwrap();
+    assert_eq!(ordinary_body["error"], "reference_exists");
+}
+
+/// Review finding (Minor): the `503 store_unavailable` branch was previously
+/// untested. `start_credential_test_server` boots an ordinary daemon with no
+/// `vault.enc` at all (unlike the vault-seeded helper the tests above use).
+#[tokio::test]
+async fn test_credential_store_returns_store_unavailable_without_vault() {
+    let server = start_credential_test_server(&["ROWBOAT_NOVAULT_TOKEN"], &[]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/credentials/store", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({
+            "reference": "ROWBOAT_NOVAULT_TOKEN",
+            "value": "irrelevant-not-a-real-secret"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 503);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "store_unavailable");
+}
+
+/// Review finding (Important #3, TOCTOU): two concurrent `/store` calls for
+/// the same NOT-yet-existing reference must not both succeed. Before
+/// `state.store_credential_lock` serialized the check-then-write-then-persist
+/// sequence, `resolve_credential` and `store_credential_checked` each took
+/// the resolver mutex separately, so both calls could observe "nothing there
+/// yet", both write, and both answer `200` -- making the `409
+/// reference_exists` guard a TOCTOU no-op under real concurrency. With the
+/// lock, the outcome is deterministic regardless of scheduling: exactly one
+/// call wins.
+#[tokio::test]
+async fn test_credential_store_concurrent_calls_race_to_one_winner() {
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let (base_url, state) = boot_credential_server(tmp.path(), &[]).await;
+
+    let store_url = format!("{}/api/credentials/store", base_url);
+    let client = reqwest::Client::new();
+
+    let (url_a, client_a) = (store_url.clone(), client.clone());
+    let task_a = tokio::spawn(async move {
+        client_a
+            .post(url_a)
+            .bearer_auth(CRED_API_KEY)
+            .json(&serde_json::json!({
+                "reference": "ROWBOAT_RACE_TOKEN",
+                "value": "race-value-a-not-a-real-secret"
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    let (url_b, client_b) = (store_url, client);
+    let task_b = tokio::spawn(async move {
+        client_b
+            .post(url_b)
+            .bearer_auth(CRED_API_KEY)
+            .json(&serde_json::json!({
+                "reference": "ROWBOAT_RACE_TOKEN",
+                "value": "race-value-b-not-a-real-secret"
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    let (resp_a, resp_b) = tokio::join!(task_a, task_b);
+    let resp_a = resp_a.expect("task a should not panic");
+    let resp_b = resp_b.expect("task b should not panic");
+
+    let statuses = [resp_a.status().as_u16(), resp_b.status().as_u16()];
+    let winners = statuses.iter().filter(|&&s| s == 200).count();
+    let conflicts = statuses.iter().filter(|&&s| s == 409).count();
+    assert_eq!(
+        (winners, conflicts),
+        (1, 1),
+        "exactly one concurrent /store call for the same reference must win \
+         (200) and the other must see reference_exists (409); got {statuses:?}"
+    );
+
+    state.kernel.shutdown();
 }

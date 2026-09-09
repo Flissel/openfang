@@ -76,6 +76,7 @@ pub async fn build_router(
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone())),
         issuable_credentials: tokio::sync::RwLock::new(issuable_credentials),
+        store_credential_lock: tokio::sync::Mutex::new(()),
     });
 
     // CORS: allow localhost origins by default. If API key is set, the API

@@ -60,6 +60,18 @@ pub struct AppState {
     /// `issue_credential` must see that grant on its very next call, in the
     /// same process, without a restart.
     pub issuable_credentials: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    /// Serializes `store_credential`'s check-then-write-then-persist-then-grant
+    /// sequence end to end, so two concurrent `/store` calls for the same
+    /// not-yet-existing reference cannot both observe "not there" and both
+    /// write -- without this, both would answer `200` and the `409
+    /// reference_exists` guard would be a TOCTOU no-op under concurrency.
+    ///
+    /// Deliberately a SEPARATE lock from `issuable_credentials`'s write lock:
+    /// serializing on that one instead would also block every `/issue` call
+    /// (a read lock) for the duration of a `/store` call's vault write and
+    /// disk persist, which is unrelated collateral damage `/issue` callers
+    /// should never see.
+    pub store_credential_lock: tokio::sync::Mutex<()>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -11749,6 +11761,16 @@ fn persist_issuable_credential(path: &std::path::Path, name: &str) -> std::io::R
 /// SECURITY invariants:
 /// - Not in the middleware's public-path allowlist -- same bearer-token gate
 ///   as `issue_credential`.
+/// - Refuses outright when the daemon is running fail-open (no `api_key` and
+///   no dashboard auth) -- the identical guard `issue_credential` has, for
+///   the identical reason: `middleware::auth` waves every non-public route
+///   through unauthenticated in that mode, and an endpoint that WRITES
+///   secrets must not run unauthenticated any more than one that reads them.
+///   Without this guard, a fail-open daemon turns `200` vs `409` into an
+///   oracle for which references already exist, and `overwrite: true` lets
+///   an unauthenticated caller overwrite vault entries outright. See the
+///   comment on `issue_credential`'s copy of this check for the full CORS
+///   angle -- it applies here unchanged.
 /// - The value is written to the encrypted vault ONLY. If no vault is
 ///   unlocked for this daemon, the write is refused (`503`) rather than
 ///   silently falling back to a lower-security store (dotenv/env) or
@@ -11761,13 +11783,20 @@ fn persist_issuable_credential(path: &std::path::Path, name: &str) -> std::io::R
 ///   shadow an operator-configured credential from a lower tier, and a
 ///   caller would have no way to tell "nothing was there" from "something
 ///   was there and I just replaced it".
-/// - The reference becomes issuable in THIS process immediately, and the
-///   name (never the value) is persisted so it survives a restart. If
-///   persisting the name fails, the in-memory grant is rolled back and the
-///   whole call is refused (`503`) -- the vault may be left holding an
-///   inert, not-yet-issuable value, but no caller can observe a partial
-///   success through the API: `issue_credential` still refuses it exactly
-///   like any other non-allowlisted reference.
+/// - The check-resolve, vault-write, disk-persist, and in-memory-grant steps
+///   run under `state.store_credential_lock`, held for the whole sequence.
+///   Without it, two concurrent calls for the same not-yet-existing
+///   reference could both see "not there" and both write, both answering
+///   `200` -- the `409` guard above is a TOCTOU no-op unless something
+///   serializes the read and the write.
+/// - The vault write is persisted to `issuable_credentials.list` BEFORE the
+///   in-memory grant is made, not after. Doing it the other way around (grant
+///   first, persist second, roll back the grant if persistence fails) opens
+///   a window where a concurrent `/issue` call sees the grant and returns
+///   the value while this call is still in flight and may yet answer `503`.
+///   With persist-then-grant that window does not exist: the only failure
+///   mode left is a vault entry that got written but never granted or
+///   persisted -- inert, never issuable, and not observable through the API.
 /// - Nothing here ever logs, echoes, or error-messages the value.
 pub async fn store_credential(
     State(state): State<Arc<AppState>>,
@@ -11813,6 +11842,29 @@ pub async fn store_credential(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    // SECURITY: identical guard to `issue_credential`'s -- see that
+    // function's comment for the full threat model (fail-open CORS, no
+    // per-caller identity). Folded into the SAME `store_unavailable` refusal
+    // this endpoint already documents for "no vault", rather than a new
+    // status/body, so a fail-open daemon stays indistinguishable from an
+    // ordinary, already-expected refusal.
+    if state.kernel.config.api_key.trim().is_empty() && !state.kernel.config.auth.enabled {
+        tracing::warn!(
+            reference = %reference,
+            "Credential store refused: this daemon runs without authentication \
+             (api_key is empty and auth.enabled is false), which disables the \
+             endpoint. Set api_key, or enable auth, to use it."
+        );
+        return credential_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "store_unavailable"}),
+        );
+    }
+
+    // SECURITY: held across the whole check-write-persist-grant sequence
+    // below -- see the SECURITY invariant on TOCTOU above.
+    let _serialize = state.store_credential_lock.lock().await;
+
     // SECURITY: checked BEFORE any write, against the full resolution chain
     // (vault, dotenv, env var) -- not just the vault -- so this cannot
     // silently shadow a value that came from somewhere else. The resolved
@@ -11835,30 +11887,31 @@ pub async fn store_credential(
         );
     }
 
-    // Make it issuable in this process right away...
-    {
-        let mut allow = state.issuable_credentials.write().await;
-        allow.insert(reference.to_string());
-    }
-
-    // ...and persist the NAME so a restart doesn't silently drop it. If that
-    // fails, roll back the in-memory grant so nothing this call did is
-    // observable via the API -- fail closed rather than leave an allowlist
-    // entry that quietly disappears the next time the daemon restarts.
+    // Persist the NAME (never the value) BEFORE granting it in memory -- see
+    // the SECURITY invariant on ordering above. If this fails, nothing else
+    // has changed yet: the vault holds an inert, ungranted entry, and no
+    // caller can observe anything through the API.
     let list_path = issuable_credentials_list_path(&state.kernel.config.home_dir);
     if persist_issuable_credential(&list_path, reference).is_err() {
-        state.issuable_credentials.write().await.remove(reference);
         tracing::warn!(
             reference = %reference,
             "Credential stored but the issuable-credential allowlist could not be \
-             persisted to disk; refusing so the daemon's observable state stays \
-             consistent rather than granting issuance that would vanish on restart"
+             persisted to disk; refusing so a restart cannot silently drop \
+             issuance for a reference this call already reported success on"
         );
         return credential_response(
             StatusCode::SERVICE_UNAVAILABLE,
             serde_json::json!({"error": "store_unavailable"}),
         );
     }
+
+    // Only now grant it in this process -- after the durable write, so a
+    // concurrent /issue can never observe a grant this call might yet fail.
+    state
+        .issuable_credentials
+        .write()
+        .await
+        .insert(reference.to_string());
 
     tracing::info!(reference = %reference, "Credential stored");
     credential_response(
