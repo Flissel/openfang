@@ -1796,7 +1796,15 @@ async fn test_credential_store_returns_store_unavailable_without_vault() {
 /// reference_exists` guard a TOCTOU no-op under real concurrency. With the
 /// lock, the outcome is deterministic regardless of scheduling: exactly one
 /// call wins.
-#[tokio::test]
+/// ZWEI DINGE MACHEN DIESEN TEST FEHLSCHLAGFAEHIG, beide tragend. Ein
+/// blankes `#[tokio::test]` laeuft auf einer CURRENT-THREAD-Laufzeit, und das
+/// Fenster zwischen Existenzpruefung und Schreiben enthaelt kein `.await` --
+/// ein Handler laeuft also immer ganz durch, bevor der andere beginnt, und
+/// der Test bestuende identisch mit geloeschtem Lock. Er verlangt deshalb
+/// eine mehrfaedige Laufzeit, damit beide Handler wirklich gleichzeitig
+/// laufen. Auch dann kann eine einzelne Runde das Fenster durch Glueck
+/// verfehlen, also rennt er mehrfach mit je frischer Referenz.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_credential_store_concurrent_calls_race_to_one_winner() {
     let tmp = tempfile::tempdir().expect("Failed to create temp dir");
     let (base_url, state) = boot_credential_server(tmp.path(), &[]).await;
@@ -1804,46 +1812,53 @@ async fn test_credential_store_concurrent_calls_race_to_one_winner() {
     let store_url = format!("{}/api/credentials/store", base_url);
     let client = reqwest::Client::new();
 
-    let (url_a, client_a) = (store_url.clone(), client.clone());
-    let task_a = tokio::spawn(async move {
-        client_a
-            .post(url_a)
-            .bearer_auth(CRED_API_KEY)
-            .json(&serde_json::json!({
-                "reference": "ROWBOAT_RACE_TOKEN",
-                "value": "race-value-a-not-a-real-secret"
-            }))
-            .send()
-            .await
-            .unwrap()
-    });
-    let (url_b, client_b) = (store_url, client);
-    let task_b = tokio::spawn(async move {
-        client_b
-            .post(url_b)
-            .bearer_auth(CRED_API_KEY)
-            .json(&serde_json::json!({
-                "reference": "ROWBOAT_RACE_TOKEN",
-                "value": "race-value-b-not-a-real-secret"
-            }))
-            .send()
-            .await
-            .unwrap()
-    });
+    for round in 0..12 {
+        let reference = format!("ROWBOAT_RACE_TOKEN_{round}");
 
-    let (resp_a, resp_b) = tokio::join!(task_a, task_b);
-    let resp_a = resp_a.expect("task a should not panic");
-    let resp_b = resp_b.expect("task b should not panic");
+        let (url_a, client_a, reference_a) =
+            (store_url.clone(), client.clone(), reference.clone());
+        let task_a = tokio::spawn(async move {
+            client_a
+                .post(url_a)
+                .bearer_auth(CRED_API_KEY)
+                .json(&serde_json::json!({
+                    "reference": reference_a,
+                    "value": "race-value-a-not-a-real-secret"
+                }))
+                .send()
+                .await
+                .unwrap()
+        });
+        let (url_b, client_b, reference_b) =
+            (store_url.clone(), client.clone(), reference.clone());
+        let task_b = tokio::spawn(async move {
+            client_b
+                .post(url_b)
+                .bearer_auth(CRED_API_KEY)
+                .json(&serde_json::json!({
+                    "reference": reference_b,
+                    "value": "race-value-b-not-a-real-secret"
+                }))
+                .send()
+                .await
+                .unwrap()
+        });
 
-    let statuses = [resp_a.status().as_u16(), resp_b.status().as_u16()];
-    let winners = statuses.iter().filter(|&&s| s == 200).count();
-    let conflicts = statuses.iter().filter(|&&s| s == 409).count();
-    assert_eq!(
-        (winners, conflicts),
-        (1, 1),
-        "exactly one concurrent /store call for the same reference must win \
-         (200) and the other must see reference_exists (409); got {statuses:?}"
-    );
+        let (resp_a, resp_b) = tokio::join!(task_a, task_b);
+        let resp_a = resp_a.expect("task a should not panic");
+        let resp_b = resp_b.expect("task b should not panic");
+
+        let statuses = [resp_a.status().as_u16(), resp_b.status().as_u16()];
+        let winners = statuses.iter().filter(|&&s| s == 200).count();
+        let conflicts = statuses.iter().filter(|&&s| s == 409).count();
+        assert_eq!(
+            (winners, conflicts),
+            (1, 1),
+            "round {round}: exactly one concurrent /store call for one \
+             reference must win (200), the other must see 409; got \
+             {statuses:?}"
+        );
+    }
 
     state.kernel.shutdown();
 }
