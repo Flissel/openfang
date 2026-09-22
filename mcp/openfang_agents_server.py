@@ -81,13 +81,16 @@ def _http(method: str, path: str, json_body: dict | None = None) -> list[TextCon
     """
     url, timeout = _cfg()
     full_url = f"{url}{path}"
+    headers = {"Authorization": f"Bearer {os.environ.get('OPENFANG_API_KEY', '')}"}
+    if json_body is not None:
+        headers["Content-Type"] = "application/json"
     try:
         resp = requests.request(
             method=method,
             url=full_url,
             json=json_body,
             timeout=timeout,
-            headers={"Content-Type": "application/json"} if json_body is not None else {},
+            headers=headers,
         )
     except requests.exceptions.ConnectionError:
         return _err(

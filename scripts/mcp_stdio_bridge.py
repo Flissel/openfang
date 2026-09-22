@@ -37,7 +37,10 @@ def forward(request_bytes: bytes, url: str) -> bytes:
     req = urllib.request.Request(
         url,
         data=request_bytes,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.environ.get('OPENFANG_API_KEY', '')}",
+        },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
