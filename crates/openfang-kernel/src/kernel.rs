@@ -5386,6 +5386,27 @@ impl OpenFangKernel {
         }
     }
 
+    /// Store a credential in the vault, reporting failure instead of
+    /// swallowing it like the sibling `store_credential` above.
+    ///
+    /// `store_credential` is best-effort by design (it dual-writes to
+    /// `secrets.env` as a fallback at its call sites), which is the wrong
+    /// shape for a caller that must fail closed when there is nowhere
+    /// durable to put the value — e.g. an HTTP endpoint that would otherwise
+    /// answer `200` for a write that never actually happened. This returns
+    /// the underlying error (never the value — the error variants here are
+    /// static strings like "no vault configured" / "vault locked", never
+    /// derived from `value`) so such a caller can refuse instead.
+    pub fn store_credential_checked(&self, key: &str, value: &str) -> Result<(), String> {
+        let mut resolver = self
+            .credential_resolver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        resolver
+            .store_in_vault(key, zeroize::Zeroizing::new(value.to_string()))
+            .map_err(|e| e.to_string())
+    }
+
     /// Remove a credential from the vault (best-effort — falls through silently if no vault).
     pub fn remove_credential(&self, key: &str) {
         let mut resolver = self
