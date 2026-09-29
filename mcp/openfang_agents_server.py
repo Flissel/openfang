@@ -362,7 +362,71 @@ async def list_tools() -> list[Tool]:
                 "required": ["agent_id"],
             },
         ),
+        Tool(
+            name="openfang_agent_recent",
+            description=(
+                "Letzte protokollierte Aktionen eines Agents (Audit). Liest "
+                "GET /api/audit/recent und filtert auf den per Namen aufgeloesten "
+                "agent_id."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Agentenname (nicht die UUID)"},
+                    "n": {"type": "integer", "default": 50, "description": "Anzahl juengster Eintraege"},
+                },
+                "required": ["agent"],
+            },
+        ),
+        Tool(
+            name="openfang_agent_task",
+            description=(
+                "Auftrag an einen Agent senden (POST /api/agents/<id>/message); "
+                "Rueckgabe mit Audit-Sequenz vorher/nachher als Beleg, dass "
+                "OpenFang den Auftrag protokolliert hat."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Agentenname (nicht die UUID)"},
+                    "message": {"type": "string", "description": "Auftragstext an den Agent"},
+                },
+                "required": ["agent", "message"],
+            },
+        ),
     ]
+
+
+def _json(method: str, path: str, body: dict | None = None):
+    """Wie _http, aber gibt das geparste JSON zurueck und wirft bei Fehlern
+    (fuer zusammengesetzte Werkzeuge, die mehrere HTTP-Aufrufe verketten).
+    Selber Timeout/URL-Weg wie _http (_cfg()); der Schluessel wird nie
+    geloggt oder zurueckgegeben."""
+    url, timeout = _cfg()
+    resp = requests.request(
+        method=method,
+        url=f"{url}{path}",
+        json=body,
+        timeout=timeout,
+        headers={"Authorization": f"Bearer {os.environ.get('OPENFANG_API_KEY', '')}"},
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"OpenFang {method} {path}: HTTP {resp.status_code}")
+    return resp.json()
+
+
+def _agent_id(name: str) -> str:
+    """Loest einen Agentennamen ueber GET /api/agents zur UUID auf."""
+    for a in _json("GET", "/api/agents") or []:
+        if a.get("name") == name:
+            return a["id"]
+    raise RuntimeError(f"Agent {name!r} nicht gefunden")
+
+
+def _audit_tip() -> int:
+    """Juengste Sequenznummer aus GET /api/audit/recent?n=1 (Beleg-Stempel)."""
+    entries = (_json("GET", "/api/audit/recent?n=1") or {}).get("entries") or [{}]
+    return int(entries[-1].get("seq", 0))
 
 
 # ── tool dispatch ────────────────────────────────────────────────────────────
@@ -439,6 +503,49 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if not agent_id:
             return _err("agent_id is required")
         return _http("DELETE", f"/api/agents/{agent_id}")
+
+    if name == "openfang_agent_recent":
+        agent = (args.get("agent") or "").strip()
+        if not agent:
+            return _err("agent is required")
+        try:
+            aid = _agent_id(agent)
+            n = int(args.get("n", 50))
+            eintraege = (_json("GET", f"/api/audit/recent?n={max(n * 5, 200)}") or {}).get("entries", [])
+        except RuntimeError as exc:
+            return _err(str(exc))
+        passt = [e for e in eintraege if e.get("agent_id") == aid][-n:]
+        return _ok(passt)
+
+    if name == "openfang_agent_task":
+        agent = (args.get("agent") or "").strip()
+        message = args.get("message")
+        if not agent:
+            return _err("agent is required")
+        if not message:
+            return _err("message is required")
+        try:
+            aid = _agent_id(agent)
+            vorher = _audit_tip()
+            antwort = _json("POST", f"/api/agents/{aid}/message", {"message": message})
+            nachher = _audit_tip()
+        except RuntimeError as exc:
+            return _err(str(exc))
+        if isinstance(antwort, dict):
+            text = antwort.get("response")
+            if text is None:
+                text = antwort.get("reply")
+            if text is None:
+                text = antwort.get("text")
+            if text is None:
+                # keins der bekannten Felder vorhanden -- rohe Antwort statt Datenverlust.
+                text = json.dumps(antwort, ensure_ascii=False)
+        else:
+            text = antwort
+        return _ok({
+            "agent": agent, "antwort": text,
+            "audit_seq_vorher": vorher, "audit_seq_nachher": nachher,
+        })
 
     return _err(f"unknown tool: {name}")
 
