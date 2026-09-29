@@ -68,6 +68,7 @@ async fn start_tool_only_test_server() -> TestServer {
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(Default::default())),
         issuable_credentials: Default::default(),
+        store_credential_lock: tokio::sync::Mutex::new(()),
     });
     let app = Router::new()
         .route("/mcp", axum::routing::post(routes::mcp_http))
@@ -4055,6 +4056,7 @@ async fn boot_credential_server_with_key(
             model: "test-model".to_string(),
             api_key_env: "OLLAMA_API_KEY".to_string(),
             base_url: None,
+            subprocess_timeout_secs: None,
         },
         ..KernelConfig::default()
     };
@@ -4095,6 +4097,7 @@ async fn boot_credential_server_with_key(
         api_key: api_key.clone(),
         auth_enabled: state.kernel.config.auth.enabled,
         session_secret: api_key.clone(),
+        allow_no_auth: false,
     };
 
     let app = Router::new()
