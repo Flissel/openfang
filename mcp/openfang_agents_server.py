@@ -401,18 +401,38 @@ def _json(method: str, path: str, body: dict | None = None):
     """Wie _http, aber gibt das geparste JSON zurueck und wirft bei Fehlern
     (fuer zusammengesetzte Werkzeuge, die mehrere HTTP-Aufrufe verketten).
     Selber Timeout/URL-Weg wie _http (_cfg()); der Schluessel wird nie
-    geloggt oder zurueckgegeben."""
+    geloggt oder zurueckgegeben.
+
+    Review-Fix (Fix-Runde 2): ohne eigenes try/except faellt ein
+    requests.ConnectionError (OpenFang aus) roh bis zum generischen
+    MCP-SDK-Handler durch statt der freundlichen Meldung, die _http fuer
+    denselben Fall gibt. Fehler hier daher in derselben Wortwahl wie _http
+    als RuntimeError, den call_tool bereits abfaengt (except RuntimeError)."""
     url, timeout = _cfg()
-    resp = requests.request(
-        method=method,
-        url=f"{url}{path}",
-        json=body,
-        timeout=timeout,
-        headers={"Authorization": f"Bearer {os.environ.get('OPENFANG_API_KEY', '')}"},
-    )
+    try:
+        resp = requests.request(
+            method=method,
+            url=f"{url}{path}",
+            json=body,
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {os.environ.get('OPENFANG_API_KEY', '')}"},
+        )
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError(
+            f"cannot reach OpenFang at {url} — is the daemon running on :4200? "
+            f"(start: Vibemind.debug.ps1 -Modules openfang, or "
+            f"target/release/openfang.exe start --config openfang.vibemind.toml)"
+        ) from None
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"OpenFang timed out after {timeout}s on {method} {path}") from None
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"{method} {path} failed: {e}") from e
     if resp.status_code >= 400:
         raise RuntimeError(f"OpenFang {method} {path}: HTTP {resp.status_code}")
-    return resp.json()
+    try:
+        return resp.json()
+    except ValueError:
+        raise RuntimeError(f"OpenFang {method} {path}: response was not JSON") from None
 
 
 def _agent_id(name: str) -> str:
