@@ -491,6 +491,29 @@ type = "stdio"
 command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
 args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_server_rowboat_ui.py"]
 
+# Brain T2 (2026-10-01) — Selbstbedienung: Wissensdokumente lesen/schreiben und
+# OpenFang-Agenten pruefen/beauftragen. OpenFang leert die Umgebung der MCP-Kinder
+# (mcp.rs env_clear) und der Daemon laedt die Root-.env bewusst nicht; deshalb
+# holt scripts/mcp_mit_env.py nur die genannten Schluessel aus der .env.
+# knowledge_write schreibt nur, wenn jeder Beleg an der Quelle bestaetigt ist.
+# Der Wissens-Server laeuft aus dem Laufzeit-Checkout C:/Users/User/ClaudeWork/vos-runtime
+# (vibemind-os, detached; nachziehen mit git checkout --detach <master-sha>).
+[[mcp_servers]]
+name = "knowledge"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "SUPABASE_ANON_KEY", "--env", "OPENFANG_API_KEY", "--set", "SUPABASE_URL=http://localhost:54321", "--set", "QDRANT_URL=http://localhost:6730", "--set", "OPENFANG_URL=http://127.0.0.1:4200", "--set", "KNOWLEDGE_DIR=C:/Users/User/.rowboat/knowledge", "--", "C:/Users/User/ClaudeWork/vos-runtime/spaces/rowboat/knowledge_mcp_server.py"]
+
+[[mcp_servers]]
+name = "openfang-agents"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "OPENFANG_API_KEY", "--set", "OPENFANG_URL=http://127.0.0.1:4200", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/openfang/mcp/openfang_agents_server.py"]
+
 # ═══════════════════════════════════════════════════════════════════
 # Phase 11.A — Spaces MCP Servers
 # Bubble + Idea tools as MCP for brain-bubbles and brain-ideas agents.
