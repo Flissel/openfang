@@ -434,15 +434,38 @@ pub fn classify_connect_error(message: &str) -> ConnectErrorClass {
     if m.contains("mcp header invalid") {
         return ConnectErrorClass::InvalidHeader;
     }
-    if m.contains("401")
-        || m.contains("403")
-        || m.contains("unauthorized")
+    if m.contains("unauthorized")
         || m.contains("forbidden")
         || m.contains("auth required")
+        || has_auth_status_code(&m)
     {
         return ConnectErrorClass::KeyRejected;
     }
     ConnectErrorClass::Unreachable
+}
+
+/// True when `m` (lowercased) carries 401/403 as an HTTP status, e.g.
+/// "http 401", "status 403", "status: 401". A bare 401/403 inside a port,
+/// path, address or longer number (":4010", "/4031", "10.0.4.403") does not
+/// count — otherwise a network error would wrongly suppress auto-reconnect.
+fn has_auth_status_code(m: &str) -> bool {
+    let bytes = m.as_bytes();
+    for code in ["401", "403"] {
+        for (i, _) in m.match_indices(code) {
+            let prev = i.checked_sub(1).map(|j| bytes[j]);
+            let next = bytes.get(i + code.len()).copied();
+            if matches!(prev, Some(b) if b.is_ascii_digit() || b == b':' || b == b'/' || b == b'.')
+                || matches!(next, Some(b) if b.is_ascii_digit())
+            {
+                continue;
+            }
+            let before = m[..i].trim_end_matches(|c: char| c == ' ' || c == ':' || c == '=');
+            if before.ends_with("http") || before.ends_with("status") || before.ends_with("code") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Ersetzt jedes Vorkommen jedes (nicht leeren) Geheimnisses durch `<redacted>`.
@@ -648,6 +671,49 @@ mod tests {
         assert_eq!(classify_connect_error("MCP header invalid: Authorization"), ConnectErrorClass::InvalidHeader);
         assert_eq!(classify_connect_error("error trying to connect: dns error"), ConnectErrorClass::Unreachable);
         assert_eq!(classify_connect_error("HTTP status 503"), ConnectErrorClass::Unreachable);
+    }
+
+    #[test]
+    fn classify_connect_error_ignores_status_like_digits_in_ports_and_paths() {
+        // Ports/paths containing 401/403 are network errors, not key rejections.
+        assert_eq!(
+            classify_connect_error("error sending request for url (http://h:4010/mcp)"),
+            ConnectErrorClass::Unreachable
+        );
+        assert_eq!(
+            classify_connect_error("error sending request for url (http://h:401/mcp)"),
+            ConnectErrorClass::Unreachable
+        );
+        assert_eq!(
+            classify_connect_error("error sending request for url (http://h/4031/mcp)"),
+            ConnectErrorClass::Unreachable
+        );
+        assert_eq!(
+            classify_connect_error("error sending request for url (http://10.0.4.403:80/mcp)"),
+            ConnectErrorClass::Unreachable
+        );
+        assert_eq!(classify_connect_error("HTTP status 4010"), ConnectErrorClass::Unreachable);
+    }
+
+    #[test]
+    fn classify_connect_error_maps_real_rmcp_401_text() {
+        // Exact text rmcp 1.2 produced against the mini MCP server in
+        // openfang-api/tests/integrations_remote_test.rs (made-up body).
+        let real = "MCP HTTP connection failed: Send message error Transport [rmcp::transport::worker::WorkerTransport<rmcp::transport::streamable_http_client::StreamableHttpClientWorker<reqwest::async_impl::client::Client>>] error: unexpected server response: HTTP 401 Unauthorized: {\"error\":\"unauthorized\"}, when send initialize request";
+        assert_eq!(classify_connect_error(real), ConnectErrorClass::KeyRejected);
+        // Same shape without any reason phrase or body: status code alone counts.
+        assert_eq!(
+            classify_connect_error("error: unexpected server response: HTTP 401, when send initialize request"),
+            ConnectErrorClass::KeyRejected
+        );
+        assert_eq!(
+            classify_connect_error("unexpected server response: HTTP 403"),
+            ConnectErrorClass::KeyRejected
+        );
+        assert_eq!(classify_connect_error("status: 403"), ConnectErrorClass::KeyRejected);
+        // The real rmcp network-error text stays Unreachable.
+        let refused = "MCP HTTP connection failed: Send message error Transport [rmcp::transport::worker::WorkerTransport<rmcp::transport::streamable_http_client::StreamableHttpClientWorker<reqwest::async_impl::client::Client>>] error: Client error: error sending request for url (http://127.0.0.1:4010/mcp), when send initialize request";
+        assert_eq!(classify_connect_error(refused), ConnectErrorClass::Unreachable);
     }
 
     #[test]
