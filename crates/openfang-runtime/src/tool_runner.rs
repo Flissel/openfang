@@ -510,7 +510,7 @@ pub async fn execute_tool(
         other => {
             // Fallback 1: MCP tools (mcp_{server}_{tool} prefix)
             if mcp::is_mcp_tool(other) {
-                if let Some(mcp_conns) = mcp_connections {
+                let mcp_result: Result<String, String> = if let Some(mcp_conns) = mcp_connections {
                     let mut conns = mcp_conns.lock().await;
                     let known_names: Vec<String> =
                         conns.iter().map(|c| c.name().to_string()).collect();
@@ -524,20 +524,7 @@ pub async fn execute_tool(
                                 server = server_name,
                                 "Dispatching to MCP server"
                             );
-                            let call_result = conn.call_tool(other, input).await;
-                            // Audit trail: tool name + approval outcome only,
-                            // never inputs or outputs.
-                            if let Some(kh) = kernel {
-                                if kh.is_integration_tool(other) {
-                                    kh.record_integration_call(
-                                        caller_agent_id.unwrap_or("unknown"),
-                                        other,
-                                        approval_mode,
-                                        if call_result.is_ok() { "ok" } else { "fehler" },
-                                    );
-                                }
-                            }
-                            match call_result {
+                            match conn.call_tool(other, input).await {
                                 Ok(content) => Ok(content),
                                 Err(e) => Err(format!("MCP tool call failed: {e}")),
                             }
@@ -549,7 +536,21 @@ pub async fn execute_tool(
                     }
                 } else {
                     Err(format!("MCP not available for tool: {other}"))
+                };
+                // Audit trail: exactly one row per integration call, whatever
+                // branch produced the result. Tool name + approval outcome
+                // only, never inputs or outputs.
+                if let Some(kh) = kernel {
+                    if kh.is_integration_tool(other) {
+                        kh.record_integration_call(
+                            caller_agent_id.unwrap_or("unknown"),
+                            other,
+                            approval_mode,
+                            if mcp_result.is_ok() { "ok" } else { "fehler" },
+                        );
+                    }
                 }
+                mcp_result
             }
             // Fallback 2: Skill registry tool providers
             else if let Some(registry) = skill_registry {
@@ -5250,6 +5251,8 @@ mod tests {
 
     struct RecordingKernel {
         calls: std::sync::Mutex<Vec<(String, String, String)>>,
+        requires: bool,
+        approve: bool,
     }
 
     #[async_trait::async_trait]
@@ -5315,10 +5318,10 @@ mod tests {
             Err("unused".into())
         }
         fn requires_approval(&self, _t: &str) -> bool {
-            true
+            self.requires
         }
         async fn request_approval(&self, _a: &str, _t: &str, _s: &str) -> Result<bool, String> {
-            Ok(false)
+            Ok(self.approve)
         }
         fn is_integration_tool(&self, t: &str) -> bool {
             t.starts_with("mcp_github_")
@@ -5335,6 +5338,8 @@ mod tests {
     async fn denied_integration_call_is_audited_as_denied() {
         let rec = Arc::new(RecordingKernel {
             calls: Default::default(),
+            requires: true,
+            approve: false,
         });
         let k: Arc<dyn KernelHandle> = rec.clone();
         let result = execute_tool(
@@ -5356,5 +5361,79 @@ mod tests {
                 "denied".to_string()
             )]
         );
+    }
+
+    async fn run_failing_mcp_call(
+        requires: bool,
+        approve: bool,
+        input: serde_json::Value,
+    ) -> (ToolResult, Vec<(String, String, String)>) {
+        let rec = Arc::new(RecordingKernel {
+            calls: Default::default(),
+            requires,
+            approve,
+        });
+        let k: Arc<dyn KernelHandle> = rec.clone();
+        let conns: tokio::sync::Mutex<Vec<mcp::McpConnection>> = tokio::sync::Mutex::new(vec![]);
+        let result = execute_tool(
+            "test-id",
+            "mcp_github_create_issue",
+            &input,
+            Some(&k),
+            None,
+            Some("agent-1"),
+            None,
+            Some(&conns),
+            None, None, None, None, None, None, None, None, None,
+        )
+        .await;
+        let calls = rec.calls.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    #[tokio::test]
+    async fn connection_failure_of_read_only_integration_call_is_audited_once() {
+        let (result, calls) =
+            run_failing_mcp_call(false, false, serde_json::json!({"title": "x"})).await;
+        assert!(result.is_error);
+        assert_eq!(
+            calls,
+            vec![(
+                "mcp_github_create_issue".to_string(),
+                "read_only".to_string(),
+                "fehler".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_of_approved_integration_call_is_audited_once() {
+        let (result, calls) =
+            run_failing_mcp_call(true, true, serde_json::json!({"title": "x"})).await;
+        assert!(result.is_error);
+        assert_eq!(
+            calls,
+            vec![(
+                "mcp_github_create_issue".to_string(),
+                "freigabe_erteilt".to_string(),
+                "fehler".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_audit_rows_never_contain_input_content() {
+        let (_, calls) = run_failing_mcp_call(
+            true,
+            true,
+            serde_json::json!({"title": "KANARIE-AUDIT"}),
+        )
+        .await;
+        assert_eq!(calls.len(), 1);
+        for (a, b, c) in &calls {
+            for field in [a, b, c] {
+                assert!(!field.contains("KANARIE-AUDIT"));
+            }
+        }
     }
 }

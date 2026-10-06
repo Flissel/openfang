@@ -6074,11 +6074,6 @@ impl OpenFangKernel {
             .collect()
     }
 
-    /// Approval default for integration tools: every tool of an installed
-    /// integration needs approval unless its original name is listed in the
-    /// template's `read_only_tools`. The owner comes from the actual
-    /// connection origin; the name-prefix fallback applies only when no origin
-    /// exists. Ambiguous ownership fails closed (approval required).
     /// Ownership of a tool from the integrations' point of view. Shared by the
     /// approval default and the audit trail so there is one ownership rule.
     fn integration_owner(&self, tool_name: &str) -> crate::integrations::Owner {
@@ -6093,6 +6088,11 @@ impl OpenFangKernel {
         crate::integrations::owning_integration(origins.as_ref(), tool_name, &installed)
     }
 
+    /// Approval default for integration tools: every tool of an installed
+    /// integration needs approval unless its original name is listed in the
+    /// template's `read_only_tools`. The owner comes from the actual
+    /// connection origin; the name-prefix fallback applies only when no origin
+    /// exists. Ambiguous ownership fails closed (approval required).
     pub fn integration_requires_approval(&self, tool_name: &str) -> bool {
         use crate::integrations::{integration_tool_requires_approval, Owner};
 
