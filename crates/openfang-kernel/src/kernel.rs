@@ -991,6 +991,16 @@ impl OpenFangKernel {
         let mut extension_registry =
             openfang_extensions::registry::IntegrationRegistry::new(&config.home_dir);
         let ext_bundled = extension_registry.load_bundled();
+        // Ordner-Vorlagen nach den eingebauten laden (gleiche id gewinnt).
+        // Uebersprungene Dateien loggt die Registry selbst (Dateiname + Grund).
+        let dir_report = extension_registry.load_template_dirs(&config.extensions.template_dirs);
+        if dir_report.loaded > 0 || !dir_report.skipped.is_empty() {
+            info!(
+                loaded = dir_report.loaded,
+                skipped = dir_report.skipped.len(),
+                "Integrations-Vorlagen aus Ordnern geladen"
+            );
+        }
         match extension_registry.load_installed() {
             Ok(count) => {
                 if count > 0 {
@@ -5986,11 +5996,118 @@ impl OpenFangKernel {
         connections.retain(|connection| !removed.iter().any(|name| name == connection.name()));
     }
 
+    /// Single connection path for boot, reload and reconnect.
+    ///
+    /// Builds the runtime config freshly from the vault on every call. The
+    /// resolved header values live only in the `McpServerConfig` handed to this
+    /// one connection — never in `effective_mcp_servers`, health or logs. A
+    /// missing credential means no connection attempt. Error text is scrubbed
+    /// of every resolved value before it is returned or stored.
+    async fn connect_one_mcp(
+        self: &Arc<Self>,
+        server_config: &openfang_types::config::McpServerConfigEntry,
+    ) -> Result<usize, String> {
+        use crate::integrations::{build_runtime_config, status_from_connect_error, BuildError};
+        use openfang_extensions::IntegrationStatus;
+
+        // Resolve env vars from vault/dotenv before passing to MCP subprocess.
+        // The MCP spawn calls env_clear() then re-adds only whitelisted vars
+        // from std::env — so we must ensure they're in std::env first.
+        // Unchanged stdio path; remote integrations carry an empty `env`.
+        for var_name in &server_config.env {
+            if std::env::var(var_name).is_err() {
+                if let Some(val) = self.resolve_credential(var_name) {
+                    std::env::set_var(var_name, &val);
+                }
+            }
+        }
+
+        let resolve = |k: &str| self.resolve_credential(k).map(zeroize::Zeroizing::new);
+        let built = match build_runtime_config(server_config, &resolve) {
+            Ok(built) => built,
+            Err(BuildError::MissingCredentials(names)) => {
+                let status = IntegrationStatus::KeyMissing(names);
+                let shown = status.detail().unwrap_or_else(|| status.to_string());
+                self.extension_health
+                    .report_status(&server_config.name, status);
+                return Err(shown);
+            }
+            Err(BuildError::InvalidCredentialValue(name)) => {
+                let shown = format!("ungueltiger Wert fuer {name}");
+                self.extension_health.report_status(
+                    &server_config.name,
+                    IntegrationStatus::Unreachable(shown.clone()),
+                );
+                return Err(shown);
+            }
+        };
+
+        match openfang_runtime::mcp::McpConnection::connect(built.config).await {
+            Ok(conn) => {
+                let tool_count = conn.tools().len();
+                self.extension_health
+                    .report_ok(&server_config.name, tool_count);
+                self.install_mcp_connection(conn).await;
+                Ok(tool_count)
+            }
+            Err(e) => {
+                let status = status_from_connect_error(&e.to_string(), &built.secrets);
+                let shown = status.detail().unwrap_or_else(|| status.to_string());
+                self.extension_health
+                    .report_status(&server_config.name, status);
+                Err(shown)
+            }
+        }
+    }
+
+    /// Ids of every installed integration (enabled or not) with a known template.
+    fn installed_integration_ids(&self) -> Vec<String> {
+        let registry = self
+            .extension_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        registry
+            .list_templates()
+            .into_iter()
+            .filter(|t| registry.is_installed(&t.id))
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// Approval default for integration tools: every tool of an installed
+    /// integration needs approval unless its original name is listed in the
+    /// template's `read_only_tools`. The owner comes from the actual
+    /// connection origin; the name-prefix fallback applies only when no origin
+    /// exists. Ambiguous ownership fails closed (approval required).
+    pub fn integration_requires_approval(&self, tool_name: &str) -> bool {
+        use crate::integrations::{integration_tool_requires_approval, owning_integration, Owner};
+
+        // Never hold the registry lock and the MCP cache lock at the same time.
+        let installed = self.installed_integration_ids();
+        let origins = self
+            .mcp_tool_origins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tool_name)
+            .cloned();
+        match owning_integration(origins.as_ref(), tool_name, &installed) {
+            Owner::NotIntegration => false,
+            Owner::Ambiguous => true,
+            Owner::Single(server) => {
+                let read_only = self
+                    .extension_registry
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_template(&server)
+                    .map(|t| t.read_only_tools.clone())
+                    .unwrap_or_default();
+                integration_tool_requires_approval(tool_name, &server, &read_only)
+            }
+        }
+    }
+
     /// Connect to all configured MCP servers and cache their tool definitions.
     async fn connect_mcp_servers(self: &Arc<Self>) {
-        use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
-        use openfang_types::config::McpTransportEntry;
-
         let _lifecycle_guard = self.mcp_lifecycle.lock().await;
 
         let servers = self
@@ -6000,55 +6117,20 @@ impl OpenFangKernel {
             .unwrap_or_default();
 
         for server_config in &servers {
-            let transport = match &server_config.transport {
-                McpTransportEntry::Stdio { command, args } => McpTransport::Stdio {
-                    command: command.clone(),
-                    args: args.clone(),
-                },
-                McpTransportEntry::Sse { url } => McpTransport::Sse { url: url.clone() },
-                McpTransportEntry::Http { url } => McpTransport::Http { url: url.clone() },
-            };
-
-            // Resolve env vars from vault/dotenv before passing to MCP subprocess.
-            // The MCP spawn calls env_clear() then re-adds only whitelisted vars
-            // from std::env — so we must ensure they're in std::env first.
-            for var_name in &server_config.env {
-                if std::env::var(var_name).is_err() {
-                    if let Some(val) = self.resolve_credential(var_name) {
-                        std::env::set_var(var_name, &val);
-                    }
-                }
-            }
-
-            let mcp_config = McpServerConfig {
-                name: server_config.name.clone(),
-                transport,
-                timeout_secs: server_config.timeout_secs,
-                env: server_config.env.clone(),
-                headers: server_config.headers.clone(),
-            };
-
-            match McpConnection::connect(mcp_config).await {
-                Ok(conn) => {
-                    let tool_count = conn.tools().len();
+            match self.connect_one_mcp(server_config).await {
+                Ok(tool_count) => {
                     info!(
                         server = %server_config.name,
                         tools = tool_count,
                         "MCP server connected"
                     );
-                    // Update extension health if this is an extension-provided server
-                    self.extension_health
-                        .report_ok(&server_config.name, tool_count);
-                    self.install_mcp_connection(conn).await;
                 }
-                Err(e) => {
+                Err(shown) => {
                     warn!(
                         server = %server_config.name,
-                        error = %e,
+                        error = %shown,
                         "Failed to connect to MCP server"
                     );
-                    self.extension_health
-                        .report_error(&server_config.name, e.to_string());
                 }
             }
         }
@@ -6066,9 +6148,6 @@ impl OpenFangKernel {
     ///
     /// Called by the API reload endpoint after CLI installs/removes integrations.
     pub async fn reload_extension_mcps(self: &Arc<Self>) -> Result<usize, String> {
-        use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
-        use openfang_types::config::McpTransportEntry;
-
         let _lifecycle_guard = self.mcp_lifecycle.lock().await;
 
         // 1. Reload installed integrations from disk
@@ -6079,6 +6158,22 @@ impl OpenFangKernel {
                 .unwrap_or_else(|e| e.into_inner());
             registry.load_installed().map_err(|e| e.to_string())?
         };
+
+        // 1b. Re-read template folders (folder templates win over bundled ones).
+        {
+            let mut registry = self
+                .extension_registry
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir_report = registry.load_template_dirs(&self.config.extensions.template_dirs);
+            if dir_report.loaded > 0 || !dir_report.skipped.is_empty() {
+                info!(
+                    loaded = dir_report.loaded,
+                    skipped = dir_report.skipped.len(),
+                    "Integrations-Vorlagen aus Ordnern neu geladen"
+                );
+            }
+        }
 
         // 2. Rebuild effective MCP server list
         let new_configs = {
@@ -6131,44 +6226,21 @@ impl OpenFangKernel {
         // 5. Connect new servers
         let mut connected_count = 0;
         for server_config in &new_servers {
-            let transport = match &server_config.transport {
-                McpTransportEntry::Stdio { command, args } => McpTransport::Stdio {
-                    command: command.clone(),
-                    args: args.clone(),
-                },
-                McpTransportEntry::Sse { url } => McpTransport::Sse { url: url.clone() },
-                McpTransportEntry::Http { url } => McpTransport::Http { url: url.clone() },
-            };
-
-            let mcp_config = McpServerConfig {
-                name: server_config.name.clone(),
-                transport,
-                timeout_secs: server_config.timeout_secs,
-                env: server_config.env.clone(),
-                headers: server_config.headers.clone(),
-            };
-
             self.extension_health.register(&server_config.name);
 
-            match McpConnection::connect(mcp_config).await {
-                Ok(conn) => {
-                    let tool_count = conn.tools().len();
-                    self.extension_health
-                        .report_ok(&server_config.name, tool_count);
+            match self.connect_one_mcp(server_config).await {
+                Ok(tool_count) => {
                     info!(
                         server = %server_config.name,
                         tools = tool_count,
                         "Extension MCP server connected (hot-reload)"
                     );
-                    self.install_mcp_connection(conn).await;
                     connected_count += 1;
                 }
-                Err(e) => {
-                    self.extension_health
-                        .report_error(&server_config.name, e.to_string());
+                Err(shown) => {
                     warn!(
                         server = %server_config.name,
-                        error = %e,
+                        error = %shown,
                         "Failed to connect extension MCP server"
                     );
                 }
@@ -6186,9 +6258,6 @@ impl OpenFangKernel {
 
     /// Reconnect a single extension MCP server by ID.
     pub async fn reconnect_extension_mcp(self: &Arc<Self>, id: &str) -> Result<usize, String> {
-        use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
-        use openfang_types::config::McpTransportEntry;
-
         let _lifecycle_guard = self.mcp_lifecycle.lock().await;
 
         // Find the config for this server
@@ -6209,39 +6278,16 @@ impl OpenFangKernel {
 
         self.extension_health.mark_reconnecting(id);
 
-        let transport = match &server_config.transport {
-            McpTransportEntry::Stdio { command, args } => McpTransport::Stdio {
-                command: command.clone(),
-                args: args.clone(),
-            },
-            McpTransportEntry::Sse { url } => McpTransport::Sse { url: url.clone() },
-            McpTransportEntry::Http { url } => McpTransport::Http { url: url.clone() },
-        };
-
-        let mcp_config = McpServerConfig {
-            name: server_config.name.clone(),
-            transport,
-            timeout_secs: server_config.timeout_secs,
-            env: server_config.env.clone(),
-            headers: server_config.headers.clone(),
-        };
-
-        match McpConnection::connect(mcp_config).await {
-            Ok(conn) => {
-                let tool_count = conn.tools().len();
-                self.extension_health.report_ok(id, tool_count);
+        match self.connect_one_mcp(&server_config).await {
+            Ok(tool_count) => {
                 info!(
                     server = %id,
                     tools = tool_count,
                     "Extension MCP server reconnected"
                 );
-                self.install_mcp_connection(conn).await;
                 Ok(tool_count)
             }
-            Err(e) => {
-                self.extension_health.report_error(id, e.to_string());
-                Err(format!("Reconnect failed for '{id}': {e}"))
-            }
+            Err(shown) => Err(format!("Reconnect failed for '{id}': {shown}")),
         }
     }
 
@@ -6425,7 +6471,11 @@ impl OpenFangKernel {
         }
 
         // Step 3: Add MCP tools (filtered by agent's MCP server allowlist,
-        // then by declared tools).
+        // then by declared tools). Integrations are opt-in: they are never part
+        // of "empty allowlist = all servers". Read the integration ids before
+        // taking the MCP cache locks.
+        let integration_ids: std::collections::HashSet<String> =
+            self.installed_integration_ids().into_iter().collect();
         if let Ok(mcp_tools) = self.mcp_tools.lock() {
             if let Ok(mcp_tool_origins) = self.mcp_tool_origins.lock() {
                 if let Ok(connected_servers) = self.mcp_connected_servers.lock() {
@@ -6455,9 +6505,11 @@ impl OpenFangKernel {
                         {
                             continue;
                         }
-                        if !mcp_allowlist.is_empty()
-                            && !mcp_allowlist.iter().any(|allowed| allowed == actual_server)
-                        {
+                        if !crate::integrations::mcp_server_visible(
+                            actual_server,
+                            &mcp_allowlist,
+                            integration_ids.contains(actual_server.as_str()),
+                        ) {
                             continue;
                         }
                         // If agent declares specific tools, only include matching MCP tools.
@@ -7820,6 +7872,7 @@ impl KernelHandle for OpenFangKernel {
 
     fn requires_approval(&self, tool_name: &str) -> bool {
         self.approval_manager.requires_approval(tool_name)
+            || self.integration_requires_approval(tool_name)
     }
 
     async fn request_approval(
@@ -8312,6 +8365,157 @@ mod tests {
             )
             .expect_err("tool-only rejects streaming agent execution");
         assert!(error.to_string().contains("tool_only"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn integration_with_missing_key_is_marked_and_not_connected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("integrations");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.toml"),
+            r#"
+id = "probe"
+name = "Probe"
+description = "Testvorlage"
+category = "devtools"
+[transport]
+type = "http"
+url = "http://127.0.0.1:9/mcp"
+[[auth_headers]]
+name = "Authorization"
+format = "Bearer {credential}"
+credential = "PROBE_KEY_NOT_SET_ANYWHERE"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("integrations.toml"),
+            "[[installed]]\nid = \"probe\"\ninstalled_at = \"2026-10-06T00:00:00Z\"\nenabled = true\n",
+        )
+        .unwrap();
+        let mut config = KernelConfig {
+            home_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().join("data"),
+            ..KernelConfig::default()
+        };
+        config.extensions.template_dirs = vec![dir];
+        config.runtime.tool_only = true;
+        let kernel = Arc::new(OpenFangKernel::boot_with_config(config).unwrap());
+        kernel.set_self_handle();
+        kernel.connect_mcp_servers().await;
+        let h = kernel
+            .extension_health
+            .get_health("probe")
+            .expect("registered");
+        assert_eq!(h.status.zustand(), "fehlt_schluessel");
+        assert_eq!(
+            h.last_error.as_deref(),
+            Some("fehlende Schluessel: PROBE_KEY_NOT_SET_ANYWHERE")
+        );
+        assert!(std::env::var("PROBE_KEY_NOT_SET_ANYWHERE").is_err());
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn integration_tools_need_approval_and_are_opt_in_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("integrations");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.toml"),
+            r#"
+id = "probe"
+name = "Probe"
+description = "Testvorlage"
+category = "devtools"
+read_only_tools = ["get_me"]
+[transport]
+type = "http"
+url = "http://127.0.0.1:9/mcp"
+[[auth_headers]]
+name = "Authorization"
+format = "Bearer {credential}"
+credential = "PROBE_KEY_NOT_SET_ANYWHERE"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("integrations.toml"),
+            "[[installed]]\nid = \"probe\"\ninstalled_at = \"2026-10-06T00:00:00Z\"\nenabled = true\n",
+        )
+        .unwrap();
+        let mut config = KernelConfig {
+            home_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().join("data"),
+            ..KernelConfig::default()
+        };
+        config.extensions.template_dirs = vec![dir];
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        let tool = |name: &str| ToolDefinition {
+            name: name.to_string(),
+            description: "test".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        kernel.replace_mcp_tool_cache(&[
+            (
+                "probe".to_string(),
+                vec![tool("mcp_probe_get_me"), tool("mcp_probe_create_issue")],
+            ),
+            ("rowboat".to_string(), vec![tool("mcp_rowboat_status")]),
+        ]);
+
+        // Approval: read-only tool free, every other integration tool gated,
+        // plain MCP servers unchanged, uncached integration-prefixed names gated.
+        assert!(!kernel.integration_requires_approval("mcp_probe_get_me"));
+        assert!(kernel.integration_requires_approval("mcp_probe_create_issue"));
+        assert!(kernel.integration_requires_approval("mcp_probe_appeared_later"));
+        assert!(!kernel.integration_requires_approval("mcp_rowboat_status"));
+        assert!(!kernel.integration_requires_approval("file_read"));
+        assert!(KernelHandle::requires_approval(&kernel, "mcp_probe_create_issue"));
+        assert!(!KernelHandle::requires_approval(&kernel, "mcp_probe_get_me"));
+
+        // Visibility: integrations are opt-in, plain servers keep "empty = all".
+        let register = |name: &str, servers: Vec<String>| {
+            let mut manifest = test_manifest(name, "visibility test", vec![]);
+            manifest.mcp_servers = servers;
+            let agent_id = AgentId::new();
+            kernel
+                .registry
+                .register(AgentEntry {
+                    id: agent_id,
+                    name: manifest.name.clone(),
+                    manifest,
+                    state: AgentState::Running,
+                    mode: AgentMode::default(),
+                    created_at: chrono::Utc::now(),
+                    last_active: chrono::Utc::now(),
+                    parent: None,
+                    children: vec![],
+                    session_id: SessionId::new(),
+                    tags: vec![],
+                    identity: Default::default(),
+                    onboarding_completed: false,
+                    onboarding_completed_at: None,
+                })
+                .unwrap();
+            agent_id
+        };
+        let names = |agent_id| -> Vec<String> {
+            kernel
+                .available_tools(agent_id)
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        let plain = names(register("plain-agent", vec![]));
+        assert!(plain.contains(&"mcp_rowboat_status".to_string()));
+        assert!(!plain.iter().any(|n| n.starts_with("mcp_probe_")));
+        let opted_in = names(register("probe-agent", vec!["probe".to_string()]));
+        assert!(opted_in.contains(&"mcp_probe_get_me".to_string()));
+        assert!(opted_in.contains(&"mcp_probe_create_issue".to_string()));
+        assert!(!opted_in.contains(&"mcp_rowboat_status".to_string()));
     }
 
     #[test]

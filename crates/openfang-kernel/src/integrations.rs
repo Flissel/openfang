@@ -89,6 +89,47 @@ pub fn integration_tool_requires_approval(tool_name: &str, server: &str, read_on
     !read_only_tools.iter().any(|ro| format_mcp_tool_name(server, ro) == tool_name)
 }
 
+/// Wem gehoert ein MCP-Werkzeug, aus Sicht der Freigabe?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owner {
+    /// Genau eine installierte Integration besitzt das Werkzeug.
+    Single(String),
+    /// Mehrere moegliche Besitzer: fail closed, Freigabe noetig.
+    Ambiguous,
+    /// Kein Integrations-Werkzeug (bestehendes Verhalten).
+    NotIntegration,
+}
+
+/// Bestimmt den Besitzer eines Werkzeugs. Massgeblich ist `origins` — die
+/// Server, deren Verbindung das Werkzeug registriert hat. Nur wenn es keinen
+/// Origin-Eintrag gibt, wird ueber das Namenspraefix `mcp_<id>_` der
+/// installierten Integrationen zugeordnet; passt es auf mehrere, ist das
+/// Ergebnis mehrdeutig.
+pub fn owning_integration(
+    origins: Option<&std::collections::HashSet<String>>,
+    tool_name: &str,
+    installed: &[String],
+) -> Owner {
+    if let Some(origins) = origins.filter(|o| !o.is_empty()) {
+        let mut iter = origins.iter();
+        return match (iter.next(), iter.next()) {
+            (Some(server), None) if installed.iter().any(|i| i == server) => {
+                Owner::Single(server.clone())
+            }
+            (Some(_), None) => Owner::NotIntegration,
+            _ => Owner::Ambiguous,
+        };
+    }
+    let mut matches = installed.iter().filter(|id| {
+        tool_name.starts_with(&format!("mcp_{}_", openfang_runtime::mcp::normalize_name(id)))
+    });
+    match (matches.next(), matches.next()) {
+        (None, _) => Owner::NotIntegration,
+        (Some(id), None) => Owner::Single(id.clone()),
+        (Some(_), Some(_)) => Owner::Ambiguous,
+    }
+}
+
 pub fn mcp_server_visible(server: &str, allowlist: &[String], is_integration: bool) -> bool {
     let listed = allowlist.iter().any(|a| a == server);
     if is_integration { listed } else { allowlist.is_empty() || listed }
@@ -182,6 +223,58 @@ mod tests {
         assert!(integration_tool_requires_approval("mcp_github_create_issue", "github", &ro));
         assert!(integration_tool_requires_approval("mcp_github_brand_new_tool", "github", &ro));
         assert!(integration_tool_requires_approval("mcp_github_get_me", "github", &[]));
+    }
+
+    fn set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn owner_comes_from_connection_origin_not_from_name_prefix() {
+        let installed = vec!["github".to_string()];
+        // Origin wins: a plain server owns a tool even if its name looks like an integration's.
+        assert_eq!(
+            owning_integration(Some(&set(&["rowboat"])), "mcp_github_create_issue", &installed),
+            Owner::NotIntegration
+        );
+        assert_eq!(
+            owning_integration(Some(&set(&["github"])), "mcp_github_create_issue", &installed),
+            Owner::Single("github".to_string())
+        );
+    }
+
+    #[test]
+    fn several_origins_are_ambiguous() {
+        let installed = vec!["github".to_string()];
+        assert_eq!(
+            owning_integration(Some(&set(&["github", "rowboat"])), "mcp_x_y", &installed),
+            Owner::Ambiguous
+        );
+        assert_eq!(
+            owning_integration(Some(&set(&["a", "b"])), "mcp_x_y", &installed),
+            Owner::Ambiguous
+        );
+    }
+
+    #[test]
+    fn prefix_fallback_only_without_origin_and_ambiguous_prefix_is_ambiguous() {
+        let installed = vec!["github".to_string(), "github-enterprise".to_string()];
+        assert_eq!(
+            owning_integration(None, "mcp_github_get_me", &installed),
+            Owner::Single("github".to_string())
+        );
+        assert_eq!(
+            owning_integration(Some(&set(&[])), "mcp_github_get_me", &installed),
+            Owner::Single("github".to_string())
+        );
+        // "mcp_github_enterprise_x" matches both "mcp_github_" and "mcp_github_enterprise_".
+        assert_eq!(
+            owning_integration(None, "mcp_github_enterprise_get_me", &installed),
+            Owner::Ambiguous
+        );
+        assert_eq!(owning_integration(None, "mcp_rowboat_status", &installed), Owner::NotIntegration);
+        assert_eq!(owning_integration(None, "shell_exec", &installed), Owner::NotIntegration);
+        assert_eq!(owning_integration(None, "mcp_github_get_me", &[]), Owner::NotIntegration);
     }
 
     #[test]
