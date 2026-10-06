@@ -1488,13 +1488,13 @@ impl AuthHeaderRef {
         let name_ok = !self.name.is_empty()
             && self.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
         if !name_ok {
-            return Err(format!("auth_headers: ungueltiger Header-Name '{}'", self.name));
+            return Err("auth_headers: ungueltiger Header-Name".into());
         }
         if self.format.matches("{credential}").count() != 1 {
             return Err("auth_headers: format braucht genau einen Platzhalter {credential}".into());
         }
         if !is_valid_credential_reference(&self.credential) {
-            return Err(format!("auth_headers: ungueltige Referenz '{}'", self.credential));
+            return Err("auth_headers: ungueltige Referenz".into());
         }
         Ok(())
     }
@@ -5012,6 +5012,17 @@ embedding_model = "text-embedding-3-small"
         assert!(bad_ref.validate().is_err());
         let bad_name = AuthHeaderRef { name: "Auth orization".into(), ..ok };
         assert!(bad_name.validate().is_err());
+    }
+
+    #[test]
+    fn auth_header_ref_errors_do_not_echo_values() {
+        let ok = AuthHeaderRef { name: "Authorization".into(), format: "Bearer {credential}".into(), credential: "GITHUB_PAT_TOKEN".into() };
+        let bad_ref = AuthHeaderRef { credential: "KANARIE-SECRET-1".into(), ..ok.clone() };
+        let e = bad_ref.validate().unwrap_err();
+        assert!(!e.contains("KANARIE"), "{e}");
+        let bad_name = AuthHeaderRef { name: "Auth KANARIE-SECRET-2".into(), ..ok };
+        let e = bad_name.validate().unwrap_err();
+        assert!(!e.contains("KANARIE"), "{e}");
     }
 
     #[test]

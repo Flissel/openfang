@@ -369,6 +369,35 @@ admission = "admitted"
     }
 
     #[test]
+    fn validation_messages_never_contain_values() {
+        let t: crate::IntegrationTemplate = toml::from_str(
+            &REMOTE
+                .replace("GITHUB_PAT_TOKEN\"\n[[required_env]]", "KANARIE-SECRET-1\"\n[[required_env]]")
+                .replace("name = \"Authorization\"", "name = \"Auth KANARIE-SECRET-2\""),
+        )
+        .unwrap();
+        let e = validate_template(&t).unwrap_err();
+        assert!(!e.contains("KANARIE"), "{e}");
+
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "a.toml",
+            &REMOTE.replace("credential = \"GITHUB_PAT_TOKEN\"", "credential = \"KANARIE-SECRET-1\""),
+        );
+        write(
+            dir.path(),
+            "b.toml",
+            &REMOTE.replace("name = \"Authorization\"", "name = \"Auth KANARIE-SECRET-2\""),
+        );
+        let mut reg = IntegrationRegistry::new(home.path());
+        let report = reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        assert_eq!(report.skipped.len(), 2);
+        assert!(report.skipped.iter().all(|(_, why)| !why.contains("KANARIE")));
+    }
+
+    #[test]
     fn auth_headers_on_stdio_are_rejected() {
         let mut t: crate::IntegrationTemplate = toml::from_str(REMOTE).unwrap();
         t.transport = crate::McpTransportTemplate::Stdio { command: "npx".into(), args: vec![] };
@@ -380,6 +409,7 @@ admission = "admitted"
         let home = tempfile::tempdir().unwrap();
         let mut reg = IntegrationRegistry::new(home.path());
         assert_eq!(reg.load_bundled(), 25);
+        assert_eq!(reg.template_count(), 25);
         for t in reg.list_templates() {
             assert!(validate_template(t).is_ok(), "{}", t.id);
             assert!(t.is_admitted());
