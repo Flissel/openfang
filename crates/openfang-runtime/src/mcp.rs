@@ -21,7 +21,7 @@ use tracing::{debug, info};
 // ---------------------------------------------------------------------------
 
 /// Configuration for an MCP server connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     /// Display name for this server (used in tool namespacing).
     pub name: String,
@@ -39,6 +39,27 @@ pub struct McpServerConfig {
     /// or any custom headers required by a remote MCP server.
     #[serde(default)]
     pub headers: Vec<String>,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    /// Header values may carry credentials, so only the header names are shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<String> = self
+            .headers
+            .iter()
+            .map(|h| match h.split_once(':') {
+                Some((name, _)) => format!("{}: <redacted>", name.trim()),
+                None => "<redacted>".to_string(),
+            })
+            .collect();
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("env", &self.env)
+            .field("headers", &headers)
+            .finish()
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -298,16 +319,17 @@ impl McpConnection {
         // Parse custom headers (e.g., "Authorization: Bearer <token>").
         let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
         for header_str in headers {
-            if let Some((name, value)) = header_str.split_once(':') {
-                let name = name.trim();
-                let value = value.trim();
-                if let (Ok(hn), Ok(hv)) = (
-                    HeaderName::from_bytes(name.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    custom_headers.insert(hn, hv);
-                }
-            }
+            let Some((name, value)) = header_str.split_once(':') else {
+                return Err("MCP header invalid: <unnamed>".to_string());
+            };
+            let name = name.trim();
+            let value = value.trim();
+            let hn = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| format!("MCP header invalid: {name}"))?;
+            let mut hv = HeaderValue::from_str(value)
+                .map_err(|_| format!("MCP header invalid: {name}"))?;
+            hv.set_sensitive(true);
+            custom_headers.insert(hn, hv);
         }
 
         // rmcp 1.3+ marks StreamableHttpClientTransportConfig as #[non_exhaustive].
@@ -395,6 +417,39 @@ fn strip_mcp_prefix<'a>(server: &str, tool_name: &'a str) -> Option<&'a str> {
 /// Normalize a name for use in tool namespacing (lowercase, replace hyphens).
 pub fn normalize_name(name: &str) -> String {
     name.to_lowercase().replace('-', "_")
+}
+
+/// Grobe Einordnung eines Verbindungsfehlers fuer den Integrations-Status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectErrorClass {
+    KeyRejected,
+    Unreachable,
+    InvalidHeader,
+}
+
+pub fn classify_connect_error(message: &str) -> ConnectErrorClass {
+    let m = message.to_ascii_lowercase();
+    if m.contains("mcp header invalid") {
+        return ConnectErrorClass::InvalidHeader;
+    }
+    if m.contains("401")
+        || m.contains("403")
+        || m.contains("unauthorized")
+        || m.contains("forbidden")
+        || m.contains("auth required")
+    {
+        return ConnectErrorClass::KeyRejected;
+    }
+    ConnectErrorClass::Unreachable
+}
+
+/// Ersetzt jedes Vorkommen jedes (nicht leeren) Geheimnisses durch `<redacted>`.
+pub fn scrub_secrets(text: &str, secrets: &[&str]) -> String {
+    let mut out = text.to_string();
+    for s in secrets.iter().filter(|s| !s.is_empty()) {
+        out = out.replace(s, "<redacted>");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -537,5 +592,50 @@ mod tests {
             }
             _ => panic!("Expected Http transport"),
         }
+    }
+
+    #[test]
+    fn mcp_server_config_debug_redacts_header_values() {
+        let c = McpServerConfig {
+            name: "x".into(),
+            transport: McpTransport::Http { url: "https://example.com/mcp".into() },
+            timeout_secs: 30,
+            env: vec![],
+            headers: vec!["Authorization: Bearer KANARIE-456".into()],
+        };
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("KANARIE-456"), "{dbg}");
+        assert!(dbg.contains("Authorization"));
+    }
+
+    #[test]
+    fn classify_connect_error_maps_auth_and_network() {
+        assert_eq!(classify_connect_error("MCP HTTP connection failed: HTTP status 401 Unauthorized"), ConnectErrorClass::KeyRejected);
+        assert_eq!(classify_connect_error("... 403 Forbidden ..."), ConnectErrorClass::KeyRejected);
+        assert_eq!(classify_connect_error("Auth required"), ConnectErrorClass::KeyRejected);
+        assert_eq!(classify_connect_error("MCP header invalid: Authorization"), ConnectErrorClass::InvalidHeader);
+        assert_eq!(classify_connect_error("error trying to connect: dns error"), ConnectErrorClass::Unreachable);
+        assert_eq!(classify_connect_error("HTTP status 503"), ConnectErrorClass::Unreachable);
+    }
+
+    #[test]
+    fn scrub_secrets_removes_every_occurrence() {
+        let out = scrub_secrets("token ABC123 echoed ABC123", &["ABC123"]);
+        assert_eq!(out, "token <redacted> echoed <redacted>");
+        assert_eq!(scrub_secrets("nichts", &[""]), "nichts");
+    }
+
+    #[tokio::test]
+    async fn connect_http_rejects_header_with_newline_instead_of_dropping_it() {
+        let cfg = McpServerConfig {
+            name: "x".into(),
+            transport: McpTransport::Http { url: "http://127.0.0.1:9/mcp".into() },
+            timeout_secs: 2,
+            env: vec![],
+            headers: vec!["Authorization: Bearer a\r\nX-Evil: 1".into()],
+        };
+        let err = McpConnection::connect(cfg).await.err().expect("must fail");
+        assert!(err.contains("MCP header invalid: Authorization"), "{err}");
+        assert!(!err.contains("Bearer a"), "{err}");
     }
 }
