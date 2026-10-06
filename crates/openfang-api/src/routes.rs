@@ -9656,27 +9656,26 @@ pub async fn remove_integration(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Scope the write lock
-    let uninstall_err = {
-        let mut registry = state
-            .kernel
-            .extension_registry
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        registry.uninstall(&id).err()
-    };
-
-    if let Some(e) = uninstall_err {
+    // Disconnect first, then uninstall — all inside the kernel's MCP lifecycle
+    // lock, so the integration's tools never count as plain MCP tools.
+    let installed = state
+        .kernel
+        .extension_registry
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_installed(&id);
+    if !installed {
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": format!("Integration not installed: {id}")})),
         );
     }
-
-    state.kernel.extension_health.unregister(&id);
-
-    // Hot-disconnect the removed MCP server
-    let _ = state.kernel.reload_extension_mcps().await;
+    if let Err(e) = state.kernel.remove_integration(&id).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        );
+    }
 
     (
         StatusCode::OK,

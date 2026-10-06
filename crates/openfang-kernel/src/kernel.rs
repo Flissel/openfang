@@ -124,6 +124,10 @@ pub struct OpenFangKernel {
     pub running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
     /// Serializes complete MCP lifecycle operations across connect/reload/reconnect.
     mcp_lifecycle: tokio::sync::Mutex<()>,
+    /// Server names of live connections that came from an installed
+    /// integration. Ownership checks treat these as integrations even if the
+    /// registry entry is already gone (fail closed against ordering races).
+    integration_servers: std::sync::RwLock<std::collections::HashSet<String>>,
     /// MCP server connections (lazily initialized at start_background_agents).
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
@@ -1277,6 +1281,7 @@ impl OpenFangKernel {
             skill_config_overrides: std::sync::RwLock::new(None),
             running_tasks: dashmap::DashMap::new(),
             mcp_lifecycle: tokio::sync::Mutex::new(()),
+            integration_servers: std::sync::RwLock::new(std::collections::HashSet::new()),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
             mcp_tool_origins: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -5994,6 +5999,15 @@ impl OpenFangKernel {
             .collect();
         self.replace_mcp_tool_cache(&remaining);
         connections.retain(|connection| !removed.iter().any(|name| name == connection.name()));
+        drop(connections);
+        // Only after the cache no longer carries their tools.
+        let mut integration_servers = self
+            .integration_servers
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        for name in removed {
+            integration_servers.remove(name);
+        }
     }
 
     /// Single connection path for boot, reload and reconnect.
@@ -6045,6 +6059,24 @@ impl OpenFangKernel {
         match openfang_runtime::mcp::McpConnection::connect(built.config).await {
             Ok(conn) => {
                 let tool_count = conn.tools().len();
+                // Mark integration origin before the tools become visible, so
+                // ownership never depends on the registry alone.
+                let from_integration = self
+                    .extension_registry
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_installed(&server_config.name)
+                    && !self
+                        .config
+                        .mcp_servers
+                        .iter()
+                        .any(|s| s.name == server_config.name);
+                if from_integration {
+                    self.integration_servers
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(server_config.name.clone());
+                }
                 self.extension_health
                     .report_ok(&server_config.name, tool_count);
                 self.install_mcp_connection(conn).await;
@@ -6060,18 +6092,34 @@ impl OpenFangKernel {
         }
     }
 
-    /// Ids of every installed integration (enabled or not) with a known template.
+    /// Ids of every installed integration (enabled or not) with a known
+    /// template, plus every live connection that came from an integration.
+    /// The union fails closed: a server stays an integration while either the
+    /// registry or the connection set says so.
     fn installed_integration_ids(&self) -> Vec<String> {
-        let registry = self
-            .extension_registry
+        let mut ids: Vec<String> = {
+            let registry = self
+                .extension_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            registry
+                .list_templates()
+                .into_iter()
+                .filter(|t| registry.is_installed(&t.id))
+                .map(|t| t.id.clone())
+                .collect()
+        };
+        for name in self
+            .integration_servers
             .read()
-            .unwrap_or_else(|e| e.into_inner());
-        registry
-            .list_templates()
-            .into_iter()
-            .filter(|t| registry.is_installed(&t.id))
-            .map(|t| t.id.clone())
-            .collect()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if !ids.contains(name) {
+                ids.push(name.clone());
+            }
+        }
+        ids
     }
 
     /// Ownership of a tool from the integrations' point of view. Shared by the
@@ -6260,6 +6308,53 @@ impl OpenFangKernel {
             removed.len()
         );
         Ok(connected_count)
+    }
+
+    /// Remove an installed integration without a fail-open window.
+    ///
+    /// Under the MCP lifecycle lock: first disconnect the server and rebuild
+    /// the tool cache (its tools are gone before the registry forgets that it
+    /// was an integration), unregister health, then uninstall and save, and
+    /// finally publish the new effective MCP server list.
+    pub async fn remove_integration(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        let _lifecycle_guard = self.mcp_lifecycle.lock().await;
+
+        if !self
+            .extension_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_installed(id)
+        {
+            return Err(format!("Integration not installed: {id}"));
+        }
+
+        // 1. Disconnect + rebuild cache, unregister health.
+        self.remove_mcp_connections_and_rebuild_cache(&[id.to_string()])
+            .await;
+        self.extension_health.unregister(id);
+
+        // 2. Only now uninstall in the registry (saves integrations.toml).
+        let new_configs = {
+            let mut registry = self
+                .extension_registry
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            registry.uninstall(id).map_err(|e| e.to_string())?;
+            let mut all = self.config.mcp_servers.clone();
+            for ext_cfg in registry.to_mcp_configs() {
+                if !all.iter().any(|s| s.name == ext_cfg.name) {
+                    all.push(ext_cfg);
+                }
+            }
+            all
+        };
+
+        // 3. Publish the new effective list.
+        if let Ok(mut effective) = self.effective_mcp_servers.write() {
+            *effective = new_configs;
+        }
+        info!(server = %id, "Integration removed and disconnected");
+        Ok(())
     }
 
     /// Reconnect a single extension MCP server by ID.
@@ -8543,6 +8638,157 @@ credential = "PROBE_KEY_NOT_SET_ANYWHERE"
         assert!(opted_in.contains(&"mcp_probe_get_me".to_string()));
         assert!(opted_in.contains(&"mcp_probe_create_issue".to_string()));
         assert!(!opted_in.contains(&"mcp_rowboat_status".to_string()));
+    }
+
+    /// Boots a tool-only kernel with an installed `probe` integration from a
+    /// template folder. `admission` is written into the template's catalog.
+    fn probe_kernel(admission: &str) -> (tempfile::TempDir, Arc<OpenFangKernel>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("integrations");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("probe.toml"),
+            format!(
+                r#"
+id = "probe"
+name = "Probe"
+description = "Testvorlage"
+category = "devtools"
+read_only_tools = ["get_me"]
+[transport]
+type = "http"
+url = "http://127.0.0.1:9/mcp"
+[[auth_headers]]
+name = "Authorization"
+format = "Bearer {{credential}}"
+credential = "PROBE_KEY_NOT_SET_ANYWHERE"
+[catalog]
+admission = "{admission}"
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("integrations.toml"),
+            "[[installed]]\nid = \"probe\"\ninstalled_at = \"2026-10-06T00:00:00Z\"\nenabled = true\n",
+        )
+        .unwrap();
+        let mut config = KernelConfig {
+            home_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().join("data"),
+            ..KernelConfig::default()
+        };
+        config.extensions.template_dirs = vec![dir];
+        config.runtime.tool_only = true;
+        let kernel = Arc::new(OpenFangKernel::boot_with_config(config).unwrap());
+        kernel.set_self_handle();
+        (tmp, kernel)
+    }
+
+    fn probe_tools() -> Vec<ToolDefinition> {
+        ["mcp_probe_get_me", "mcp_probe_create_issue"]
+            .iter()
+            .map(|n| ToolDefinition {
+                name: n.to_string(),
+                description: "test".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            })
+            .collect()
+    }
+
+    fn register_plain_agent(kernel: &OpenFangKernel, name: &str) -> AgentId {
+        let manifest = test_manifest(name, "visibility test", vec![]);
+        let agent_id = AgentId::new();
+        kernel
+            .registry
+            .register(AgentEntry {
+                id: agent_id,
+                name: manifest.name.clone(),
+                manifest,
+                state: AgentState::Running,
+                mode: AgentMode::default(),
+                created_at: chrono::Utc::now(),
+                last_active: chrono::Utc::now(),
+                parent: None,
+                children: vec![],
+                session_id: SessionId::new(),
+                tags: vec![],
+                identity: Default::default(),
+                onboarding_completed: false,
+                onboarding_completed_at: None,
+            })
+            .unwrap();
+        agent_id
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_integration_disconnects_before_uninstall_and_reports_errors() {
+        let (_tmp, kernel) = probe_kernel("admitted");
+        kernel.extension_health.register("probe");
+        kernel.replace_mcp_tool_cache(&[("probe".to_string(), probe_tools())]);
+        kernel
+            .integration_servers
+            .write()
+            .unwrap()
+            .insert("probe".to_string());
+
+        kernel.remove_integration("probe").await.expect("removed");
+
+        let cached: Vec<String> = kernel
+            .mcp_tools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert!(!cached.iter().any(|n| n.starts_with("mcp_probe_")), "{cached:?}");
+        assert!(!kernel
+            .extension_registry
+            .read()
+            .unwrap()
+            .is_installed("probe"));
+        assert!(kernel.extension_health.get_health("probe").is_none());
+        assert!(!kernel.integration_servers.read().unwrap().contains("probe"));
+        assert!(!kernel
+            .effective_mcp_servers
+            .read()
+            .unwrap()
+            .iter()
+            .any(|s| s.name == "probe"));
+
+        // A second removal is an error, not silently ignored.
+        assert!(kernel.remove_integration("probe").await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connected_integration_stays_gated_even_after_registry_uninstall() {
+        let (_tmp, kernel) = probe_kernel("admitted");
+        kernel.replace_mcp_tool_cache(&[("probe".to_string(), probe_tools())]);
+        kernel
+            .integration_servers
+            .write()
+            .unwrap()
+            .insert("probe".to_string());
+        // Simulate the old ordering: registry entry gone, connection still live.
+        kernel
+            .extension_registry
+            .write()
+            .unwrap()
+            .uninstall("probe")
+            .unwrap();
+
+        assert!(kernel.integration_requires_approval("mcp_probe_create_issue"));
+        assert!(KernelHandle::is_integration_tool(
+            kernel.as_ref(),
+            "mcp_probe_create_issue"
+        ));
+        let agent = register_plain_agent(&kernel, "plain-agent");
+        let names: Vec<String> = kernel
+            .available_tools(agent)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(!names.iter().any(|n| n.starts_with("mcp_probe_")), "{names:?}");
     }
 
     #[test]

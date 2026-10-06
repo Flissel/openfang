@@ -139,6 +139,10 @@ async fn harness(template_body: String) -> Harness {
             axum::routing::get(routes::list_available_integrations),
         )
         .route(
+            "/api/integrations/{id}",
+            axum::routing::delete(routes::remove_integration),
+        )
+        .route(
             "/api/integrations/{id}/reconnect",
             post(routes::reconnect_integration),
         )
@@ -227,6 +231,32 @@ async fn connected_with_env_key_and_value_never_leaks() {
         .state
         .kernel
         .integration_requires_approval("mcp_probe_create_issue"));
+
+    // Entfernen: danach keine Werkzeuge mehr im Cache, nicht mehr installiert.
+    let del = |h: &Harness| {
+        reqwest::Client::new()
+            .delete(format!("{}/api/integrations/probe", h.base))
+            .send()
+    };
+    assert_eq!(del(&h).await.unwrap().status().as_u16(), 200);
+    let cached: Vec<String> = h
+        .state
+        .kernel
+        .mcp_tools
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert!(!cached.iter().any(|n| n.starts_with("mcp_probe_")), "{cached:?}");
+    assert!(!h
+        .state
+        .kernel
+        .extension_registry
+        .read()
+        .unwrap()
+        .is_installed("probe"));
+    assert_eq!(del(&h).await.unwrap().status().as_u16(), 404);
 }
 
 #[tokio::test(flavor = "multi_thread")]
