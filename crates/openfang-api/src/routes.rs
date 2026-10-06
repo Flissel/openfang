@@ -9493,12 +9493,32 @@ pub async fn list_integrations(State(state): State<Arc<AppState>>) -> impl IntoR
             },
             None => continue, // Only show installed
         };
+        // Only names leave the API: the health status already carries scrubbed text.
+        let (zustand, detail) = match &info.installed {
+            Some(inst) if !inst.enabled => (
+                openfang_extensions::IntegrationStatus::Disabled.zustand(),
+                None,
+            ),
+            _ => {
+                let st = h
+                    .as_ref()
+                    .map(|h| h.status.clone())
+                    .unwrap_or(openfang_extensions::IntegrationStatus::Setup);
+                (st.zustand(), st.detail())
+            }
+        };
         entries.push(serde_json::json!({
             "id": info.template.id,
             "name": info.template.name,
             "icon": info.template.icon,
             "category": info.template.category.to_string(),
             "status": status,
+            "zustand": zustand,
+            "detail": detail,
+            "auth_headers": info.template.auth_headers.iter().map(|a| serde_json::json!({
+                "name": a.name,
+                "credential": a.credential,
+            })).collect::<Vec<_>>(),
             "tool_count": h.as_ref().map(|h| h.tool_count).unwrap_or(0),
             "installed_at": info.installed.as_ref().map(|i| i.installed_at.to_rfc3339()),
         }));
@@ -9582,6 +9602,12 @@ pub async fn add_integration(
                 StatusCode::NOT_FOUND,
                 format!("Unknown integration: '{}'", id),
             ))
+        } else if registry
+            .get_template(&id)
+            .map(|t| !t.is_admitted())
+            .unwrap_or(false)
+        {
+            Some((StatusCode::CONFLICT, "integration_not_admitted".to_string()))
         } else {
             let entry = openfang_extensions::InstalledIntegration {
                 id: id.clone(),
@@ -9605,12 +9631,20 @@ pub async fn add_integration(
 
     // Hot-connect the new MCP server
     let connected = state.kernel.reload_extension_mcps().await.unwrap_or(0);
+    let st = state
+        .kernel
+        .extension_health
+        .get_health(&id)
+        .map(|h| h.status)
+        .unwrap_or(openfang_extensions::IntegrationStatus::Setup);
 
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
             "id": id,
             "status": "installed",
+            "zustand": st.zustand(),
+            "detail": st.detail(),
             "connected": connected > 0,
             "message": format!("Integration '{}' installed", id),
         })),
@@ -9703,6 +9737,8 @@ pub async fn integrations_health(State(state): State<Arc<AppState>>) -> impl Int
             serde_json::json!({
                 "id": h.id,
                 "status": h.status.to_string(),
+                "zustand": h.status.zustand(),
+                "detail": h.status.detail(),
                 "tool_count": h.tool_count,
                 "last_ok": h.last_ok.map(|t| t.to_rfc3339()),
                 "last_error": h.last_error,
