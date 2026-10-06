@@ -8006,6 +8006,14 @@ impl KernelHandle for OpenFangKernel {
         )
     }
 
+    fn report_integration_key_rejected(&self, tool_name: &str) {
+        if let crate::integrations::Owner::Single(id) = self.integration_owner(tool_name) {
+            self.extension_health
+                .report_status(&id, openfang_extensions::IntegrationStatus::KeyRejected);
+            warn!(integration = %id, "Integration: Schluessel beim Werkzeugaufruf abgelehnt");
+        }
+    }
+
     fn record_integration_call(&self, agent_id: &str, tool_name: &str, approval: &str, outcome: &str) {
         self.audit_log.record(
             agent_id.to_string(),
@@ -8811,6 +8819,21 @@ admission = "{admission}"
             .await
             .iter()
             .all(|c| c.name() != "probe"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn key_rejection_during_tool_call_marks_owning_integration() {
+        let (_tmp, kernel) = probe_kernel("admitted");
+        kernel.extension_health.register("probe");
+        kernel.extension_health.report_ok("probe", 2);
+        kernel.replace_mcp_tool_cache(&[("probe".to_string(), probe_tools())]);
+        KernelHandle::report_integration_key_rejected(kernel.as_ref(), "mcp_probe_create_issue");
+        assert_eq!(
+            kernel.extension_health.get_health("probe").map(|h| h.status.zustand()),
+            Some("schluessel_abgelehnt")
+        );
+        // Not an integration tool: nothing happens.
+        KernelHandle::report_integration_key_rejected(kernel.as_ref(), "file_read");
     }
 
     #[tokio::test(flavor = "multi_thread")]

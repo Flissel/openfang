@@ -167,6 +167,13 @@ pub async fn execute_tool(
     }
 
     let mut approval_mode = "read_only";
+    // Without a kernel handle there is no approval gate, also not for
+    // integration MCP tools. Behaviour deliberately unchanged, and safe in
+    // the daemon: integration connections live in the kernel, the MCP hub and
+    // API pass `Some(kernel)` explicitly, and the agent loop gets the kernel's
+    // self handle, which the daemon sets at boot before serving. `None` only
+    // occurs in tests/embedders without a kernel, which hold no integration
+    // connection to reach.
     if let Some(kh) = kernel {
         if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
@@ -541,6 +548,9 @@ pub async fn execute_tool(
                 // branch produced the result. Tool name + approval outcome
                 // only, never inputs or outputs.
                 if let Some(kh) = kernel {
+                    if let Err(e) = &mcp_result {
+                        report_integration_call_error(kh.as_ref(), other, e);
+                    }
                     if kh.is_integration_tool(other) {
                         kh.record_integration_call(
                             caller_agent_id.unwrap_or("unknown"),
@@ -595,6 +605,17 @@ pub async fn execute_tool(
             content: format!("Error: {err}"),
             is_error: true,
         },
+    }
+}
+
+/// If an integration tool call failed because the vendor rejected the key
+/// (HTTP 401/403), tell the kernel so the integration shows
+/// `schluessel_abgelehnt`. Only the tool name crosses; the error text stays here.
+fn report_integration_call_error(kh: &dyn KernelHandle, tool_name: &str, err: &str) {
+    if kh.is_integration_tool(tool_name)
+        && mcp::classify_connect_error(err) == mcp::ConnectErrorClass::KeyRejected
+    {
+        kh.report_integration_key_rejected(tool_name);
     }
 }
 
@@ -5253,6 +5274,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<(String, String, String)>>,
         requires: bool,
         approve: bool,
+        rejected: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -5326,6 +5348,9 @@ mod tests {
         fn is_integration_tool(&self, t: &str) -> bool {
             t.starts_with("mcp_github_")
         }
+        fn report_integration_key_rejected(&self, tool_name: &str) {
+            self.rejected.lock().unwrap().push(tool_name.to_string());
+        }
         fn record_integration_call(&self, _a: &str, t: &str, approval: &str, outcome: &str) {
             self.calls
                 .lock()
@@ -5340,6 +5365,7 @@ mod tests {
             calls: Default::default(),
             requires: true,
             approve: false,
+            rejected: Default::default(),
         });
         let k: Arc<dyn KernelHandle> = rec.clone();
         let result = execute_tool(
@@ -5372,6 +5398,7 @@ mod tests {
             calls: Default::default(),
             requires,
             approve,
+            rejected: Default::default(),
         });
         let k: Arc<dyn KernelHandle> = rec.clone();
         let conns: tokio::sync::Mutex<Vec<mcp::McpConnection>> = tokio::sync::Mutex::new(vec![]);
@@ -5435,5 +5462,25 @@ mod tests {
                 assert!(!field.contains("KANARIE-AUDIT"));
             }
         }
+    }
+
+    #[test]
+    fn key_rejection_on_integration_call_is_reported_to_kernel() {
+        let rec = Arc::new(RecordingKernel {
+            calls: Default::default(),
+            requires: false,
+            approve: false,
+            rejected: Default::default(),
+        });
+        let k: Arc<dyn KernelHandle> = rec.clone();
+        let rejected = "MCP tool call failed: unexpected server response: HTTP 401 Unauthorized";
+        report_integration_call_error(k.as_ref(), "mcp_github_get_me", rejected);
+        // Network errors and non-integration tools are not key rejections.
+        report_integration_call_error(k.as_ref(), "mcp_github_get_me", "error sending request: dns error");
+        report_integration_call_error(k.as_ref(), "mcp_rowboat_status", rejected);
+        assert_eq!(
+            rec.rejected.lock().unwrap().as_slice(),
+            &["mcp_github_get_me".to_string()]
+        );
     }
 }

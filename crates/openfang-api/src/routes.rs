@@ -8220,8 +8220,10 @@ pub async fn get_agent_mcp_servers(
             }
         }
     }
+    // Integrations are opt-in: an empty list means every plain MCP server,
+    // never an integration (spec 4.6).
     let mode = if entry.manifest.mcp_servers.is_empty() {
-        "all"
+        "all_except_integrations"
     } else {
         "allowlist"
     };
@@ -9499,13 +9501,11 @@ pub async fn list_integrations(State(state): State<Arc<AppState>>) -> impl IntoR
                 openfang_extensions::IntegrationStatus::Disabled.zustand(),
                 None,
             ),
-            _ => {
-                let st = h
-                    .as_ref()
-                    .map(|h| h.status.clone())
-                    .unwrap_or(openfang_extensions::IntegrationStatus::Setup);
-                (st.zustand(), st.detail())
-            }
+            _ => match h.as_ref() {
+                Some(h) => (h.status.zustand(), h.status.detail()),
+                // No health entry yet: we do not know — never claim a missing key.
+                None => ("unbekannt", None),
+            },
         };
         entries.push(serde_json::json!({
             "id": info.template.id,
@@ -13359,19 +13359,9 @@ fn remove_toml_section(content: &str, section: &str) -> String {
 // Credential issuance
 // ---------------------------------------------------------------------------
 
-/// `^[A-Za-z_][A-Za-z0-9_]{0,127}$` -- the shape a credential reference must
-/// have. Hand-rolled because this crate does not depend on `regex`.
-fn is_valid_credential_reference(reference: &str) -> bool {
-    if reference.is_empty() || reference.len() > 128 {
-        return false;
-    }
-    let mut chars = reference.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
+// The credential-reference shape lives in openfang-types, shared with the
+// integration templates' `auth_headers.credential` validation.
+use openfang_types::config::is_valid_credential_reference;
 
 /// Build a credential-endpoint response. Every response from this endpoint --
 /// success and refusal alike -- is marked `no-store` so no proxy or client

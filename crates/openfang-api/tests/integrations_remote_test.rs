@@ -139,6 +139,10 @@ async fn harness(template_body: String) -> Harness {
             axum::routing::get(routes::list_available_integrations),
         )
         .route(
+            "/api/agents/{id}/mcp_servers",
+            axum::routing::get(routes::get_agent_mcp_servers),
+        )
+        .route(
             "/api/integrations/reload",
             post(routes::reload_integrations),
         )
@@ -380,4 +384,65 @@ async fn vendor_503_body_never_leaves_the_daemon() {
     let rb = r.text().await.unwrap();
     assert!(!rb.contains(BODY_CANARY), "reconnect leaks body: {rb}");
     assert!(!rb.contains(CANARY), "reconnect leaks value: {rb}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn installed_without_health_entry_is_unknown_not_missing_key() {
+    let url = start_mini_mcp().await;
+    let h = harness(template(&url, "PROBE_KEY_EGAL", "admitted")).await;
+    // Direkt in der Registry installiert, ohne Gesundheits-Eintrag.
+    h.state
+        .kernel
+        .extension_registry
+        .write()
+        .unwrap()
+        .install(openfang_extensions::InstalledIntegration {
+            id: "probe".into(),
+            installed_at: chrono::Utc::now(),
+            enabled: true,
+            oauth_provider: None,
+            config: Default::default(),
+        })
+        .unwrap();
+    assert!(h.state.kernel.extension_health.get_health("probe").is_none());
+    let list: serde_json::Value =
+        serde_json::from_str(&body(&h, "/api/integrations").await).unwrap();
+    assert_eq!(list["installed"][0]["zustand"], "unbekannt", "{list}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_mcp_allowlist_is_reported_as_all_except_integrations() {
+    use openfang_types::agent::{AgentEntry, AgentId, AgentManifest, AgentMode, AgentState, SessionId};
+    let url = start_mini_mcp().await;
+    let h = harness(template(&url, "PROBE_KEY_EGAL", "admitted")).await;
+    let agent_id = AgentId::new();
+    let manifest = AgentManifest {
+        name: "plain-agent".into(),
+        ..Default::default()
+    };
+    h.state
+        .kernel
+        .registry
+        .register(AgentEntry {
+            id: agent_id,
+            name: manifest.name.clone(),
+            manifest,
+            state: AgentState::Running,
+            mode: AgentMode::default(),
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+            parent: None,
+            children: vec![],
+            session_id: SessionId::new(),
+            tags: vec![],
+            identity: Default::default(),
+            onboarding_completed: false,
+            onboarding_completed_at: None,
+        })
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_str(
+        &body(&h, &format!("/api/agents/{agent_id}/mcp_servers")).await,
+    )
+    .unwrap();
+    assert_eq!(info["mode"], "all_except_integrations", "{info}");
 }

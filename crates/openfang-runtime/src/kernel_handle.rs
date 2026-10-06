@@ -191,6 +191,13 @@ pub trait KernelHandle: Send + Sync {
         false
     }
 
+    /// An integration tool call failed because the vendor rejected the key
+    /// (HTTP 401/403). The kernel marks the owning integration as
+    /// `schluessel_abgelehnt`. Receives only the tool name. Default: no-op.
+    fn report_integration_key_rejected(&self, tool_name: &str) {
+        let _ = tool_name;
+    }
+
     /// Record one integration tool call in the audit log. `approval` is one of
     /// `read_only`, `freigabe_erteilt`, `freigabe_abgelehnt`; `outcome` one of
     /// `ok`, `fehler`, `denied`. Must never receive tool inputs or outputs.
