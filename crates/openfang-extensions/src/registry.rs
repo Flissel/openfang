@@ -13,6 +13,29 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+/// Prueft eine Vorlage auf Konsistenz (auth_headers nur bei http/sse, gueltige Felder).
+pub fn validate_template(t: &crate::IntegrationTemplate) -> Result<(), String> {
+    if !t.auth_headers.is_empty() {
+        match t.transport {
+            crate::McpTransportTemplate::Http { .. } | crate::McpTransportTemplate::Sse { .. } => {}
+            crate::McpTransportTemplate::Stdio { .. } => {
+                return Err("auth_headers nur bei http/sse erlaubt".into());
+            }
+        }
+    }
+    for h in &t.auth_headers {
+        h.validate()?;
+    }
+    Ok(())
+}
+
+/// Ergebnis des Ladens von Vorlagen-Ordnern.
+#[derive(Debug, Default)]
+pub struct TemplateDirReport {
+    pub loaded: usize,
+    pub skipped: Vec<(std::path::PathBuf, String)>,
+}
+
 /// The integration registry — holds all known templates and install state.
 pub struct IntegrationRegistry {
     /// All known templates (bundled + custom).
@@ -40,6 +63,10 @@ impl IntegrationRegistry {
         for (id, toml_content) in bundled {
             match toml::from_str::<IntegrationTemplate>(toml_content) {
                 Ok(template) => {
+                    if let Err(why) = validate_template(&template) {
+                        warn!("Bundled integration '{}' invalid: {}", id, why);
+                        continue;
+                    }
                     self.templates.insert(id.to_string(), template);
                 }
                 Err(e) => {
@@ -49,6 +76,46 @@ impl IntegrationRegistry {
         }
         debug!("Loaded {count} bundled integration template(s)");
         count
+    }
+
+    /// Vorlagen aus Ordnern laden; gleiche id ueberschreibt die eingebaute.
+    /// Ungueltige Dateien werden uebersprungen (Grund ohne Dateiinhalt).
+    pub fn load_template_dirs(&mut self, dirs: &[std::path::PathBuf]) -> TemplateDirReport {
+        let mut report = TemplateDirReport::default();
+        for dir in dirs {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    report.skipped.push((dir.clone(), format!("Ordner nicht lesbar: {}", e.kind())));
+                    continue;
+                }
+            };
+            let mut paths: Vec<_> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("toml"))
+                .collect();
+            paths.sort();
+            for path in paths {
+                let parsed = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("nicht lesbar: {}", e.kind()))
+                    .and_then(|s| {
+                        toml::from_str::<IntegrationTemplate>(&s)
+                            .map_err(|_| "TOML ungueltig".to_string())
+                    })
+                    .and_then(|t| validate_template(&t).map(|_| t));
+                match parsed {
+                    Ok(t) => {
+                        self.templates.insert(t.id.clone(), t);
+                        report.loaded += 1;
+                    }
+                    Err(why) => {
+                        warn!(file = %path.display(), reason = %why, "Integrations-Vorlage uebersprungen");
+                        report.skipped.push((path, why));
+                    }
+                }
+            }
+        }
+        report
     }
 
     /// Load installed state from integrations.toml.
@@ -195,18 +262,20 @@ impl IntegrationRegistry {
                         McpTransportEntry::Http { url: url.clone() }
                     }
                 };
-                let env: Vec<String> = template
-                    .required_env
-                    .iter()
-                    .map(|e| e.name.clone())
-                    .collect();
+                let is_remote =
+                    !matches!(template.transport, crate::McpTransportTemplate::Stdio { .. });
+                let env: Vec<String> = if is_remote {
+                    Vec::new()
+                } else {
+                    template.required_env.iter().map(|e| e.name.clone()).collect()
+                };
                 Some(McpServerConfigEntry {
                     name: inst.id.clone(),
                     transport,
                     timeout_secs: 30,
                     env,
                     headers: Vec::new(),
-                    auth_headers: Vec::new(),
+                    auth_headers: template.auth_headers.clone(),
                 })
             })
             .collect()
@@ -231,6 +300,99 @@ impl IntegrationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REMOTE: &str = r#"
+id = "github"
+name = "GitHub"
+description = "GitHub ueber den offiziellen Remote-MCP-Server"
+category = "devtools"
+read_only_tools = ["get_me"]
+[transport]
+type = "http"
+url = "https://api.githubcopilot.com/mcp/"
+[[auth_headers]]
+name = "Authorization"
+format = "Bearer {credential}"
+credential = "GITHUB_PAT_TOKEN"
+[[required_env]]
+name = "GITHUB_PAT_TOKEN"
+label = "GitHub PAT"
+help = "fein granuliert"
+[catalog]
+replaces_openai_plugin = "github"
+license = "MIT"
+admission = "admitted"
+"#;
+
+    fn write(dir: &std::path::Path, file: &str, body: &str) {
+        std::fs::write(dir.join(file), body).unwrap();
+    }
+
+    #[test]
+    fn folder_template_overrides_bundled_and_is_remote_without_env() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "github.toml", REMOTE);
+        let mut reg = IntegrationRegistry::new(home.path());
+        reg.load_bundled();
+        let report = reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        assert_eq!(report.loaded, 1);
+        assert!(report.skipped.is_empty());
+        let t = reg.get_template("github").unwrap();
+        assert!(matches!(t.transport, crate::McpTransportTemplate::Http { .. }));
+        reg.install(crate::InstalledIntegration {
+            id: "github".into(), installed_at: chrono::Utc::now(), enabled: true,
+            oauth_provider: None, config: Default::default(),
+        }).unwrap();
+        let cfgs = reg.to_mcp_configs();
+        let gh = cfgs.iter().find(|c| c.name == "github").unwrap();
+        assert!(gh.env.is_empty(), "remote template must not export env: {:?}", gh.env);
+        assert_eq!(gh.auth_headers.len(), 1);
+        assert_eq!(gh.auth_headers[0].credential, "GITHUB_PAT_TOKEN");
+        assert!(gh.headers.is_empty());
+    }
+
+    #[test]
+    fn invalid_folder_template_is_skipped_and_bundled_stays() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "github.toml", &REMOTE.replace("Bearer {credential}", "Bearer"));
+        write(dir.path(), "kaputt.toml", "das ist kein toml = = =");
+        let mut reg = IntegrationRegistry::new(home.path());
+        reg.load_bundled();
+        let report = reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        assert_eq!(report.loaded, 0);
+        assert_eq!(report.skipped.len(), 2);
+        assert!(report.skipped.iter().all(|(_, why)| !why.contains("Bearer")));
+        let t = reg.get_template("github").unwrap();
+        assert!(matches!(t.transport, crate::McpTransportTemplate::Stdio { .. }), "bundled stays active");
+    }
+
+    #[test]
+    fn auth_headers_on_stdio_are_rejected() {
+        let mut t: crate::IntegrationTemplate = toml::from_str(REMOTE).unwrap();
+        t.transport = crate::McpTransportTemplate::Stdio { command: "npx".into(), args: vec![] };
+        assert!(validate_template(&t).is_err());
+    }
+
+    #[test]
+    fn bundled_templates_unchanged_and_valid() {
+        let home = tempfile::tempdir().unwrap();
+        let mut reg = IntegrationRegistry::new(home.path());
+        assert_eq!(reg.load_bundled(), 25);
+        for t in reg.list_templates() {
+            assert!(validate_template(t).is_ok(), "{}", t.id);
+            assert!(t.is_admitted());
+            assert!(t.auth_headers.is_empty());
+        }
+    }
+
+    #[test]
+    fn review_required_template_is_not_admitted() {
+        let t: crate::IntegrationTemplate =
+            toml::from_str(&REMOTE.replace("admission = \"admitted\"", "admission = \"review_required\"")).unwrap();
+        assert!(!t.is_admitted());
+    }
 
     #[test]
     fn registry_load_bundled() {

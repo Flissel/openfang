@@ -1482,6 +1482,9 @@ pub struct AuthHeaderRef {
 
 impl AuthHeaderRef {
     pub fn validate(&self) -> Result<(), String> {
+        if self.name.chars().any(char::is_control) || self.format.chars().any(char::is_control) {
+            return Err("auth_headers: Steuerzeichen in Name oder Format nicht erlaubt".into());
+        }
         let name_ok = !self.name.is_empty()
             && self.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
         if !name_ok {
@@ -4982,6 +4985,19 @@ embedding_model = "text-embedding-3-small"
         let bad_ref = AuthHeaderRef { credential: "1BAD-REF".into(), ..ok.clone() };
         assert!(bad_ref.validate().is_err());
         let bad_name = AuthHeaderRef { name: "Auth orization".into(), ..ok };
+        assert!(bad_name.validate().is_err());
+    }
+
+    #[test]
+    fn auth_header_ref_rejects_control_characters() {
+        let ok = AuthHeaderRef { name: "Authorization".into(), format: "Bearer {credential}".into(), credential: "GITHUB_PAT_TOKEN".into() };
+        let crlf = AuthHeaderRef { format: "Bearer {credential}
+X-Evil: 1".into(), ..ok.clone() };
+        assert!(crlf.validate().is_err());
+        let tab = AuthHeaderRef { format: "Bearer	{credential}".into(), ..ok.clone() };
+        assert!(tab.validate().is_err());
+        let bad_name = AuthHeaderRef { name: "Authorization
+".into(), ..ok };
         assert!(bad_name.validate().is_err());
     }
 

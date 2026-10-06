@@ -146,6 +146,26 @@ impl Default for HealthCheckConfig {
     }
 }
 
+/// Zulassungsstatus einer Vorlage im Katalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Admission {
+    #[default]
+    Admitted,
+    ReviewRequired,
+}
+
+/// Katalog-Metadaten einer Vorlage.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CatalogMeta {
+    #[serde(default)]
+    pub replaces_openai_plugin: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub admission: Admission,
+}
+
 /// A bundled integration template — describes how to set up an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrationTemplate {
@@ -177,6 +197,21 @@ pub struct IntegrationTemplate {
     /// Health check configuration.
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// Header mit Werten aus dem Tresor (nur fuer http/sse).
+    #[serde(default)]
+    pub auth_headers: Vec<openfang_types::config::AuthHeaderRef>,
+    /// Originalnamen lesender Werkzeuge; alle anderen brauchen Freigabe.
+    #[serde(default)]
+    pub read_only_tools: Vec<String>,
+    /// Katalog-Metadaten (fehlt = zugelassen).
+    #[serde(default)]
+    pub catalog: Option<CatalogMeta>,
+}
+
+impl IntegrationTemplate {
+    pub fn is_admitted(&self) -> bool {
+        self.catalog.as_ref().map(|c| c.admission == Admission::Admitted).unwrap_or(true)
+    }
 }
 
 /// Status of an installed integration.
@@ -193,6 +228,35 @@ pub enum IntegrationStatus {
     Error(String),
     /// Disabled by user.
     Disabled,
+    /// Required keys are missing from the vault.
+    KeyMissing(Vec<String>),
+    /// The remote server rejected the key.
+    KeyRejected,
+    /// The remote server could not be reached.
+    Unreachable(String),
+    /// Template is not admitted in the catalog.
+    NotAdmitted,
+}
+
+impl IntegrationStatus {
+    pub fn zustand(&self) -> &'static str {
+        match self {
+            Self::Ready => "verbunden",
+            Self::Setup | Self::KeyMissing(_) => "fehlt_schluessel",
+            Self::KeyRejected => "schluessel_abgelehnt",
+            Self::Unreachable(_) | Self::Error(_) => "nicht_erreichbar",
+            Self::NotAdmitted => "nicht_zugelassen",
+            Self::Available => "verfuegbar",
+            Self::Disabled => "deaktiviert",
+        }
+    }
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::KeyMissing(names) => Some(format!("fehlende Schluessel: {}", names.join(", "))),
+            Self::Unreachable(msg) | Self::Error(msg) => Some(msg.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for IntegrationStatus {
@@ -203,6 +267,10 @@ impl std::fmt::Display for IntegrationStatus {
             Self::Available => write!(f, "Available"),
             Self::Error(msg) => write!(f, "Error: {msg}"),
             Self::Disabled => write!(f, "Disabled"),
+            Self::KeyMissing(names) => write!(f, "Key missing: {}", names.join(", ")),
+            Self::KeyRejected => write!(f, "Key rejected"),
+            Self::Unreachable(msg) => write!(f, "Unreachable: {msg}"),
+            Self::NotAdmitted => write!(f, "Not admitted"),
         }
     }
 }
@@ -244,6 +312,21 @@ pub struct IntegrationInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zustand_names_match_spec() {
+        assert_eq!(IntegrationStatus::Ready.zustand(), "verbunden");
+        assert_eq!(IntegrationStatus::KeyMissing(vec!["A".into()]).zustand(), "fehlt_schluessel");
+        assert_eq!(IntegrationStatus::Setup.zustand(), "fehlt_schluessel");
+        assert_eq!(IntegrationStatus::KeyRejected.zustand(), "schluessel_abgelehnt");
+        assert_eq!(IntegrationStatus::Unreachable("x".into()).zustand(), "nicht_erreichbar");
+        assert_eq!(IntegrationStatus::Error("x".into()).zustand(), "nicht_erreichbar");
+        assert_eq!(IntegrationStatus::NotAdmitted.zustand(), "nicht_zugelassen");
+        assert_eq!(
+            IntegrationStatus::KeyMissing(vec!["A".into(), "B".into()]).detail().as_deref(),
+            Some("fehlende Schluessel: A, B")
+        );
+    }
 
     #[test]
     fn category_display() {

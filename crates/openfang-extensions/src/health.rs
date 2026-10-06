@@ -71,6 +71,17 @@ impl IntegrationHealth {
         self.connected_since = None;
     }
 
+    /// Mark with an arbitrary status (detail becomes `last_error`).
+    pub fn mark_status(&mut self, status: IntegrationStatus) {
+        self.last_error = status.detail();
+        if !matches!(status, IntegrationStatus::Ready) {
+            self.connected_since = None;
+            self.consecutive_failures += 1;
+        }
+        self.status = status;
+        self.reconnecting = false;
+    }
+
     /// Mark as reconnecting.
     pub fn mark_reconnecting(&mut self) {
         self.reconnecting = true;
@@ -145,6 +156,13 @@ impl HealthMonitor {
         }
     }
 
+    /// Report an arbitrary status (key missing/rejected, unreachable, ...).
+    pub fn report_status(&self, id: &str, status: IntegrationStatus) {
+        if let Some(mut entry) = self.health.get_mut(id) {
+            entry.mark_status(status);
+        }
+    }
+
     /// Get health for a specific integration.
     pub fn get_health(&self, id: &str) -> Option<IntegrationHealth> {
         self.health.get(id).map(|e| e.clone())
@@ -168,7 +186,10 @@ impl HealthMonitor {
             return false;
         }
         if let Some(entry) = self.health.get(id) {
-            matches!(entry.status, IntegrationStatus::Error(_))
+            matches!(
+                entry.status,
+                IntegrationStatus::Error(_) | IntegrationStatus::Unreachable(_)
+            )
                 && entry.reconnect_attempts < self.config.max_reconnect_attempts
         } else {
             false
@@ -196,6 +217,19 @@ impl HealthMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_rejected_and_key_missing_are_not_auto_reconnected() {
+        let m = HealthMonitor::new(HealthMonitorConfig::default());
+        m.register("a");
+        m.report_status("a", IntegrationStatus::KeyRejected);
+        assert!(!m.should_reconnect("a"));
+        m.report_status("a", IntegrationStatus::KeyMissing(vec!["X".into()]));
+        assert!(!m.should_reconnect("a"));
+        m.report_status("a", IntegrationStatus::Unreachable("dns".into()));
+        assert!(m.should_reconnect("a"));
+        assert_eq!(m.get_health("a").unwrap().last_error.as_deref(), Some("dns"));
+    }
 
     #[test]
     fn health_monitor_register_report() {

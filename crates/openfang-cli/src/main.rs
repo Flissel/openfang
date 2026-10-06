@@ -5554,6 +5554,18 @@ fn cmd_integrations_list(query: Option<&str>) {
                 openfang_extensions::IntegrationStatus::Disabled => {
                     "[Disabled]".dimmed().to_string()
                 }
+                openfang_extensions::IntegrationStatus::KeyMissing(names) => {
+                    format!("[Key missing: {}]", names.join(", ")).yellow().to_string()
+                }
+                openfang_extensions::IntegrationStatus::KeyRejected => {
+                    "[Key rejected]".red().to_string()
+                }
+                openfang_extensions::IntegrationStatus::Unreachable(msg) => {
+                    format!("[Unreachable: {msg}]").red().to_string()
+                }
+                openfang_extensions::IntegrationStatus::NotAdmitted => {
+                    "[Not admitted]".dimmed().to_string()
+                }
             };
             println!(
                 "    {} {:<20} {:<12} {}",
