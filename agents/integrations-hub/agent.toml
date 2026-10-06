@@ -1,0 +1,14 @@
+name = "integrations-hub"
+version = "0.1.0"
+description = "Identitaet fuer Hub-Abnehmer (Claude Code, Spaces, Rowboat): sieht ausdruecklich zugewiesene Integrationen."
+author = "vibemind"
+module = "builtin:chat"
+tags = ["integrations", "hub"]
+mcp_servers = ["github"]
+
+[model]
+provider = "ollama"
+model = "qwen2.5-coder:7b"
+max_tokens = 1024
+temperature = 0.0
+system_prompt = "Du bist die Hub-Identitaet fuer Integrationen. Du fuehrst nur Werkzeugaufrufe aus, die dir ueber /mcp angetragen werden."

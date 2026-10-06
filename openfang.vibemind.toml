@@ -592,3 +592,7 @@ listen_path = "/a2a"
 [[a2a.external_agents]]
 name = "brain-bridge"
 url = "http://localhost:5100"
+
+
+[extensions]
+template_dirs = ["../integrations"]

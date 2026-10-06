@@ -397,6 +397,52 @@ admission = "admitted"
         assert!(report.skipped.iter().all(|(_, why)| !why.contains("KANARIE")));
     }
 
+    /// Exakte Kopie von vibemind-os/integrations/github.toml (Pilot-Vorlage).
+    const PILOT_GITHUB: &str = r##"id = "github"
+name = "GitHub"
+description = "GitHub ueber den offiziellen Remote-MCP-Server (GitHub Copilot MCP)"
+category = "devtools"
+icon = "🐙"
+tags = ["git", "code", "issues", "pull-requests"]
+read_only_tools = ["get_me", "search_repositories", "get_file_contents", "list_issues", "get_issue", "list_pull_requests", "get_pull_request"]
+
+[transport]
+type = "http"
+url = "https://api.githubcopilot.com/mcp/"
+
+[[auth_headers]]
+name = "Authorization"
+format = "Bearer {credential}"
+credential = "GITHUB_PAT_TOKEN"
+
+[[required_env]]
+name = "GITHUB_PAT_TOKEN"
+label = "GitHub Personal Access Token (fein granuliert)"
+help = "Fein granulierter Token; Rechte nach Bedarf, fuer get_me reichen keine"
+is_secret = true
+get_url = "https://github.com/settings/personal-access-tokens/new"
+
+[catalog]
+replaces_openai_plugin = "github"
+license = "MIT"
+admission = "admitted"
+"##;
+
+    #[test]
+    fn pilot_github_template_parses_and_validates() {
+        let t: crate::IntegrationTemplate = toml::from_str(PILOT_GITHUB).unwrap();
+        assert!(validate_template(&t).is_ok());
+        assert!(t.is_admitted());
+        match &t.transport {
+            crate::McpTransportTemplate::Http { url } => {
+                assert_eq!(url, "https://api.githubcopilot.com/mcp/")
+            }
+            other => panic!("expected http transport, got {other:?}"),
+        }
+        assert_eq!(t.auth_headers[0].credential, "GITHUB_PAT_TOKEN");
+        assert!(t.read_only_tools.iter().any(|n| n == "get_me"));
+    }
+
     #[test]
     fn auth_headers_on_stdio_are_rejected() {
         let mut t: crate::IntegrationTemplate = toml::from_str(REMOTE).unwrap();
