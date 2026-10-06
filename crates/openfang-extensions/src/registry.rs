@@ -32,8 +32,19 @@ pub fn validate_template(t: &crate::IntegrationTemplate) -> Result<(), String> {
 /// Ergebnis des Ladens von Vorlagen-Ordnern.
 #[derive(Debug, Default)]
 pub struct TemplateDirReport {
+    /// Geladene Vorlagen (Dateien).
     pub loaded: usize,
+    /// Uebersprungene Dateien und nicht lesbare Ordner (Pfad + Grund ohne Inhalt).
     pub skipped: Vec<(std::path::PathBuf, String)>,
+    /// Ordner, die fehlen oder nicht lesbar sind.
+    pub unreadable_dirs: usize,
+}
+
+impl TemplateDirReport {
+    /// Anzahl uebersprungener Vorlagen-Dateien (ohne nicht lesbare Ordner).
+    pub fn skipped_files(&self) -> usize {
+        self.skipped.len() - self.unreadable_dirs
+    }
 }
 
 /// The integration registry — holds all known templates and install state.
@@ -86,7 +97,13 @@ impl IntegrationRegistry {
             let entries = match std::fs::read_dir(dir) {
                 Ok(e) => e,
                 Err(e) => {
+                    warn!(
+                        dir = %dir.display(),
+                        kind = ?e.kind(),
+                        "Integrations-Vorlagen-Ordner nicht lesbar"
+                    );
                     report.skipped.push((dir.clone(), format!("Ordner nicht lesbar: {}", e.kind())));
+                    report.unreadable_dirs += 1;
                     continue;
                 }
             };
@@ -497,6 +514,19 @@ admission = "admitted"
         }).unwrap();
         assert!(reg.to_mcp_configs().iter().all(|c| c.name != "github"));
         assert_eq!(reg.not_admitted_installed(), vec!["github".to_string()]);
+    }
+
+    #[test]
+    fn missing_template_dir_is_counted_and_others_still_load() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "github.toml", REMOTE);
+        let missing = dir.path().join("gibt-es-nicht");
+        let mut reg = IntegrationRegistry::new(home.path());
+        let report = reg.load_template_dirs(&[missing, dir.path().to_path_buf()]);
+        assert_eq!(report.loaded, 1);
+        assert_eq!(report.unreadable_dirs, 1);
+        assert_eq!(report.skipped_files(), 0);
     }
 
     #[test]

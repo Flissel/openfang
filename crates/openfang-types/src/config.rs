@@ -700,8 +700,8 @@ pub struct ExtensionsConfig {
     pub reconnect_max_backoff_secs: u64,
     /// Health check interval in seconds.
     pub health_check_interval_secs: u64,
-    /// Zusaetzliche Ordner mit Integrations-Vorlagen (*.toml); relativ zum
-    /// Arbeitsverzeichnis des Daemons.
+    /// Zusaetzliche Ordner mit Integrations-Vorlagen (*.toml). Relative Pfade
+    /// gelten relativ zum Ordner der geladenen Konfigdatei.
     pub template_dirs: Vec<std::path::PathBuf>,
 }
 

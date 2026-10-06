@@ -77,7 +77,8 @@ pub fn load_config(path: Option<&Path>) -> KernelConfig {
                     lenient_extract_bindings(&mut root_value);
 
                     match root_value.try_into::<KernelConfig>() {
-                        Ok(config) => {
+                        Ok(mut config) => {
+                            resolve_template_dirs(&mut config, &config_dir);
                             info!(path = %config_path.display(), "Loaded configuration");
                             return config;
                         }
@@ -121,6 +122,17 @@ pub fn load_config(path: Option<&Path>) -> KernelConfig {
     }
 
     KernelConfig::default()
+}
+
+/// Relative `[extensions] template_dirs` gelten relativ zum Ordner der
+/// geladenen Konfigdatei, nicht zum Arbeitsverzeichnis des Prozesses.
+/// Ohne bekannte Konfigdatei (Defaults, Tests) bleibt alles unveraendert.
+fn resolve_template_dirs(config: &mut KernelConfig, config_dir: &Path) {
+    for dir in &mut config.extensions.template_dirs {
+        if dir.is_relative() {
+            *dir = config_dir.join(&*dir);
+        }
+    }
 }
 
 /// Resolve config includes by deep-merging included files into the root value.
@@ -367,6 +379,32 @@ mod tests {
     fn test_load_config_defaults() {
         let config = load_config(None);
         assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn relative_template_dirs_resolve_against_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("absolut");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[extensions]
+template_dirs = [\"integrations\", \"../nachbar\", {:?}]
+",
+                abs.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let config = load_config(Some(&path));
+        assert_eq!(
+            config.extensions.template_dirs,
+            vec![
+                tmp.path().join("integrations"),
+                tmp.path().join("../nachbar"),
+                abs,
+            ]
+        );
     }
 
     #[test]

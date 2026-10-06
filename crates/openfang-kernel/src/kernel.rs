@@ -998,11 +998,13 @@ impl OpenFangKernel {
         // Ordner-Vorlagen nach den eingebauten laden (gleiche id gewinnt).
         // Uebersprungene Dateien loggt die Registry selbst (Dateiname + Grund).
         let dir_report = extension_registry.load_template_dirs(&config.extensions.template_dirs);
-        if dir_report.loaded > 0 || !dir_report.skipped.is_empty() {
+        if !config.extensions.template_dirs.is_empty() {
             info!(
                 loaded = dir_report.loaded,
-                skipped = dir_report.skipped.len(),
-                "Integrations-Vorlagen aus Ordnern geladen"
+                skipped_files = dir_report.skipped_files(),
+                unreadable_dirs = dir_report.unreadable_dirs,
+                "{} Vorlagen aus Ordnern geladen",
+                dir_report.loaded
             );
         }
         match extension_registry.load_installed() {
@@ -6226,11 +6228,13 @@ impl OpenFangKernel {
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
             let dir_report = registry.load_template_dirs(&self.config.extensions.template_dirs);
-            if dir_report.loaded > 0 || !dir_report.skipped.is_empty() {
+            if !self.config.extensions.template_dirs.is_empty() {
                 info!(
                     loaded = dir_report.loaded,
-                    skipped = dir_report.skipped.len(),
-                    "Integrations-Vorlagen aus Ordnern neu geladen"
+                    skipped_files = dir_report.skipped_files(),
+                    unreadable_dirs = dir_report.unreadable_dirs,
+                    "{} Vorlagen aus Ordnern neu geladen",
+                    dir_report.loaded
                 );
             }
         }
