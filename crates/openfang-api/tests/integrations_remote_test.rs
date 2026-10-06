@@ -43,8 +43,26 @@ async fn mini_mcp(headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Res
         .into_response()
 }
 
+/// Anbieter in Stoerung: antwortet immer 503 mit einem Kanarien-Koerper.
+const BODY_CANARY: &str = "KANARIE-BODY-5c03";
+
+async fn mini_mcp_503() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"echo": BODY_CANARY})),
+    )
+        .into_response()
+}
+
 async fn start_mini_mcp() -> String {
-    let app = Router::new().route("/mcp", post(mini_mcp));
+    start_server(Router::new().route("/mcp", post(mini_mcp))).await
+}
+
+async fn start_mini_mcp_503() -> String {
+    start_server(Router::new().route("/mcp", post(mini_mcp_503))).await
+}
+
+async fn start_server(app: Router) -> String {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -116,6 +134,14 @@ async fn harness(template_body: String) -> Harness {
             axum::routing::get(routes::integrations_health),
         )
         .route("/api/config", axum::routing::get(routes::get_config))
+        .route(
+            "/api/integrations/available",
+            axum::routing::get(routes::list_available_integrations),
+        )
+        .route(
+            "/api/integrations/{id}/reconnect",
+            post(routes::reconnect_integration),
+        )
         .with_state(state.clone());
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -244,4 +270,27 @@ async fn review_required_is_not_installable() {
     let list: serde_json::Value =
         serde_json::from_str(&body(&h, "/api/integrations").await).unwrap();
     assert_eq!(list["count"], 0, "{list}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vendor_503_body_never_leaves_the_daemon() {
+    const CANARY: &str = "kanarie-503-wert-9d1b";
+    let _env = EnvGuard::set("PROBE_KEY_503", CANARY);
+    let url = start_mini_mcp_503().await;
+    let h = harness(template(&url, "PROBE_KEY_503", "admitted")).await;
+    let (status, json) = add(&h).await;
+    assert_eq!(status, 201, "{json}");
+    assert_eq!(json["zustand"], "nicht_erreichbar", "{json}");
+    assert!(json["detail"].as_str().unwrap_or("").contains("503"), "{json}");
+    assert_value_never_leaks(&h, &json, CANARY).await;
+    assert_value_never_leaks(&h, &json, BODY_CANARY).await;
+    // Reconnect-Fehlerantwort ebenso ohne Koerper.
+    let r = reqwest::Client::new()
+        .post(format!("{}/api/integrations/probe/reconnect", h.base))
+        .send()
+        .await
+        .unwrap();
+    let rb = r.text().await.unwrap();
+    assert!(!rb.contains(BODY_CANARY), "reconnect leaks body: {rb}");
+    assert!(!rb.contains(CANARY), "reconnect leaks value: {rb}");
 }

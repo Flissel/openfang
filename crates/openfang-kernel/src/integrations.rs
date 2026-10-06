@@ -81,8 +81,57 @@ pub fn status_from_connect_error(err: &str, secrets: &[Zeroizing<String>]) -> In
     match classify_connect_error(&clean) {
         ConnectErrorClass::KeyRejected => IntegrationStatus::KeyRejected,
         ConnectErrorClass::InvalidHeader => IntegrationStatus::Unreachable("ungueltiger Header".into()),
-        ConnectErrorClass::Unreachable => IntegrationStatus::Unreachable(clean),
+        ConnectErrorClass::Unreachable => IntegrationStatus::Unreachable(unreachable_detail(&clean)),
     }
+}
+
+/// Feste, wertfreie Beschreibung eines Netzwerkfehlers: nur eine Klasse
+/// (`dns`, `tls`, `timeout`, `connect`, `http <status>`), nie Antwortkoerper,
+/// URL, Query-String oder Userinfo. Best effort auf dem kleingeschriebenen Text.
+pub fn unreachable_detail(err: &str) -> String {
+    let m = err.to_ascii_lowercase();
+    if let Some(code) = http_status_code(&m) {
+        return format!("http {code}");
+    }
+    let has = |needles: &[&str]| needles.iter().any(|n| m.contains(n));
+    if has(&["dns error", "failed to lookup", "name resolution", "no such host", "nodename nor servname"]) {
+        "dns".into()
+    } else if has(&["certificate", "tls", "ssl", "handshake"]) {
+        "tls".into()
+    } else if has(&["timed out", "timeout", "deadline"]) {
+        "timeout".into()
+    } else if has(&["error sending request", "connection refused", "connection reset", "error trying to connect", "connect error", "connection closed", "broken pipe"]) {
+        "connect".into()
+    } else {
+        "verbindung fehlgeschlagen".into()
+    }
+}
+
+/// Liest einen HTTP-Status (100..=599) nach "http", "status" oder "code".
+/// Ziffern in Ports, Pfaden, Adressen oder laengeren Zahlen zaehlen nicht.
+fn http_status_code(m: &str) -> Option<u16> {
+    let bytes = m.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let is_three_digits = bytes[i..i + 3].iter().all(|b| b.is_ascii_digit());
+        let prev = i.checked_sub(1).map(|j| bytes[j]);
+        let next = bytes.get(i + 3).copied();
+        if is_three_digits
+            && !matches!(prev, Some(b) if b.is_ascii_digit() || b == b':' || b == b'/' || b == b'.')
+            && !matches!(next, Some(b) if b.is_ascii_digit())
+        {
+            let before = m[..i].trim_end_matches([' ', ':', '=']);
+            if before.ends_with("http") || before.ends_with("status") || before.ends_with("code") {
+                if let Ok(code) = m[i..i + 3].parse::<u16>() {
+                    if (100..=599).contains(&code) {
+                        return Some(code);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 pub fn integration_tool_requires_approval(tool_name: &str, server: &str, read_only_tools: &[String]) -> bool {
@@ -221,6 +270,39 @@ mod tests {
             IntegrationStatus::Unreachable(msg) => assert!(msg.contains("ungueltiger Header")),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn unreachable_detail_never_carries_vendor_body_url_or_userinfo() {
+        let err = "unexpected server response: HTTP 503 Service Unavailable: {\"echo\":\"KANARIE-BODY\"} for url (https://user:pw@h/mcp?token=KANARIE-Q)";
+        match status_from_connect_error(err, &[]) {
+            IntegrationStatus::Unreachable(msg) => {
+                assert!(!msg.contains("KANARIE-BODY"), "{msg}");
+                assert!(!msg.contains("KANARIE-Q"), "{msg}");
+                assert!(!msg.contains("user:pw"), "{msg}");
+                assert!(msg.contains("503"), "{msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn unreachable_detail_is_a_fixed_class() {
+        let detail = |e: &str| match status_from_connect_error(e, &[]) {
+            IntegrationStatus::Unreachable(msg) => msg,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(detail("error trying to connect: dns error: failed to lookup address KANARIE"), "dns");
+        assert_eq!(detail("invalid peer certificate: UnknownIssuer KANARIE"), "tls");
+        assert_eq!(detail("operation timed out KANARIE"), "timeout");
+        assert_eq!(
+            detail("Client error: error sending request for url (http://127.0.0.1:4010/mcp?k=KANARIE)"),
+            "connect"
+        );
+        assert_eq!(detail("HTTP status 502 Bad Gateway <html>KANARIE</html>"), "http 502");
+        assert_eq!(detail("irgendwas KANARIE"), "verbindung fehlgeschlagen");
+        // A port must not be read as an HTTP status.
+        assert_eq!(detail("error sending request for url (http://h:5030/mcp)"), "connect");
     }
 
     #[test]
