@@ -47,10 +47,7 @@ impl std::fmt::Debug for McpServerConfig {
         let headers: Vec<String> = self
             .headers
             .iter()
-            .map(|h| match h.split_once(':') {
-                Some((name, _)) => format!("{}: <redacted>", name.trim()),
-                None => "<redacted>".to_string(),
-            })
+            .map(|h| openfang_types::config::redact_header_for_debug(h))
             .collect();
         f.debug_struct("McpServerConfig")
             .field("name", &self.name)
@@ -319,13 +316,18 @@ impl McpConnection {
         // Parse custom headers (e.g., "Authorization: Bearer <token>").
         let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
         for header_str in headers {
-            let Some((name, value)) = header_str.split_once(':') else {
-                return Err("MCP header invalid: <unnamed>".to_string());
+            // Never echo the raw name: a malformed header string could carry
+            // part of a secret before its first ':'.
+            const INVALID: &str = "MCP header invalid: <invalid name>";
+            let Some((raw_name, value)) = header_str.split_once(':') else {
+                return Err(INVALID.to_string());
             };
-            let name = name.trim();
+            let Some(name) = openfang_types::config::displayable_header_name(raw_name) else {
+                return Err(INVALID.to_string());
+            };
             let value = value.trim();
             let hn = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| format!("MCP header invalid: {name}"))?;
+                .map_err(|_| INVALID.to_string())?;
             let mut hv = HeaderValue::from_str(value)
                 .map_err(|_| format!("MCP header invalid: {name}"))?;
             hv.set_sensitive(true);
@@ -592,6 +594,36 @@ mod tests {
             }
             _ => panic!("Expected Http transport"),
         }
+    }
+
+    #[tokio::test]
+    async fn connect_http_error_never_echoes_malformed_header_name() {
+        let cfg = McpServerConfig {
+            name: "x".into(),
+            transport: McpTransport::Http { url: "http://127.0.0.1:9/mcp".into() },
+            timeout_secs: 2,
+            env: vec![],
+            headers: vec!["Authorization Bearer KANARIE-1:x".into()],
+        };
+        let err = McpConnection::connect(cfg).await.err().expect("must fail");
+        assert!(!err.contains("KANARIE-1"), "{err}");
+        assert!(err.contains("MCP header invalid: <invalid name>"), "{err}");
+    }
+
+    #[test]
+    fn mcp_server_config_debug_does_not_echo_malformed_header_name() {
+        let mk = |h: &str| McpServerConfig {
+            name: "x".into(),
+            transport: McpTransport::Http { url: "https://example.com/mcp".into() },
+            timeout_secs: 30,
+            env: vec![],
+            headers: vec![h.into()],
+        };
+        let dbg = format!("{:?}", mk("Authorization Bearer KANARIE-1:x"));
+        assert!(!dbg.contains("KANARIE-1"), "{dbg}");
+        let dbg = format!("{:?}", mk("Authorization: Bearer KANARIE-2"));
+        assert!(dbg.contains("Authorization"), "{dbg}");
+        assert!(!dbg.contains("KANARIE-2"), "{dbg}");
     }
 
     #[test]

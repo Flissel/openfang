@@ -1525,15 +1525,41 @@ pub struct McpServerConfigEntry {
     pub auth_headers: Vec<AuthHeaderRef>,
 }
 
+/// Returns the header name only if it is safe to echo into logs, errors and
+/// Debug output: non-empty and made solely of `A-Za-z0-9`, `-` and `_`.
+///
+/// A malformed header string (e.g. `"Authorization Bearer tok:en"`) would
+/// otherwise leak part of a secret through its "name" prefix.
+pub fn displayable_header_name(raw: &str) -> Option<&str> {
+    let name = raw.trim();
+    if !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Debug-safe rendering of one `"Name: value"` header string.
+pub fn redact_header_for_debug(header: &str) -> String {
+    match header
+        .split_once(':')
+        .and_then(|(n, _)| displayable_header_name(n))
+    {
+        Some(n) => format!("{n}: <redacted>"),
+        None => "<redacted>".to_string(),
+    }
+}
+
 impl std::fmt::Debug for McpServerConfigEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let headers: Vec<String> = self
             .headers
             .iter()
-            .map(|h| match h.split_once(':') {
-                Some((n, _)) => format!("{}: <redacted>", n.trim()),
-                None => "<redacted>".to_string(),
-            })
+            .map(|h| redact_header_for_debug(h))
             .collect();
         f.debug_struct("McpServerConfigEntry")
             .field("name", &self.name)
@@ -4999,6 +5025,33 @@ X-Evil: 1".into(), ..ok.clone() };
         let bad_name = AuthHeaderRef { name: "Authorization
 ".into(), ..ok };
         assert!(bad_name.validate().is_err());
+    }
+
+    #[test]
+    fn displayable_header_name_accepts_only_token_chars() {
+        assert_eq!(displayable_header_name("Authorization"), Some("Authorization"));
+        assert_eq!(displayable_header_name("X-Api_Key2"), Some("X-Api_Key2"));
+        assert_eq!(displayable_header_name(""), None);
+        assert_eq!(displayable_header_name("Authorization Bearer KANARIE-1"), None);
+        assert_eq!(displayable_header_name("A:b"), None);
+        assert_eq!(displayable_header_name("Namé"), None);
+    }
+
+    #[test]
+    fn mcp_server_entry_debug_does_not_echo_malformed_header_name() {
+        let mk = |h: &str| McpServerConfigEntry {
+            name: "x".into(),
+            transport: McpTransportEntry::Http { url: "https://example.com/mcp".into() },
+            timeout_secs: 30,
+            env: vec![],
+            headers: vec![h.into()],
+            auth_headers: vec![],
+        };
+        let dbg = format!("{:?}", mk("Authorization Bearer KANARIE-1:x"));
+        assert!(!dbg.contains("KANARIE-1"), "{dbg}");
+        let dbg = format!("{:?}", mk("Authorization: Bearer KANARIE-2"));
+        assert!(dbg.contains("Authorization"), "{dbg}");
+        assert!(!dbg.contains("KANARIE-2"), "{dbg}");
     }
 
     #[test]
