@@ -9055,6 +9055,7 @@ mod tests {
             timeout_secs: 30,
             env: vec![],
             headers: vec![],
+            auth_headers: Vec::new(),
         };
         let mut config = KernelConfig {
             home_dir: home_dir.clone(),
@@ -9197,6 +9198,7 @@ mod tests {
             timeout_secs: 30,
             env: vec![],
             headers: vec![],
+            auth_headers: Vec::new(),
         };
         let mut config = KernelConfig {
             home_dir: home_dir.clone(),
@@ -10014,6 +10016,7 @@ mod tests {
                 timeout_secs: 30,
                 env: vec!["OPENAI_API_KEY".to_string()],
                 headers: vec![],
+                auth_headers: Vec::new(),
             }],
             ..KernelConfig::default()
         };

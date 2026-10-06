@@ -700,6 +700,9 @@ pub struct ExtensionsConfig {
     pub reconnect_max_backoff_secs: u64,
     /// Health check interval in seconds.
     pub health_check_interval_secs: u64,
+    /// Zusaetzliche Ordner mit Integrations-Vorlagen (*.toml); relativ zum
+    /// Arbeitsverzeichnis des Daemons.
+    pub template_dirs: Vec<std::path::PathBuf>,
 }
 
 impl Default for ExtensionsConfig {
@@ -709,6 +712,7 @@ impl Default for ExtensionsConfig {
             reconnect_max_attempts: 10,
             reconnect_max_backoff_secs: 300,
             health_check_interval_secs: 60,
+            template_dirs: Vec::new(),
         }
     }
 }
@@ -1453,11 +1457,51 @@ fn default_max_cron_jobs() -> usize {
     500
 }
 
+/// `^[A-Za-z_][A-Za-z0-9_]{0,127}$` — gemeinsame Form einer Credential-Referenz.
+pub fn is_valid_credential_reference(reference: &str) -> bool {
+    if reference.is_empty() || reference.len() > 128 {
+        return false;
+    }
+    let mut chars = reference.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Ein HTTP-Header, dessen Wert zur Verbindungszeit aus dem Tresor kommt.
+/// Traegt NUR Namen: Header-Name, Format mit genau einem `{credential}`,
+/// Tresor-Referenz. Der Wert existiert nie in dieser Struktur.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthHeaderRef {
+    pub name: String,
+    pub format: String,
+    pub credential: String,
+}
+
+impl AuthHeaderRef {
+    pub fn validate(&self) -> Result<(), String> {
+        let name_ok = !self.name.is_empty()
+            && self.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !name_ok {
+            return Err(format!("auth_headers: ungueltiger Header-Name '{}'", self.name));
+        }
+        if self.format.matches("{credential}").count() != 1 {
+            return Err("auth_headers: format braucht genau einen Platzhalter {credential}".into());
+        }
+        if !is_valid_credential_reference(&self.credential) {
+            return Err(format!("auth_headers: ungueltige Referenz '{}'", self.credential));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration entry for an MCP server.
 ///
 /// This is the config.toml representation. The runtime `McpServerConfig`
 /// struct is constructed from this during kernel boot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct McpServerConfigEntry {
     /// Display name for this server.
     pub name: String,
@@ -1473,6 +1517,30 @@ pub struct McpServerConfigEntry {
     /// Each entry is `"Header-Name: value"` (e.g., `"Authorization: Bearer <token>"`).
     #[serde(default)]
     pub headers: Vec<String>,
+    /// Header, deren Werte der Kernel beim Verbinden aus dem Tresor einsetzt.
+    #[serde(default)]
+    pub auth_headers: Vec<AuthHeaderRef>,
+}
+
+impl std::fmt::Debug for McpServerConfigEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<String> = self
+            .headers
+            .iter()
+            .map(|h| match h.split_once(':') {
+                Some((n, _)) => format!("{}: <redacted>", n.trim()),
+                None => "<redacted>".to_string(),
+            })
+            .collect();
+        f.debug_struct("McpServerConfigEntry")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("env", &self.env)
+            .field("headers", &headers)
+            .field("auth_headers", &self.auth_headers)
+            .finish()
+    }
 }
 
 fn default_mcp_timeout() -> u64 {
@@ -4901,5 +4969,54 @@ embedding_model = "text-embedding-3-small"
             .expect_err("tool-only must reject active model configuration");
         assert!(error.contains("default_model"));
         assert!(error.contains("memory.embedding_*"));
+    }
+
+    #[test]
+    fn auth_header_ref_requires_exactly_one_placeholder() {
+        let ok = AuthHeaderRef { name: "Authorization".into(), format: "Bearer {credential}".into(), credential: "GITHUB_PAT_TOKEN".into() };
+        assert!(ok.validate().is_ok());
+        let none = AuthHeaderRef { format: "Bearer".into(), ..ok.clone() };
+        assert!(none.validate().is_err());
+        let twice = AuthHeaderRef { format: "{credential}{credential}".into(), ..ok.clone() };
+        assert!(twice.validate().is_err());
+        let bad_ref = AuthHeaderRef { credential: "1BAD-REF".into(), ..ok.clone() };
+        assert!(bad_ref.validate().is_err());
+        let bad_name = AuthHeaderRef { name: "Auth orization".into(), ..ok };
+        assert!(bad_name.validate().is_err());
+    }
+
+    #[test]
+    fn mcp_server_entry_debug_redacts_header_values() {
+        let e = McpServerConfigEntry {
+            name: "x".into(),
+            transport: McpTransportEntry::Http { url: "https://example.com/mcp".into() },
+            timeout_secs: 30,
+            env: vec![],
+            headers: vec!["Authorization: Bearer KANARIE-123".into()],
+            auth_headers: vec![],
+        };
+        let dbg = format!("{e:?}");
+        assert!(!dbg.contains("KANARIE-123"), "Debug leaks header value: {dbg}");
+        assert!(dbg.contains("Authorization"));
+    }
+
+    #[test]
+    fn mcp_server_entry_auth_headers_default_empty() {
+        let toml_src = r#"
+name = "x"
+timeout_secs = 30
+[transport]
+type = "http"
+url = "https://example.com/mcp"
+"#;
+        let e: McpServerConfigEntry = toml::from_str(toml_src).unwrap();
+        assert!(e.auth_headers.is_empty());
+    }
+
+    #[test]
+    fn extensions_template_dirs_default_empty_and_parse() {
+        assert!(ExtensionsConfig::default().template_dirs.is_empty());
+        let c: ExtensionsConfig = toml::from_str(r#"template_dirs = ["../integrations"]"#).unwrap();
+        assert_eq!(c.template_dirs, vec![std::path::PathBuf::from("../integrations")]);
     }
 }

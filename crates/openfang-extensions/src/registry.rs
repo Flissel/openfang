@@ -206,6 +206,7 @@ impl IntegrationRegistry {
                     timeout_secs: 30,
                     env,
                     headers: Vec::new(),
+                    auth_headers: Vec::new(),
                 })
             })
             .collect()
