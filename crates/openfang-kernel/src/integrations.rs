@@ -130,6 +130,13 @@ pub fn owning_integration(
     }
 }
 
+/// Darf ein Hand-Agent dieses Werkzeug ohne Freigabe ausfuehren? Haende sind
+/// kuratierte Pakete und werden auto-freigegeben — Integrations-Werkzeuge
+/// (Zugriff auf Fremdsysteme mit Tresor-Schluessel) sind davon ausgenommen.
+pub fn hand_auto_approve_allowed(is_hand: bool, is_integration_tool: bool) -> bool {
+    is_hand && !is_integration_tool
+}
+
 pub fn mcp_server_visible(server: &str, allowlist: &[String], is_integration: bool) -> bool {
     let listed = allowlist.iter().any(|a| a == server);
     if is_integration { listed } else { allowlist.is_empty() || listed }
@@ -138,6 +145,15 @@ pub fn mcp_server_visible(server: &str, allowlist: &[String], is_integration: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hand_auto_approve_never_covers_integration_tools() {
+        assert!(hand_auto_approve_allowed(true, false));
+        assert!(!hand_auto_approve_allowed(true, true));
+        assert!(!hand_auto_approve_allowed(false, false));
+        assert!(!hand_auto_approve_allowed(false, true));
+    }
+
     use openfang_types::config::{AuthHeaderRef, McpServerConfigEntry, McpTransportEntry};
     use zeroize::Zeroizing;
 

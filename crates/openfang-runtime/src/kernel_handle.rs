@@ -184,6 +184,26 @@ pub trait KernelHandle: Send + Sync {
         false
     }
 
+    /// Is this tool provided by an installed integration (vendor MCP server)?
+    /// Ambiguous ownership counts as integration (fail closed). Default: false.
+    fn is_integration_tool(&self, tool_name: &str) -> bool {
+        let _ = tool_name;
+        false
+    }
+
+    /// Record one integration tool call in the audit log. `approval` is one of
+    /// `read_only`, `freigabe_erteilt`, `freigabe_abgelehnt`; `outcome` one of
+    /// `ok`, `fehler`, `denied`. Must never receive tool inputs or outputs.
+    fn record_integration_call(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        approval: &str,
+        outcome: &str,
+    ) {
+        let _ = (agent_id, tool_name, approval, outcome);
+    }
+
     /// Request approval for a tool execution. Blocks until approved/denied/timed out.
     /// Returns `Ok(true)` if approved, `Ok(false)` if denied or timed out.
     async fn request_approval(

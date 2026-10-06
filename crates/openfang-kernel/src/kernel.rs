@@ -6079,9 +6079,9 @@ impl OpenFangKernel {
     /// template's `read_only_tools`. The owner comes from the actual
     /// connection origin; the name-prefix fallback applies only when no origin
     /// exists. Ambiguous ownership fails closed (approval required).
-    pub fn integration_requires_approval(&self, tool_name: &str) -> bool {
-        use crate::integrations::{integration_tool_requires_approval, owning_integration, Owner};
-
+    /// Ownership of a tool from the integrations' point of view. Shared by the
+    /// approval default and the audit trail so there is one ownership rule.
+    fn integration_owner(&self, tool_name: &str) -> crate::integrations::Owner {
         // Never hold the registry lock and the MCP cache lock at the same time.
         let installed = self.installed_integration_ids();
         let origins = self
@@ -6090,7 +6090,13 @@ impl OpenFangKernel {
             .unwrap_or_else(|e| e.into_inner())
             .get(tool_name)
             .cloned();
-        match owning_integration(origins.as_ref(), tool_name, &installed) {
+        crate::integrations::owning_integration(origins.as_ref(), tool_name, &installed)
+    }
+
+    pub fn integration_requires_approval(&self, tool_name: &str) -> bool {
+        use crate::integrations::{integration_tool_requires_approval, Owner};
+
+        match self.integration_owner(tool_name) {
             Owner::NotIntegration => false,
             Owner::Ambiguous => true,
             Owner::Single(server) => {
@@ -7875,6 +7881,23 @@ impl KernelHandle for OpenFangKernel {
             || self.integration_requires_approval(tool_name)
     }
 
+    fn is_integration_tool(&self, tool_name: &str) -> bool {
+        // Single and Ambiguous both count (fail closed).
+        !matches!(
+            self.integration_owner(tool_name),
+            crate::integrations::Owner::NotIntegration
+        )
+    }
+
+    fn record_integration_call(&self, agent_id: &str, tool_name: &str, approval: &str, outcome: &str) {
+        self.audit_log.record(
+            agent_id.to_string(),
+            openfang_runtime::audit::AuditAction::ToolInvoke,
+            format!("integration_tool={tool_name} approval={approval}"),
+            outcome,
+        );
+    }
+
     async fn request_approval(
         &self,
         agent_id: &str,
@@ -7887,7 +7910,11 @@ impl KernelHandle for OpenFangKernel {
         // Check if this agent has a "hand:" tag indicating it was spawned by activate_hand().
         if let Ok(aid) = agent_id.parse::<AgentId>() {
             if let Some(entry) = self.registry.get(aid) {
-                if entry.tags.iter().any(|t| t.starts_with("hand:")) {
+                let is_hand = entry.tags.iter().any(|t| t.starts_with("hand:"));
+                if crate::integrations::hand_auto_approve_allowed(
+                    is_hand,
+                    self.is_integration_tool(tool_name),
+                ) {
                     info!(agent_id, tool_name, "Auto-approved for hand agent");
                     return Ok(true);
                 }

@@ -166,6 +166,7 @@ pub async fn execute_tool(
         );
     }
 
+    let mut approval_mode = "read_only";
     if let Some(kh) = kernel {
         if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
@@ -177,10 +178,19 @@ pub async fn execute_tool(
             );
             match kh.request_approval(agent_id_str, tool_name, &summary).await {
                 Ok(true) => {
+                    approval_mode = "freigabe_erteilt";
                     debug!(tool_name, "Approval granted — proceeding with execution");
                 }
                 Ok(false) => {
                     warn!(tool_name, "Approval denied — blocking tool execution");
+                    if kh.is_integration_tool(tool_name) {
+                        kh.record_integration_call(
+                            agent_id_str,
+                            tool_name,
+                            "freigabe_abgelehnt",
+                            "denied",
+                        );
+                    }
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),
                         content: format!(
@@ -192,6 +202,14 @@ pub async fn execute_tool(
                 }
                 Err(e) => {
                     warn!(tool_name, error = %e, "Approval system error");
+                    if kh.is_integration_tool(tool_name) {
+                        kh.record_integration_call(
+                            agent_id_str,
+                            tool_name,
+                            "freigabe_abgelehnt",
+                            "denied",
+                        );
+                    }
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),
                         content: format!("Approval system error: {e}"),
@@ -506,7 +524,20 @@ pub async fn execute_tool(
                                 server = server_name,
                                 "Dispatching to MCP server"
                             );
-                            match conn.call_tool(other, input).await {
+                            let call_result = conn.call_tool(other, input).await;
+                            // Audit trail: tool name + approval outcome only,
+                            // never inputs or outputs.
+                            if let Some(kh) = kernel {
+                                if kh.is_integration_tool(other) {
+                                    kh.record_integration_call(
+                                        caller_agent_id.unwrap_or("unknown"),
+                                        other,
+                                        approval_mode,
+                                        if call_result.is_ok() { "ok" } else { "fehler" },
+                                    );
+                                }
+                            }
+                            match call_result {
                                 Ok(content) => Ok(content),
                                 Err(e) => Err(format!("MCP tool call failed: {e}")),
                             }
@@ -5215,5 +5246,115 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_lowercase().contains("kernel"));
+    }
+
+    struct RecordingKernel {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl KernelHandle for RecordingKernel {
+        async fn spawn_agent(&self, _: &str, _: Option<&str>) -> Result<(String, String), String> {
+            Err("unused".into())
+        }
+        async fn send_to_agent(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("unused".into())
+        }
+        fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        fn kill_agent(&self, _: &str) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn memory_store(&self, _: &str, _: serde_json::Value) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn memory_recall(&self, _: &str) -> Result<Option<serde_json::Value>, String> {
+            Err("unused".into())
+        }
+        fn find_agents(&self, _: &str) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        async fn task_post(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<String, String> {
+            Err("unused".into())
+        }
+        async fn task_claim(&self, _: &str) -> Result<Option<serde_json::Value>, String> {
+            Err("unused".into())
+        }
+        async fn task_complete(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("unused".into())
+        }
+        async fn task_list(&self, _: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+            Err("unused".into())
+        }
+        async fn publish_event(&self, _: &str, _: serde_json::Value) -> Result<(), String> {
+            Err("unused".into())
+        }
+        async fn knowledge_add_entity(
+            &self,
+            _: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("unused".into())
+        }
+        async fn knowledge_add_relation(
+            &self,
+            _: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("unused".into())
+        }
+        async fn knowledge_query(
+            &self,
+            _: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            Err("unused".into())
+        }
+        fn requires_approval(&self, _t: &str) -> bool {
+            true
+        }
+        async fn request_approval(&self, _a: &str, _t: &str, _s: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn is_integration_tool(&self, t: &str) -> bool {
+            t.starts_with("mcp_github_")
+        }
+        fn record_integration_call(&self, _a: &str, t: &str, approval: &str, outcome: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((t.into(), approval.into(), outcome.into()));
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_integration_call_is_audited_as_denied() {
+        let rec = Arc::new(RecordingKernel {
+            calls: Default::default(),
+        });
+        let k: Arc<dyn KernelHandle> = rec.clone();
+        let result = execute_tool(
+            "test-id",
+            "mcp_github_create_issue",
+            &serde_json::json!({"title": "x"}),
+            Some(&k),
+            None,
+            Some("agent-1"),
+            None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(
+            rec.calls.lock().unwrap().as_slice(),
+            &[(
+                "mcp_github_create_issue".to_string(),
+                "freigabe_abgelehnt".to_string(),
+                "denied".to_string()
+            )]
+        );
     }
 }
