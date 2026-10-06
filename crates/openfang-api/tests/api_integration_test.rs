@@ -3509,6 +3509,8 @@ async fn test_clone_agent_empty_name_rejected() {
 
 /// Bearer token every credential-issuance test server is configured with.
 const CRED_API_KEY: &str = "cred-test-key-123";
+/// Eigener Schluessel fuer `/api/credentials/issue` (OPENFANG_ISSUE_KEY).
+const CRED_ISSUE_KEY: &str = "cred-issue-key-456";
 
 /// Start a test server that mounts `POST /api/credentials/issue` behind the
 /// real auth middleware.
@@ -3538,6 +3540,17 @@ async fn start_credential_test_server_with_key(
     issuable: &[&str],
     credentials: &[(&str, &str)],
 ) -> TestServer {
+    start_credential_test_server_with_keys(api_key, CRED_ISSUE_KEY, issuable, credentials).await
+}
+
+/// Same, with the daemon's issue key (OPENFANG_ISSUE_KEY) under the test's
+/// control too. `""` reproduces a daemon booted without one: `/issue` is off.
+async fn start_credential_test_server_with_keys(
+    api_key: &str,
+    issue_key: &str,
+    issuable: &[&str],
+    credentials: &[(&str, &str)],
+) -> TestServer {
     let tmp = tempfile::tempdir().expect("Failed to create temp dir");
 
     if !credentials.is_empty() {
@@ -3552,6 +3565,7 @@ async fn start_credential_test_server_with_key(
         home_dir: tmp.path().to_path_buf(),
         data_dir: tmp.path().join("data"),
         api_key: api_key.to_string(),
+        issue_key: issue_key.to_string(),
         default_model: DefaultModelConfig {
             provider: "ollama".to_string(),
             model: "test-model".to_string(),
@@ -3645,6 +3659,7 @@ async fn test_credential_issue_requires_auth() {
 
     let resp = client
         .post(format!("{}/api/credentials/issue", server.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
         .send()
         .await
@@ -3672,6 +3687,7 @@ async fn test_credential_issue_returns_value_with_no_store() {
 
     let resp = client
         .post(format!("{}/api/credentials/issue", server.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
         .send()
@@ -3715,6 +3731,7 @@ async fn test_credential_issue_allowlisted_but_unresolvable() {
 
     let resp = client
         .post(format!("{}/api/credentials/issue", server.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_ALLOWED_MISSING"}))
         .send()
@@ -3743,6 +3760,7 @@ async fn test_credential_issue_refusals_are_indistinguishable() {
     // Resolvable by the kernel, but not allowlisted.
     let not_allowlisted = client
         .post(format!("{}/api/credentials/issue", server.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_SECRET_NOT_ALLOWED"}))
         .send()
@@ -3752,6 +3770,7 @@ async fn test_credential_issue_refusals_are_indistinguishable() {
     // Allowlisted, but unresolvable.
     let unresolvable = client
         .post(format!("{}/api/credentials/issue", server.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_ALLOWED_MISSING"}))
         .send()
@@ -3795,6 +3814,7 @@ async fn test_credential_issue_empty_allowlist_refuses_everything() {
 
     let resp = client
         .post(format!("{}/api/credentials/issue", server.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
         .send()
@@ -3820,6 +3840,7 @@ async fn test_credential_issue_rejects_malformed_reference() {
     for reference in ["a b", "", too_long.as_str(), "../../etc/passwd"] {
         let resp = client
             .post(format!("{}/api/credentials/issue", server.base_url))
+            .header("x-openfang-issue-key", CRED_ISSUE_KEY)
             .bearer_auth(CRED_API_KEY)
             .json(&serde_json::json!({"reference": reference}))
             .send()
@@ -3858,6 +3879,7 @@ async fn test_credential_issue_refused_when_daemon_has_no_auth() {
 
     let refused_by_guard = client
         .post(format!("{}/api/credentials/issue", open.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
         .send()
         .await
@@ -3870,6 +3892,7 @@ async fn test_credential_issue_refused_when_daemon_has_no_auth() {
     let guarded = start_credential_test_server(&["ROWBOAT_ALLOWED_MISSING"], &[]).await;
     let ordinary_refusal = client
         .post(format!("{}/api/credentials/issue", guarded.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_ALLOWED_MISSING"}))
         .send()
@@ -3920,6 +3943,7 @@ async fn test_credential_issue_rejects_non_string_and_unparseable_bodies() {
     ] {
         let resp = client
             .post(format!("{}/api/credentials/issue", server.base_url))
+            .header("x-openfang-issue-key", CRED_ISSUE_KEY)
             .bearer_auth(CRED_API_KEY)
             .json(&body)
             .send()
@@ -3934,6 +3958,7 @@ async fn test_credential_issue_rejects_non_string_and_unparseable_bodies() {
     // No Content-Type: application/json, and not JSON either.
     let resp = client
         .post(format!("{}/api/credentials/issue", server.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .header("content-type", "text/plain")
         .body("reference=ROWBOAT_TEST_TOKEN")
@@ -4051,6 +4076,7 @@ async fn boot_credential_server_with_key(
         home_dir: home.to_path_buf(),
         data_dir: home.join("data"),
         api_key: api_key.to_string(),
+        issue_key: CRED_ISSUE_KEY.to_string(),
         default_model: DefaultModelConfig {
             provider: "ollama".to_string(),
             model: "test-model".to_string(),
@@ -4222,6 +4248,7 @@ async fn test_credential_store_rejects_bad_requests() {
 
     let issue_resp = client
         .post(format!("{}/api/credentials/issue", server.base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_EXISTING_TOKEN"}))
         .send()
@@ -4272,6 +4299,7 @@ async fn test_credential_store_then_issue_same_process() {
 
     let issue_resp = client
         .post(format!("{}/api/credentials/issue", base_url))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_STORED_TOKEN"}))
         .send()
@@ -4321,6 +4349,7 @@ async fn test_credential_store_survives_restart() {
 
     let issue_resp = client
         .post(format!("{}/api/credentials/issue", base_url_2))
+        .header("x-openfang-issue-key", CRED_ISSUE_KEY)
         .bearer_auth(CRED_API_KEY)
         .json(&serde_json::json!({"reference": "ROWBOAT_RESTART_TOKEN"}))
         .send()
@@ -4499,4 +4528,87 @@ async fn test_credential_store_concurrent_calls_race_to_one_winner() {
     }
 
     state.kernel.shutdown();
+}
+
+
+// ---------------------------------------------------------------------------
+// Eigener Issue-Key (2026-10-06): der allgemeine OPENFANG_API_KEY steht in der
+// Root-.env, lesbar fuer jeden lokalen Prozess und jeden Agenten mit
+// Dateiwerkzeugen. Wer ihn hatte, durfte jeden freigegebenen Schluessel im
+// Klartext abholen. Jetzt braucht /issue zusaetzlich einen eigenen Key, und
+// ohne konfigurierten Issue-Key ist /issue aus.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_credential_issue_refuses_general_key_without_issue_key() {
+    let server =
+        start_credential_test_server(&["ROWBOAT_TEST_TOKEN"], &[("ROWBOAT_TEST_TOKEN", "seeded")])
+            .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "credential_unavailable");
+    assert!(body["value"].is_null());
+}
+
+#[tokio::test]
+async fn test_credential_issue_refuses_wrong_issue_key() {
+    let server =
+        start_credential_test_server(&["ROWBOAT_TEST_TOKEN"], &[("ROWBOAT_TEST_TOKEN", "seeded")])
+            .await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/credentials/issue", server.base_url))
+        .bearer_auth(CRED_API_KEY)
+        .header("x-openfang-issue-key", "falsch")
+        .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "credential_unavailable");
+}
+
+#[tokio::test]
+async fn test_credential_issue_is_off_without_configured_issue_key() {
+    let server = start_credential_test_server_with_keys(
+        CRED_API_KEY,
+        "",
+        &["ROWBOAT_TEST_TOKEN"],
+        &[("ROWBOAT_TEST_TOKEN", "seeded")],
+    )
+    .await;
+    for presented in ["", CRED_ISSUE_KEY] {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/api/credentials/issue", server.base_url))
+            .bearer_auth(CRED_API_KEY)
+            .header("x-openfang-issue-key", presented)
+            .json(&serde_json::json!({"reference": "ROWBOAT_TEST_TOKEN"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "presented={presented:?}");
+    }
+}
+
+#[test]
+fn test_issue_key_never_leaves_the_config() {
+    let config = KernelConfig {
+        issue_key: "ganz-geheimer-issue-key".to_string(),
+        ..KernelConfig::default()
+    };
+    let json = serde_json::to_string(&config).unwrap();
+    assert!(!json.contains("ganz-geheimer-issue-key"), "issue_key darf nie serialisiert werden");
+    let dbg = format!("{config:?}");
+    assert!(!dbg.contains("ganz-geheimer-issue-key"), "issue_key darf nie im Debug-Text stehen");
+    // Und aus einer Konfigurationsdatei laesst er sich nicht setzen.
+    let from_file: KernelConfig =
+        toml::from_str("issue_key = \"aus-der-datei\"").unwrap_or_default();
+    assert!(from_file.issue_key.is_empty(), "issue_key darf nie aus einer Datei kommen");
 }

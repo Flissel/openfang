@@ -645,6 +645,17 @@ impl OpenFangKernel {
             }
         }
 
+        // OPENFANG_ISSUE_KEY: the ONLY source of the issue key (it is
+        // `#[serde(skip)]`, so no config file can set it). Unset or blank keeps
+        // `/api/credentials/issue` off.
+        if let Ok(key) = std::env::var("OPENFANG_ISSUE_KEY") {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                info!("Credential issuance enabled: issue key from OPENFANG_ISSUE_KEY");
+                config.issue_key = key;
+            }
+        }
+
         // Clamp configuration bounds to prevent zero-value or unbounded misconfigs
         config.clamp_bounds();
 

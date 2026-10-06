@@ -13373,6 +13373,7 @@ fn credential_response(status: StatusCode, body: serde_json::Value) -> axum::res
 /// — and never with a framework-generated one.
 pub async fn issue_credential(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     payload: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
     // Take the body as raw JSON and pull `reference` out by hand, so that a
@@ -13429,6 +13430,46 @@ pub async fn issue_credential(
              (api_key is empty and auth.enabled is false), which disables the \
              endpoint. Set api_key, or enable auth, to use it."
         );
+        return credential_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "credential_unavailable"}),
+        );
+    }
+
+    // SECURITY: issuance needs its OWN key on top of the bearer `api_key`.
+    //
+    // `api_key` is shared with many local clients and sits in a plaintext
+    // `.env` that any local process -- including an agent with file tools --
+    // can read. Without this check, holding it meant pulling every issuable
+    // secret in plaintext. `issue_key` comes only from OPENFANG_ISSUE_KEY and
+    // is handed to the one consumer that needs it. Empty = issuance is OFF.
+    //
+    // Same ordinary refusal as every other arm, so a caller learns nothing
+    // about whether the key or the reference was wrong. Constant-time compare.
+    // Checked BEFORE the vault lookup: without the key there is no lookup to
+    // time, so the timing-oracle guard below stays intact for key holders.
+    let issue_key = state.kernel.config.issue_key.trim();
+    let presented = headers
+        .get("x-openfang-issue-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let issue_key_ok = !issue_key.is_empty() && presented.len() == issue_key.len() && {
+        use subtle::ConstantTimeEq;
+        bool::from(presented.as_bytes().ct_eq(issue_key.as_bytes()))
+    };
+    if !issue_key_ok {
+        if issue_key.is_empty() {
+            tracing::warn!(
+                reference = %reference,
+                "Credential issuance refused: OPENFANG_ISSUE_KEY is not set, so the \
+                 endpoint is off."
+            );
+        } else {
+            tracing::warn!(
+                reference = %reference,
+                "Credential issuance refused: missing or wrong X-OpenFang-Issue-Key."
+            );
+        }
         return credential_response(
             StatusCode::NOT_FOUND,
             serde_json::json!({"error": "credential_unavailable"}),

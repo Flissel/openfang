@@ -1166,6 +1166,18 @@ pub struct KernelConfig {
     /// require a `Authorization: Bearer <key>` header.
     /// If empty, the API is unauthenticated (local development only).
     pub api_key: String,
+    /// Separate key for `POST /api/credentials/issue`, presented in the
+    /// `X-OpenFang-Issue-Key` header ON TOP of the bearer `api_key`. Empty
+    /// means issuance is OFF. Only ever read from the `OPENFANG_ISSUE_KEY`
+    /// environment variable: `#[serde(skip)]` keeps it out of every config
+    /// file (it can't be loaded from one) and out of `/api/config`.
+    ///
+    /// Why a second key: `api_key` is handed to many local clients and lives
+    /// in a plaintext `.env` that any local process or agent with file tools
+    /// can read. Without this, holding `api_key` meant being able to pull every
+    /// issuable secret in plaintext.
+    #[serde(skip)]
+    pub issue_key: String,
     /// Kernel operating mode (stable, default, dev).
     #[serde(default)]
     pub mode: KernelMode,
@@ -1540,6 +1552,7 @@ impl Default for KernelConfig {
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
             api_key: String::new(),
+            issue_key: String::new(),
             mode: KernelMode::default(),
             language: "en".to_string(),
             users: Vec::new(),
@@ -1691,6 +1704,14 @@ impl std::fmt::Debug for KernelConfig {
             .field(
                 "api_key",
                 &if self.api_key.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field(
+                "issue_key",
+                &if self.issue_key.is_empty() {
                     "<empty>"
                 } else {
                     "<redacted>"
