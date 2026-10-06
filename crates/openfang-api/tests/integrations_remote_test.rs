@@ -139,6 +139,10 @@ async fn harness(template_body: String) -> Harness {
             axum::routing::get(routes::list_available_integrations),
         )
         .route(
+            "/api/integrations/reload",
+            post(routes::reload_integrations),
+        )
+        .route(
             "/api/integrations/{id}",
             axum::routing::delete(routes::remove_integration),
         )
@@ -300,6 +304,59 @@ async fn review_required_is_not_installable() {
     let list: serde_json::Value =
         serde_json::from_str(&body(&h, "/api/integrations").await).unwrap();
     assert_eq!(list["count"], 0, "{list}");
+    // Katalog zeigt Zulassung, Lizenz, Ersatz und Transport.
+    let avail: serde_json::Value =
+        serde_json::from_str(&body(&h, "/api/integrations/available").await).unwrap();
+    let probe = avail["integrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "probe")
+        .expect("probe listed");
+    assert_eq!(probe["admission"], "review_required", "{probe}");
+    assert_eq!(probe["transport"], "http", "{probe}");
+    assert!(probe.get("license").is_some(), "{probe}");
+    assert!(probe.get("replaces_openai_plugin").is_some(), "{probe}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn installed_template_switched_to_review_required_is_not_admitted_and_disconnected() {
+    let _env = EnvGuard::set("PROBE_KEY_UMSCHALT", "kanarie-7f3a91");
+    let url = start_mini_mcp().await;
+    let h = harness(template(&url, "PROBE_KEY_UMSCHALT", "admitted")).await;
+    let (status, json) = add(&h).await;
+    assert_eq!(status, 201, "{json}");
+    assert_eq!(json["zustand"], "verbunden", "{json}");
+
+    // Vorlage wird nachtraeglich auf review_required gesetzt, dann reload.
+    let dir = h.state.kernel.config.extensions.template_dirs[0].clone();
+    std::fs::write(
+        dir.join("probe.toml"),
+        template(&url, "PROBE_KEY_UMSCHALT", "review_required"),
+    )
+    .unwrap();
+    let r = reqwest::Client::new()
+        .post(format!("{}/api/integrations/reload", h.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    let list: serde_json::Value =
+        serde_json::from_str(&body(&h, "/api/integrations").await).unwrap();
+    let probe = &list["installed"][0];
+    assert_eq!(probe["id"], "probe", "{list}");
+    assert_eq!(probe["zustand"], "nicht_zugelassen", "{list}");
+    assert!(h
+        .state
+        .kernel
+        .mcp_connections
+        .lock()
+        .await
+        .iter()
+        .all(|c| c.name() != "probe"));
+    let cached = h.state.kernel.mcp_tools.lock().unwrap().len();
+    assert_eq!(cached, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

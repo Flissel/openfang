@@ -248,6 +248,10 @@ impl IntegrationRegistry {
             .filter(|inst| inst.enabled)
             .filter_map(|inst| {
                 let template = self.templates.get(&inst.id)?;
+                // Nicht zugelassene Vorlagen werden nie verbunden (Spec 4.1/4.4).
+                if !template.is_admitted() {
+                    return None;
+                }
                 let transport = match &template.transport {
                     crate::McpTransportTemplate::Stdio { command, args } => {
                         McpTransportEntry::Stdio {
@@ -279,6 +283,19 @@ impl IntegrationRegistry {
                 })
             })
             .collect()
+    }
+
+    /// Ids installierter Integrationen, deren Vorlage nicht zugelassen ist
+    /// (sortiert). Diese werden nie verbunden.
+    pub fn not_admitted_installed(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .installed
+            .keys()
+            .filter(|id| self.templates.get(*id).map(|t| !t.is_admitted()).unwrap_or(false))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Get the path to integrations.toml.
@@ -461,6 +478,25 @@ admission = "admitted"
             assert!(t.is_admitted());
             assert!(t.auth_headers.is_empty());
         }
+    }
+
+    #[test]
+    fn to_mcp_configs_skips_installed_templates_that_are_not_admitted() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "github.toml",
+            &REMOTE.replace("admission = \"admitted\"", "admission = \"review_required\""),
+        );
+        let mut reg = IntegrationRegistry::new(home.path());
+        reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        reg.install(crate::InstalledIntegration {
+            id: "github".into(), installed_at: chrono::Utc::now(), enabled: true,
+            oauth_provider: None, config: Default::default(),
+        }).unwrap();
+        assert!(reg.to_mcp_configs().iter().all(|c| c.name != "github"));
+        assert_eq!(reg.not_admitted_installed(), vec!["github".to_string()]);
     }
 
     #[test]

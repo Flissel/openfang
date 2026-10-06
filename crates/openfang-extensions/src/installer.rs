@@ -50,6 +50,11 @@ pub fn install_integration(
         return Err(ExtensionError::AlreadyInstalled(id.to_string()));
     }
 
+    // Nicht zugelassene Vorlagen sind sichtbar, aber nicht installierbar.
+    if !template.is_admitted() {
+        return Err(ExtensionError::NotAdmitted(id.to_string()));
+    }
+
     // 2. Store provided keys in vault
     for (key, value) in provided_keys {
         if let Err(e) = resolver.store_in_vault(key, Zeroizing::new(value.clone())) {
@@ -331,6 +336,35 @@ mod tests {
 
         let result = install_integration(&mut registry, &mut resolver, "notion", &keys).unwrap();
         assert_eq!(result.id, "notion");
+    }
+
+    #[test]
+    fn install_refuses_template_that_is_not_admitted() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("probe.toml"),
+            r#"
+id = "probe"
+name = "Probe"
+description = "Testvorlage"
+category = "devtools"
+[transport]
+type = "http"
+url = "http://127.0.0.1:9/mcp"
+[catalog]
+admission = "review_required"
+"#,
+        )
+        .unwrap();
+        let mut registry = IntegrationRegistry::new(home.path());
+        registry.load_template_dirs(&[dir.path().to_path_buf()]);
+        let mut resolver = CredentialResolver::new(None, None);
+        let err = install_integration(&mut registry, &mut resolver, "probe", &HashMap::new())
+            .unwrap_err();
+        assert!(matches!(err, ExtensionError::NotAdmitted(_)), "{err}");
+        assert!(err.to_string().contains("not admitted"), "{err}");
+        assert!(!registry.is_installed("probe"));
     }
 
     #[test]

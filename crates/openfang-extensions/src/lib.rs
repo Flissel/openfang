@@ -45,6 +45,10 @@ pub enum ExtensionError {
     Http(String),
     #[error("Health check failed: {0}")]
     HealthCheck(String),
+    /// Vorlage ist im Katalog nicht zugelassen (`admission = "review_required"`).
+    /// Traegt nur die id, nie Werte.
+    #[error("Integration not admitted: {0}")]
+    NotAdmitted(String),
 }
 
 pub type ExtensionResult<T> = Result<T, ExtensionError>;

@@ -9559,6 +9559,17 @@ pub async fn list_available_integrations(State(state): State<Arc<AppState>>) -> 
                 })).collect::<Vec<_>>(),
                 "has_oauth": t.oauth.is_some(),
                 "setup_instructions": t.setup_instructions,
+                "transport": match &t.transport {
+                    openfang_extensions::McpTransportTemplate::Stdio { .. } => "stdio",
+                    openfang_extensions::McpTransportTemplate::Sse { .. } => "sse",
+                    openfang_extensions::McpTransportTemplate::Http { .. } => "http",
+                },
+                "admission": if t.is_admitted() { "admitted" } else { "review_required" },
+                "license": t.catalog.as_ref().and_then(|c| c.license.clone()),
+                "replaces_openai_plugin": t
+                    .catalog
+                    .as_ref()
+                    .and_then(|c| c.replaces_openai_plugin.clone()),
             })
         })
         .collect();

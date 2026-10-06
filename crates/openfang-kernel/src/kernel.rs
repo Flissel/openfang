@@ -1042,6 +1042,12 @@ impl OpenFangKernel {
         for inst in extension_registry.to_mcp_configs() {
             extension_health.register(&inst.name);
         }
+        // Installed but not admitted: visible as nicht_zugelassen, never connected.
+        for id in extension_registry.not_admitted_installed() {
+            extension_health.register(&id);
+            extension_health.report_status(&id, openfang_extensions::IntegrationStatus::NotAdmitted);
+            warn!(integration = %id, "Integration installiert, aber nicht zugelassen; keine Verbindung");
+        }
 
         // Initialize web tools (multi-provider search + SSRF-protected fetch + caching)
         let cache_ttl = std::time::Duration::from_secs(config.web.cache_ttl_minutes * 60);
@@ -6277,6 +6283,18 @@ impl OpenFangKernel {
             info!(server = %name, "Extension MCP server disconnected (removed)");
         }
 
+        // 4b. Installed but not admitted: mark, never connect.
+        let not_admitted = self
+            .extension_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .not_admitted_installed();
+        for id in &not_admitted {
+            self.extension_health.register(id);
+            self.extension_health
+                .report_status(id, openfang_extensions::IntegrationStatus::NotAdmitted);
+        }
+
         // 5. Connect new servers
         let mut connected_count = 0;
         for server_config in &new_servers {
@@ -8758,6 +8776,37 @@ admission = "{admission}"
 
         // A second removal is an error, not silently ignored.
         assert!(kernel.remove_integration("probe").await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn installed_but_not_admitted_integration_is_marked_and_never_connected() {
+        let (_tmp, kernel) = probe_kernel("review_required");
+        let zustand = |k: &OpenFangKernel| {
+            k.extension_health
+                .get_health("probe")
+                .map(|h| h.status.zustand())
+        };
+        assert_eq!(zustand(&kernel), Some("nicht_zugelassen"));
+        let in_effective = |k: &OpenFangKernel| {
+            k.effective_mcp_servers
+                .read()
+                .unwrap()
+                .iter()
+                .any(|s| s.name == "probe")
+        };
+        assert!(!in_effective(&kernel));
+        kernel.connect_mcp_servers().await;
+        assert_eq!(zustand(&kernel), Some("nicht_zugelassen"));
+
+        kernel.reload_extension_mcps().await.unwrap();
+        assert_eq!(zustand(&kernel), Some("nicht_zugelassen"));
+        assert!(!in_effective(&kernel));
+        assert!(kernel
+            .mcp_connections
+            .lock()
+            .await
+            .iter()
+            .all(|c| c.name() != "probe"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
