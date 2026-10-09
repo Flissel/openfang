@@ -9747,9 +9747,16 @@ pub async fn reconnect_integration(
 // eingesetzt wird nur die Fehlerklasse des Kernels (HTML-escaped).
 
 /// Peer-Adresse aus `ConnectInfo`. Fehlt sie, gilt die Anfrage als NICHT
-/// Loopback (fail closed), wie in `middleware::auth`.
-fn peer_is_loopback(peer: &Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>) -> bool {
-    peer.as_ref().is_some_and(|Extension(ci)| ci.0.ip().is_loopback())
+/// Loopback (fail closed), wie in `middleware::auth`. Eine Proxy-Kopfzeile
+/// (tailscale serve, Reverse-Proxy) hebt den Loopback-Status ebenfalls auf.
+fn peer_is_loopback(
+    peer: &Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: &HeaderMap,
+) -> bool {
+    crate::middleware::is_direct_loopback(
+        peer.as_ref().map(|Extension(ci)| ci.0),
+        headers,
+    )
 }
 
 fn html_escape(s: &str) -> String {
@@ -9785,7 +9792,8 @@ fn integration_html(status: StatusCode, title: &str, body_html: &str) -> axum::r
             (axum::http::header::REFERRER_POLICY, "no-referrer"),
             (
                 axum::http::header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; \
+                 frame-ancestors 'none'; base-uri 'none'",
             ),
         ],
         page,
@@ -9824,10 +9832,11 @@ pub async fn integration_oauth_callback(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     peer: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     query: Result<Query<HashMap<String, String>>, axum::extract::rejection::QueryRejection>,
 ) -> axum::response::Response {
     // Defence in Depth: die Middleware prueft das bereits.
-    if !peer_is_loopback(&peer) {
+    if !peer_is_loopback(&peer, &headers) {
         return integration_not_found();
     }
     let q = query.map(|Query(q)| q).unwrap_or_default();
@@ -9915,8 +9924,9 @@ pub async fn integration_schluessel_page(
     State(state): State<Arc<AppState>>,
     Path((id, token)): Path<(String, String)>,
     peer: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
-    if !peer_is_loopback(&peer) {
+    if !peer_is_loopback(&peer, &headers) {
         return integration_not_found();
     }
     let Some(reference) = state.kernel.schluessel_peek(&id, &token) else {
@@ -9948,13 +9958,22 @@ pub async fn integration_schluessel_submit(
     State(state): State<Arc<AppState>>,
     Path((id, token)): Path<(String, String)>,
     peer: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     form: Result<
         axum::extract::Form<HashMap<String, String>>,
         axum::extract::rejection::FormRejection,
     >,
 ) -> axum::response::Response {
-    if !peer_is_loopback(&peer) {
+    if !peer_is_loopback(&peer, &headers) {
         return integration_not_found();
+    }
+    // A browser announces a foreign origin via Sec-Fetch-Site. Only our own
+    // form (same-origin) or a direct navigation (none) may submit; anything
+    // else is refused BEFORE the link is consumed.
+    if let Some(site) = headers.get("sec-fetch-site") {
+        if !matches!(site.to_str(), Ok("same-origin") | Ok("none")) {
+            return integration_not_found();
+        }
     }
     // Fehlendes Feld oder kaputtes Formular: leerer Wert -> der Kernel
     // verbraucht den Link trotzdem und meldet "wert ungueltig" (fail closed).
@@ -13604,6 +13623,16 @@ fn remove_toml_section(content: &str, section: &str) -> String {
 // integration templates' `auth_headers.credential` validation.
 use openfang_types::config::is_valid_credential_reference;
 
+/// True for integration keys (`INTEGRATION_*`) in ANY spelling: environment
+/// lookup on Windows is case-insensitive, so `integration_x` names the same
+/// variable as `INTEGRATION_X`. Only the kernel reads or writes these.
+fn is_integration_reference(reference: &str) -> bool {
+    let prefix = openfang_extensions::INTEGRATION_PREFIX;
+    reference
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
 /// Build a credential-endpoint response. Every response from this endpoint --
 /// success and refusal alike -- is marked `no-store` so no proxy or client
 /// cache ever retains an issued credential.
@@ -13685,7 +13714,7 @@ pub async fn issue_credential(
     // never issuable, whatever the allowlist says. Refused right after the
     // shape check: before any log line carrying the reference, before the
     // allowlist is consulted, before any lookup. Same body as every refusal.
-    if reference.starts_with(openfang_extensions::INTEGRATION_PREFIX) {
+    if is_integration_reference(reference) {
         return credential_response(
             StatusCode::NOT_FOUND,
             serde_json::json!({"error": "credential_unavailable"}),
@@ -13825,6 +13854,8 @@ fn read_issuable_credentials_list(path: &std::path::Path) -> std::collections::H
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && is_valid_credential_reference(l))
+        // Integration keys are never issuable, in any spelling.
+        .filter(|l| !is_integration_reference(l))
         .map(str::to_string)
         .collect()
 }
@@ -13847,6 +13878,8 @@ pub fn seed_issuable_credentials(
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            // Integration keys are never issuable, in any spelling.
+            .filter(|s| !is_integration_reference(s))
             .map(str::to_string)
             .collect();
 
@@ -13960,7 +13993,7 @@ pub async fn store_credential(
     // SECURITY: only the kernel writes `INTEGRATION_*` (one-time key page,
     // OAuth login). This route never does, not even with `overwrite`.
     if !is_valid_credential_reference(reference)
-        || reference.starts_with(openfang_extensions::INTEGRATION_PREFIX)
+        || is_integration_reference(reference)
     {
         return credential_response(
             StatusCode::BAD_REQUEST,

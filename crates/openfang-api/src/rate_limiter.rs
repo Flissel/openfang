@@ -78,7 +78,9 @@ pub async fn gcra_rate_limit(
     let cost = operation_cost(&method, &path);
 
     if limiter.check_key_n(&ip, cost).is_err() {
-        tracing::warn!(ip = %ip, cost = cost.get(), path = %path, "GCRA rate limit exceeded");
+        // SECURITY: this layer runs before auth; never log a one-time token.
+        let log_path = crate::middleware::log_safe_path(&path);
+        tracing::warn!(ip = %ip, cost = cost.get(), path = %log_path, "GCRA rate limit exceeded");
         return Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header("content-type", "application/json")
@@ -109,5 +111,55 @@ mod tests {
         assert_eq!(operation_cost("GET", "/api/audit/recent").get(), 5);
         assert_eq!(operation_cost("POST", "/api/skills/install").get(), 50);
         assert_eq!(operation_cost("POST", "/api/migrate").get(), 100);
+    }
+
+    /// Schreibt die Log-Ausgabe in einen geteilten Puffer.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn throttled_key_page_request_never_logs_the_one_time_token() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Kontingent kleiner als die Kosten: die erste Anfrage wird gedrosselt.
+        let limiter: Arc<KeyedRateLimiter> = Arc::new(RateLimiter::keyed(Quota::per_minute(
+            NonZeroU32::new(1).unwrap(),
+        )));
+        let app = axum::Router::new()
+            .route("/api/integrations/{id}/schluessel/{t}", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(limiter, gcra_rate_limit));
+        let mut req = Request::builder()
+            .uri("/api/integrations/probe/schluessel/KANARIE-EINMAL-TOKEN")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("GCRA rate limit exceeded"), "{log}");
+        assert!(log.contains("schluessel/<geschwaerzt>"), "{log}");
+        assert!(!log.contains("KANARIE-EINMAL-TOKEN"), "token leaked: {log}");
     }
 }

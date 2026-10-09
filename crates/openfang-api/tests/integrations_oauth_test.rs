@@ -430,7 +430,7 @@ fn assert_html_headers(headers: &HeaderMap) {
     assert_eq!(h("referrer-policy"), "no-referrer");
     assert_eq!(
         h("content-security-policy"),
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
     assert!(
         h("content-type").starts_with("text/html"),
@@ -700,44 +700,237 @@ async fn integration_rows(h: &H) -> Vec<serde_json::Value> {
 #[tokio::test(flavor = "multi_thread")]
 async fn integration_prefix_is_never_issuable_or_storable() {
     // Allowlistet UND aufloesbar: ohne Sperre wuerde der Wert ausgegeben.
+    // Auch in anderer Schreibweise (Windows-Umgebung ist case-insensitiv).
     let h = harness(Opts {
         template: None,
         with_vault: false,
         files: vec![
             (
                 "issuable_credentials.list",
-                "INTEGRATION_GITHUB_PAT\n".into(),
+                "INTEGRATION_GITHUB_PAT\nintegration_github_pat\nIntegration_X\n".into(),
             ),
-            (".env", "INTEGRATION_GITHUB_PAT=KANARIE-ISSUE-3\n".into()),
+            (
+                ".env",
+                "INTEGRATION_GITHUB_PAT=KANARIE-ISSUE-3\nintegration_github_pat=KANARIE-ISSUE-4\nIntegration_X=KANARIE-ISSUE-5\n"
+                    .into(),
+            ),
         ],
     })
     .await;
-    let r = reqwest::Client::new()
-        .post(format!("{}/api/credentials/issue", h.base))
-        .bearer_auth(API_KEY)
-        .header("x-openfang-issue-key", ISSUE_KEY)
-        .json(&serde_json::json!({"reference": "INTEGRATION_GITHUB_PAT"}))
+    for reference in [
+        "INTEGRATION_GITHUB_PAT",
+        "integration_github_pat",
+        "Integration_X",
+    ] {
+        let r = reqwest::Client::new()
+            .post(format!("{}/api/credentials/issue", h.base))
+            .bearer_auth(API_KEY)
+            .header("x-openfang-issue-key", ISSUE_KEY)
+            .json(&serde_json::json!({ "reference": reference }))
+            .send()
+            .await
+            .unwrap();
+        let s = r.status().as_u16();
+        let b = r.text().await.unwrap();
+        assert!(
+            !b.contains("KANARIE-ISSUE"),
+            "issued an INTEGRATION_ value for {reference}"
+        );
+        assert_eq!(s, 404, "{reference}");
+        let j: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(j["error"], "credential_unavailable", "{reference}");
+
+        let (s, j) = post(
+            &h,
+            "/api/credentials/store",
+            serde_json::json!({"reference": reference, "value": "KANARIE-STORE", "overwrite": true}),
+        )
+        .await;
+        assert_eq!(s, 400, "{reference}: {j}");
+        assert_eq!(j["error"], "reference_invalid", "{reference}");
+    }
+}
+
+/// Die Ausgabeliste nimmt `INTEGRATION_`-Namen in keiner Schreibweise auf.
+#[test]
+fn issuable_seed_drops_integration_names_in_any_case() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("issuable_credentials.list"),
+        "INTEGRATION_A\nintegration_b\nInTeGrAtIoN_C\nOTHER_TOKEN\n",
+    )
+    .unwrap();
+    let seeded = routes::seed_issuable_credentials(tmp.path());
+    assert!(seeded.contains("OTHER_TOKEN"), "{seeded:?}");
+    for n in ["INTEGRATION_A", "integration_b", "InTeGrAtIoN_C"] {
+        assert!(!seeded.contains(n), "{n} seeded: {seeded:?}");
+    }
+}
+
+/// Ein Rueckruf mit unbekanntem `state` schreibt keine Audit-Zeile (kein
+/// Spam durch Loopback-Aufrufer); ein echter Rueckruf schreibt genau eine.
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_state_callback_writes_no_audit_row() {
+    let mock = start_mock().await;
+    let h = harness_with_oauth_probe(&mock).await;
+    let callback_rows = |h: &H| {
+        let h_base = h.base.clone();
+        async move {
+            let r = reqwest::Client::new()
+                .get(format!("{h_base}/api/audit/recent?n=500"))
+                .bearer_auth(API_KEY)
+                .send()
+                .await
+                .unwrap();
+            let j: serde_json::Value = r.json().await.unwrap();
+            j["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e["detail"].as_str().map(str::to_string))
+                .filter(|d| d.contains(" ereignis=anmeldung "))
+                .collect::<Vec<String>>()
+        }
+    };
+    for _ in 0..3 {
+        let r = reqwest::get(format!(
+            "{}/api/integrations/probe/oauth/callback?state=unbekannt&code=x",
+            h.base
+        ))
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 400);
+    }
+    let rows = callback_rows(&h).await;
+    assert!(rows.is_empty(), "unknown state must not audit: {rows:?}");
+
+    let url = login(&h).await;
+    let rows = callback_rows(&h).await;
+    assert_eq!(
+        rows,
+        vec!["integration_oauth=probe ereignis=anmeldung ergebnis=ok".to_string()]
+    );
+    // Wiederholter (verbrauchter) state: ebenfalls keine Zeile.
+    let r = reqwest::get(format!(
+        "{}{}",
+        h.base,
+        callback_path_from(&url, "CODE-OK", &mock.base)
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    assert_eq!(callback_rows(&h).await.len(), 1);
+}
+
+/// Anfragen ueber einen Proxy (tailscale serve, Reverse-Proxy) gelten nie
+/// als Loopback; fremde Herkunft (Sec-Fetch-Site) verbraucht keinen Link.
+#[tokio::test(flavor = "multi_thread")]
+async fn proxied_or_cross_site_browser_requests_are_refused() {
+    let mock = start_mock().await;
+    let h = harness(Opts {
+        template: Some(static_template(&mock.base, "INTEGRATION_PROBE_KEY_PX")),
+        with_vault: true,
+        files: vec![],
+    })
+    .await;
+    let (s, _) = post(
+        &h,
+        "/api/integrations/add",
+        serde_json::json!({"id":"probe"}),
+    )
+    .await;
+    assert_eq!(s, 201);
+    let (_, j) = post(
+        &h,
+        "/api/integrations/probe/schluessel/link",
+        serde_json::json!({}),
+    )
+    .await;
+    let url = j["url"].as_str().unwrap().to_string();
+    let path = reqwest::Url::parse(&url).unwrap().path().to_string();
+    let callback = format!(
+        "{}/api/integrations/probe/oauth/callback?state=x&code=y",
+        h.base
+    );
+    let client = reqwest::Client::new();
+    let proxy_headers = [
+        ("Tailscale-User-Login", "x"),
+        ("X-Forwarded-For", "100.67.177.45"),
+        ("Forwarded", "for=100.67.177.45"),
+    ];
+    for (name, value) in proxy_headers {
+        for target in [url.as_str(), callback.as_str()] {
+            let r = client.get(target).header(name, value).send().await.unwrap();
+            assert_eq!(r.status().as_u16(), 404, "{name} GET {target}");
+            assert!(!r.text().await.unwrap().contains("password"));
+        }
+        let r = client
+            .post(&url)
+            .header(name, value)
+            .form(&[("wert", "KANARIE-PROXY")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404, "{name} POST");
+    }
+
+    // Defence in Depth: auch die Handler allein (ohne Middleware).
+    let bare = Router::new()
+        .route(
+            "/api/integrations/{id}/oauth/callback",
+            get(routes::integration_oauth_callback),
+        )
+        .route(
+            "/api/integrations/{id}/schluessel/{token}",
+            get(routes::integration_schluessel_page).post(routes::integration_schluessel_submit),
+        )
+        .with_state(h.state.clone());
+    for (name, value) in proxy_headers {
+        for p in [
+            "/api/integrations/probe/oauth/callback?state=x&code=y",
+            path.as_str(),
+        ] {
+            let mut req = oneshot_req("127.0.0.1:5555", "GET", p, Body::empty(), false);
+            req.headers_mut().insert(name, value.parse().unwrap());
+            let resp = bare.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), 404, "bare {name} {p}");
+        }
+        let mut req = oneshot_req(
+            "127.0.0.1:5555",
+            "POST",
+            &path,
+            Body::from("wert=KANARIE-PROXY"),
+            true,
+        );
+        req.headers_mut().insert(name, value.parse().unwrap());
+        assert_eq!(bare.clone().oneshot(req).await.unwrap().status(), 404);
+    }
+
+    // Fremde Herkunft: 404 vor dem Verbrauch.
+    for site in ["cross-site", "same-site"] {
+        let r = client
+            .post(&url)
+            .header("Sec-Fetch-Site", site)
+            .form(&[("wert", "KANARIE-CROSS")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404, "Sec-Fetch-Site {site}");
+    }
+
+    // Nichts davon hat den Link verbraucht.
+    let (s, form, _) = get_page(&url).await;
+    assert_eq!(s, 200, "link still valid");
+    assert!(form.contains("password"));
+    let r = client
+        .post(&url)
+        .header("Sec-Fetch-Site", "same-origin")
+        .form(&[("wert", "KANARIE-STATIC-9")])
         .send()
         .await
         .unwrap();
-    let s = r.status().as_u16();
-    let b = r.text().await.unwrap();
-    assert!(
-        !b.contains("KANARIE-ISSUE-3"),
-        "issued an INTEGRATION_ value"
-    );
-    assert_eq!(s, 404);
-    let j: serde_json::Value = serde_json::from_str(&b).unwrap();
-    assert_eq!(j["error"], "credential_unavailable");
-
-    let (s, j) = post(
-        &h,
-        "/api/credentials/store",
-        serde_json::json!({"reference": "INTEGRATION_GITHUB_PAT", "value": "KANARIE-STORE", "overwrite": true}),
-    )
-    .await;
-    assert_eq!(s, 400, "{j}");
-    assert_eq!(j["error"], "reference_invalid");
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.text().await.unwrap().contains("gespeichert"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

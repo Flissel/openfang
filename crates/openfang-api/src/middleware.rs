@@ -54,6 +54,12 @@ pub async fn tool_only_model_routes(
 /// lokalen Browser aufruft: `/api/integrations/{id}/oauth/callback` und
 /// `/api/integrations/{id}/schluessel/{token}` (nicht `.../schluessel/link`,
 /// das ist eine Bearer-Route). Sie sind NUR ueber Loopback erreichbar.
+///
+/// SECURITY: never expose /api/integrations/* via tailscale serve or a
+/// reverse proxy. Such a proxy connects from 127.0.0.1, so the TCP peer alone
+/// would look like loopback. As a second line, a request carrying a proxy
+/// header (`Tailscale-User-Login`, `X-Forwarded-For`, `Forwarded`) never
+/// counts as loopback for these routes (see [`has_proxy_headers`]).
 pub fn is_browser_integration_path(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/api/integrations/") else {
         return false;
@@ -66,12 +72,37 @@ pub fn is_browser_integration_path(path: &str) -> bool {
     }
 }
 
-/// Pfad fuer Logs und Spans: das Einmal-Token der Schluesselseite wird
-/// geschwaerzt (Query-Strings werden ohnehin nie geloggt).
+/// Proxy-Kopfzeilen, mit denen eine Anfrage fuer die Browser-Routen nie als
+/// Loopback gilt (tailscale serve, Reverse-Proxy).
+const PROXY_HEADERS: [&str; 3] = ["tailscale-user-login", "x-forwarded-for", "forwarded"];
+
+/// True, wenn die Anfrage eine Proxy-Kopfzeile traegt.
+pub fn has_proxy_headers(headers: &axum::http::HeaderMap) -> bool {
+    PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
+}
+
+/// Loopback-Bedingung der Browser-Routen: TCP-Peer ist Loopback UND keine
+/// Proxy-Kopfzeile. Fehlendes `ConnectInfo` gilt als nicht Loopback.
+pub fn is_direct_loopback(
+    peer: Option<std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    peer.is_some_and(|p| p.ip().is_loopback()) && !has_proxy_headers(headers)
+}
+
+/// Pfad fuer Logs und Spans: unter `/api/integrations/` wird alles nach
+/// einem `schluessel`-Segment geschwaerzt, ausser das Segment ist `link`
+/// (auch bei Schraegstrich am Ende oder Zusatzsegmenten). Query-Strings
+/// werden ohnehin nie geloggt.
 pub fn log_safe_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if is_browser_integration_path(path) && path.contains("/schluessel/") {
-        if let Some((head, _token)) = path.rsplit_once('/') {
-            return std::borrow::Cow::Owned(format!("{head}/<geschwaerzt>"));
+    let Some(rest) = path.strip_prefix("/api/integrations/") else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    let seg: Vec<&str> = rest.split('/').collect();
+    if let Some(i) = seg.iter().position(|s| *s == "schluessel") {
+        if seg.get(i + 1).is_some_and(|t| *t != "link") {
+            let head = seg[..=i].join("/");
+            return std::borrow::Cow::Owned(format!("/api/integrations/{head}/<geschwaerzt>"));
         }
     }
     std::borrow::Cow::Borrowed(path)
@@ -157,7 +188,9 @@ pub async fn auth(
     // ohne Bearer auf. Nur Loopback; alles andere sieht 404 (auch mit
     // gueltigem Bearer und auch mit OPENFANG_ALLOW_NO_AUTH).
     if is_browser_integration_path(path) {
-        if is_loopback {
+        // A proxy (tailscale serve, reverse proxy) connects from loopback:
+        // its headers revoke the loopback status for these routes.
+        if is_loopback && !has_proxy_headers(request.headers()) {
             return next.run(request).await;
         }
         return (StatusCode::NOT_FOUND, "").into_response();
@@ -392,6 +425,56 @@ mod tests {
             "/api/integrations/probe/schluessel/link"
         );
         assert_eq!(log_safe_path("/api/agents/1"), "/api/agents/1");
+        // Abweichende Formen (Router matcht sie nicht, Logs sehen sie trotzdem).
+        for p in [
+            "/api/integrations/probe/schluessel/KANARIE-TOKEN/",
+            "/api/integrations/probe/schluessel/KANARIE-TOKEN/extra",
+            "/api/integrations/a/b/schluessel/KANARIE-TOKEN",
+            "/api/integrations//schluessel/KANARIE-TOKEN",
+        ] {
+            let safe = log_safe_path(p);
+            assert!(!safe.contains("KANARIE"), "{p} -> {safe}");
+            assert!(safe.contains("<geschwaerzt>"), "{p} -> {safe}");
+        }
+        assert_eq!(
+            log_safe_path("/api/integrations/probe/schluessel/link/"),
+            "/api/integrations/probe/schluessel/link/"
+        );
+        assert_eq!(
+            log_safe_path("/api/other/schluessel/x"),
+            "/api/other/schluessel/x"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxied_loopback_request_is_not_loopback_for_browser_paths() {
+        let app = Router::new()
+            .route("/api/integrations/{id}/schluessel/{t}", get(ok_handler))
+            .route("/api/integrations/{id}/oauth/callback", get(ok_handler))
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth_state_with_key("secret"),
+                auth,
+            ));
+        for (name, value) in [
+            ("tailscale-user-login", "x"),
+            ("x-forwarded-for", "100.67.177.45"),
+            ("forwarded", "for=100.67.177.45"),
+        ] {
+            for uri in [
+                "/api/integrations/p/schluessel/abc",
+                "/api/integrations/p/oauth/callback",
+            ] {
+                let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+                let mut r = Request::builder()
+                    .uri(uri)
+                    .header(name, value)
+                    .body(Body::empty())
+                    .unwrap();
+                r.extensions_mut().insert(ConnectInfo(addr));
+                let resp = app.clone().oneshot(r).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name} {uri}");
+            }
+        }
     }
 
     #[tokio::test]

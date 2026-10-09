@@ -6736,7 +6736,17 @@ impl OpenFangKernel {
         error: Option<&str>,
         iss: Option<&str>,
     ) -> Result<(), String> {
-        let result = self.oauth_callback_inner(id, code, state, error, iss).await;
+        // Unbekannter, abgelaufener oder verbrauchter `state`: KEINE Audit-Zeile.
+        // Der Rueckruf ist ohne Bearer erreichbar (Loopback); sonst koennte
+        // jeder lokale Aufrufer das Audit-Log fluten. Audit nur fuer echte
+        // Ausgaenge nach gueltigem `state`.
+        let Some(login) = self
+            .oauth_pending
+            .take(state, id, crate::integration_oauth::LOGIN_TTL)
+        else {
+            return Err("state ungueltig".into());
+        };
+        let result = self.oauth_callback_inner(id, code, login, error, iss).await;
         self.audit_oauth(
             id,
             "anmeldung",
@@ -6749,17 +6759,11 @@ impl OpenFangKernel {
         self: &Arc<Self>,
         id: &str,
         code: Option<&str>,
-        state: &str,
+        login: crate::integration_oauth::PendingLogin,
         error: Option<&str>,
         iss: Option<&str>,
     ) -> Result<(), String> {
         use openfang_extensions::mcp_oauth as m;
-        let Some(login) = self
-            .oauth_pending
-            .take(state, id, crate::integration_oauth::LOGIN_TTL)
-        else {
-            return Err("state ungueltig".into());
-        };
         if error.is_some() {
             return Err("anmeldung abgebrochen".into());
         }
