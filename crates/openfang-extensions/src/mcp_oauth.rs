@@ -11,6 +11,14 @@
 //! - Provider response bodies are only ever deserialised into expected fields.
 //!   They never appear in errors, logs or [`OAuthError::class`].
 //! - Tokens and the client id never appear in `Debug` output.
+//! - No redirects are followed and no internal targets (IP literals,
+//!   `localhost`, `*.local`, `*.internal`, `*.ts.net`, single-label hosts)
+//!   are contacted.
+//!
+//! **Every public function that takes a `reqwest::Client` requires a client
+//! built by [`http_client`]** (no redirects, https only, fixed timeout). As
+//! defence in depth each response is additionally rejected when it is a
+//! redirect or was answered by a different URL than the one requested.
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -59,13 +67,69 @@ impl UrlPolicy {
     }
 
     /// Parse `url` and check it against the policy.
+    ///
+    /// - Scheme: `https`; `http` only for loopback under the test policy.
+    /// - Host: a public DNS name. IP literals (v4, v6, v4-mapped), `localhost`,
+    ///   `*.localhost`, `*.local`, `*.internal`, `*.ts.net` and single-label
+    ///   names are refused. Loopback (`127.0.0.1`, `::1`, `localhost`) passes
+    ///   only under the test policy.
     pub fn check(&self, url: &str) -> Result<url::Url, OAuthError> {
         let parsed = url::Url::parse(url).map_err(|_| OAuthError::Discovery("ungueltige url"))?;
+        let loopback_ok = self.allow_loopback_http && is_loopback_host(&parsed);
         match parsed.scheme() {
-            "https" => Ok(parsed),
-            "http" if self.allow_loopback_http && is_loopback_host(&parsed) => Ok(parsed),
-            _ => Err(OAuthError::Discovery("unsicheres schema")),
+            "https" => {}
+            "http" if loopback_ok => {}
+            _ => return Err(OAuthError::Discovery("unsicheres schema")),
         }
+        if loopback_ok || is_public_host(&parsed) {
+            Ok(parsed)
+        } else {
+            Err(OAuthError::Discovery("unzulaessiger host"))
+        }
+    }
+}
+
+/// True for a dotted DNS name outside the reserved/internal namespaces.
+/// IP literals and missing hosts are never public in this sense.
+fn is_public_host(u: &url::Url) -> bool {
+    const BLOCKED_SUFFIXES: [&str; 4] = [".localhost", ".local", ".internal", ".ts.net"];
+    match u.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d.contains('.')
+                && !d.starts_with('.')
+                && !BLOCKED_SUFFIXES.iter().any(|s| d.ends_with(s))
+        }
+        _ => false,
+    }
+}
+
+/// HTTP client for all functions of this module: no redirects, `https` only
+/// (except under the test policy), fixed timeout, no default headers.
+pub fn http_client(policy: &UrlPolicy) -> Result<reqwest::Client, OAuthError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(!policy.allow_loopback_http)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| OAuthError::Network("client"))
+}
+
+/// Fail closed when a response is a redirect or came from another URL than
+/// the requested one (a caller-supplied client that follows redirects).
+fn ensure_direct(
+    resp: &reqwest::Response,
+    requested: &url::Url,
+    on_redirect: OAuthError,
+) -> Result<(), OAuthError> {
+    let mut got = resp.url().clone();
+    got.set_fragment(None);
+    let mut want = requested.clone();
+    want.set_fragment(None);
+    if resp.status().is_redirection() || got != want {
+        Err(on_redirect)
+    } else {
+        Ok(())
     }
 }
 
@@ -172,22 +236,56 @@ pub struct OAuthRecord {
     pub refresh_token: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub scopes: Vec<String>,
+    /// AS advertised `authorization_response_iss_parameter_supported` (RFC 9207).
+    #[serde(default)]
+    pub iss_supported: bool,
+}
+
+/// Validate the `iss` parameter of the authorization response (RFC 9207).
+/// A present `iss` must equal the issuer (trailing `/` ignored); an absent one
+/// is only accepted when the AS does not advertise `iss` support.
+pub fn check_callback_iss(rec: &OAuthRecord, iss: Option<&str>) -> Result<(), OAuthError> {
+    let bad = OAuthError::Discovery("iss passt nicht");
+    match iss {
+        Some(i) if i.trim_end_matches('/') == rec.issuer.trim_end_matches('/') => Ok(()),
+        Some(_) => Err(bad),
+        None if rec.iss_supported => Err(bad),
+        None => Ok(()),
+    }
 }
 
 fn redact(v: &Option<String>) -> Option<&'static str> {
     v.as_ref().map(|_| "<redacted>")
 }
 
+/// URL without query string and fragment (they may carry secrets).
+fn no_query(s: &str) -> &str {
+    match s.find(['?', '#']) {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
 impl std::fmt::Debug for OAuthRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuthRecord")
             .field("v", &self.v)
-            .field("resource", &self.resource)
-            .field("issuer", &self.issuer)
-            .field("authorization_endpoint", &self.authorization_endpoint)
-            .field("token_endpoint", &self.token_endpoint)
-            .field("registration_endpoint", &self.registration_endpoint)
-            .field("revocation_endpoint", &self.revocation_endpoint)
+            .field("resource", &no_query(&self.resource))
+            .field("issuer", &no_query(&self.issuer))
+            .field(
+                "authorization_endpoint",
+                &no_query(&self.authorization_endpoint),
+            )
+            .field("token_endpoint", &no_query(&self.token_endpoint))
+            .field(
+                "registration_endpoint",
+                &self.registration_endpoint.as_deref().map(no_query),
+            )
+            .field(
+                "revocation_endpoint",
+                &self.revocation_endpoint.as_deref().map(no_query),
+            )
+            .field("iss_supported", &self.iss_supported)
             .field("client_id", &redact(&self.client_id))
             .field("access_token", &redact(&self.access_token))
             .field("refresh_token", &redact(&self.refresh_token))
@@ -228,6 +326,7 @@ impl OAuthRecord {
             refresh_token: None,
             expires_at: None,
             scopes: Vec::new(),
+            iss_supported: false,
         }
     }
 }
@@ -268,12 +367,13 @@ async fn get_json<T: serde::de::DeserializeOwned>(
 ) -> Result<Option<T>, OAuthError> {
     let u = policy.check(url)?;
     let resp = http
-        .get(u)
+        .get(u.clone())
         .header(reqwest::header::ACCEPT, "application/json")
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|e| network_error(&e))?;
+    ensure_direct(&resp, &u, OAuthError::Discovery("weiterleitung"))?;
     if !resp.status().is_success() {
         return Ok(None);
     }
@@ -301,6 +401,28 @@ fn parse_resource_metadata(header: &str) -> Option<String> {
     }
 }
 
+/// Normalised resource identifier for comparison: parsed (scheme and host
+/// lower-cased, default port dropped), trailing `/` removed.
+fn normalised_resource(s: &str) -> Option<String> {
+    let u = url::Url::parse(s).ok()?;
+    Some(u.as_str().trim_end_matches('/').to_string())
+}
+
+/// Re-check a stored endpoint before posting to it: policy plus same host as
+/// the issuer. A tampered record fails closed.
+fn issuer_endpoint(
+    policy: &UrlPolicy,
+    rec: &OAuthRecord,
+    endpoint: &str,
+) -> Result<url::Url, OAuthError> {
+    let ep = policy.check(endpoint)?;
+    let issuer = policy.check(&rec.issuer)?;
+    if !same_host(&ep, &issuer) {
+        return Err(OAuthError::Discovery("fremder host"));
+    }
+    Ok(ep)
+}
+
 fn same_host(a: &url::Url, b: &url::Url) -> bool {
     a.host_str().map(str::to_ascii_lowercase) == b.host_str().map(str::to_ascii_lowercase)
         && a.port_or_known_default() == b.port_or_known_default()
@@ -310,6 +432,8 @@ fn same_host(a: &url::Url, b: &url::Url) -> bool {
 
 #[derive(Deserialize)]
 struct ProtectedResourceMetadata {
+    /// Required (RFC 9728 section 3.3): must name the resource we asked about.
+    resource: String,
     #[serde(default)]
     authorization_servers: Vec<String>,
 }
@@ -325,6 +449,8 @@ struct AuthServerMetadata {
     revocation_endpoint: Option<String>,
     #[serde(default)]
     code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: bool,
 }
 
 /// Discover the authorization server of an MCP resource and validate its
@@ -358,6 +484,7 @@ pub async fn discover(
         .send()
         .await
         .map_err(|e| network_error(&e))?;
+    ensure_direct(&resp, &resource, OAuthError::Discovery("weiterleitung"))?;
     let from_header = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         resp.headers()
             .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -368,6 +495,14 @@ pub async fn discover(
         None
     };
     drop(resp);
+
+    // The announced metadata document must live on the resource's own origin.
+    if let Some(h) = &from_header {
+        let hu = policy.check(h)?;
+        if hu.origin() != resource.origin() {
+            return Err(OAuthError::Discovery("schutzbeschreibung fremder host"));
+        }
+    }
 
     // 2. Fallback: well-known location on the resource origin.
     let prm_url = from_header.unwrap_or_else(|| {
@@ -381,6 +516,14 @@ pub async fn discover(
     let prm: ProtectedResourceMetadata = get_json(http, policy, &prm_url)
         .await?
         .ok_or(OAuthError::Discovery("schutzbeschreibung nicht lesbar"))?;
+    // RFC 9728 section 3.3: the document must describe exactly the requested resource.
+    match (
+        normalised_resource(&prm.resource),
+        normalised_resource(resource_url),
+    ) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => return Err(OAuthError::Discovery("resource passt nicht")),
+    }
     let as_url = prm
         .authorization_servers
         .into_iter()
@@ -453,6 +596,7 @@ pub async fn discover(
         refresh_token: None,
         expires_at: None,
         scopes: Vec::new(),
+        iss_supported: meta.authorization_response_iss_parameter_supported,
     })
 }
 
@@ -475,7 +619,7 @@ pub async fn register_client(
         .registration_endpoint
         .as_deref()
         .ok_or(OAuthError::Discovery("keine selbstregistrierung"))?;
-    let u = policy.check(endpoint)?;
+    let u = issuer_endpoint(policy, rec, endpoint)?;
     let mut body = serde_json::json!({
         "client_name": "OpenFang (VibeMind)",
         "redirect_uris": [redirect_uri],
@@ -487,13 +631,14 @@ pub async fn register_client(
         body["scope"] = serde_json::Value::String(rec.scopes.join(" "));
     }
     let resp = http
-        .post(u)
+        .post(u.clone())
         .header(reqwest::header::ACCEPT, "application/json")
         .json(&body)
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|e| network_error(&e))?;
+    ensure_direct(&resp, &u, OAuthError::Network("weiterleitung"))?;
     let status = resp.status().as_u16();
     if status != 200 && status != 201 {
         return Err(OAuthError::Registration(status));
@@ -594,18 +739,19 @@ struct TokenErrorResponse {
 
 async fn post_form(
     http: &reqwest::Client,
-    policy: &UrlPolicy,
-    endpoint: &str,
+    endpoint: url::Url,
     form: &[(&str, &str)],
 ) -> Result<reqwest::Response, OAuthError> {
-    let u = policy.check(endpoint)?;
-    http.post(u)
+    let resp = http
+        .post(endpoint.clone())
         .header(reqwest::header::ACCEPT, "application/json")
         .form(form)
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
-        .map_err(|e| network_error(&e))
+        .map_err(|e| network_error(&e))?;
+    ensure_direct(&resp, &endpoint, OAuthError::Network("weiterleitung"))?;
+    Ok(resp)
 }
 
 /// Exchange an authorization code (with PKCE verifier) for tokens.
@@ -620,11 +766,12 @@ pub async fn exchange_code(
     let client_id = rec
         .client_id
         .clone()
+        .filter(|c| !c.is_empty())
         .ok_or(OAuthError::Discovery("keine client_id"))?;
+    let endpoint = issuer_endpoint(policy, rec, &rec.token_endpoint)?;
     let resp = post_form(
         http,
-        policy,
-        &rec.token_endpoint,
+        endpoint,
         &[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -664,11 +811,16 @@ pub async fn refresh(
         Some(t) if !t.is_empty() => Zeroizing::new(t.to_string()),
         _ => return Err(OAuthError::Refresh(RefreshFailure::InvalidGrant)),
     };
-    let client_id = rec.client_id.clone().unwrap_or_default();
+    // Never send an empty client_id; without one no refresh is possible.
+    let client_id = rec
+        .client_id
+        .clone()
+        .filter(|c| !c.is_empty())
+        .ok_or(OAuthError::Refresh(RefreshFailure::InvalidGrant))?;
+    let endpoint = issuer_endpoint(policy, rec, &rec.token_endpoint)?;
     let resp = post_form(
         http,
-        policy,
-        &rec.token_endpoint,
+        endpoint,
         &[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token.as_str()),
@@ -718,10 +870,14 @@ pub async fn revoke(
     let Some(token) = rec.refresh_token.as_deref().or(rec.access_token.as_deref()) else {
         return Ok(());
     };
-    let client_id = rec.client_id.as_deref().unwrap_or_default();
+    let client_id = rec
+        .client_id
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .ok_or(OAuthError::Discovery("keine client_id"))?;
+    let endpoint = issuer_endpoint(policy, rec, endpoint)?;
     let resp = post_form(
         http,
-        policy,
         endpoint,
         &[("token", token), ("client_id", client_id)],
     )
@@ -872,7 +1028,7 @@ mod tests {
 
     #[cfg(feature = "test-insecure-oauth")]
     fn http() -> reqwest::Client {
-        reqwest::Client::new()
+        http_client(&UrlPolicy::allow_loopback_http()).unwrap()
     }
 
     #[test]
@@ -994,7 +1150,7 @@ mod tests {
                 "/.well-known/oauth-protected-resource",
                 get(move || {
                     let b = b2.clone();
-                    async move { Json(serde_json::json!({"authorization_servers":[b]})) }
+                    async move { Json(serde_json::json!({"resource": format!("{b}/mcp"), "authorization_servers":[b]})) }
                 }),
             )
             .route(
@@ -1020,16 +1176,16 @@ mod tests {
     }
 
     /// Mock without a `/mcp` route (no 401 header -> well-known fallback).
-    /// `as_entry` is the `authorization_servers[0]` value, `meta` builds the AS
+    /// `prm` builds the protected-resource document, `meta` the AS
     /// metadata from the base URL.
     #[cfg(feature = "test-insecure-oauth")]
     async fn mock_meta(
-        as_entry: impl Fn(&str) -> String + Send + 'static,
+        prm: impl Fn(&str) -> serde_json::Value + Send + 'static,
         meta: impl Fn(&str) -> serde_json::Value + Send + Sync + 'static,
     ) -> String {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let b = format!("http://{}", l.local_addr().unwrap());
-        let prm = serde_json::json!({"authorization_servers": [as_entry(&b)]});
+        let prm = prm(&b);
         let m = meta(&b);
         let app = Router::new()
             .route(
@@ -1051,6 +1207,11 @@ mod tests {
     }
 
     #[cfg(feature = "test-insecure-oauth")]
+    fn good_prm(b: &str) -> serde_json::Value {
+        serde_json::json!({"resource": format!("{b}/mcp"), "authorization_servers": [b]})
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
     fn good_meta(issuer: &str, ep_base: &str) -> serde_json::Value {
         serde_json::json!({"issuer": issuer,
             "authorization_endpoint": format!("{ep_base}/authorize"),
@@ -1063,10 +1224,9 @@ mod tests {
     async fn discovery_specific_rule_violations_are_classified() {
         let p = UrlPolicy::allow_loopback_http();
         // issuer differs from the announced authorization server (both loopback-allowed)
-        let b = mock_meta(
-            |b| b.to_string(),
-            |b| good_meta(&b.replace("127.0.0.1", "localhost"), b),
-        )
+        let b = mock_meta(good_prm, |b| {
+            good_meta(&b.replace("127.0.0.1", "localhost"), b)
+        })
         .await;
         let e = discover(&http(), &p, &format!("{b}/mcp"))
             .await
@@ -1074,15 +1234,12 @@ mod tests {
         assert_eq!(e, OAuthError::Discovery("issuer passt nicht"));
 
         // token endpoint on a different host than the issuer
-        let b = mock_meta(
-            |b| b.to_string(),
-            |b| {
-                let mut m = good_meta(b, b);
-                m["token_endpoint"] =
-                    serde_json::json!(format!("{}/token", b.replace("127.0.0.1", "localhost")));
-                m
-            },
-        )
+        let b = mock_meta(good_prm, |b| {
+            let mut m = good_meta(b, b);
+            m["token_endpoint"] =
+                serde_json::json!(format!("{}/token", b.replace("127.0.0.1", "localhost")));
+            m
+        })
         .await;
         let e = discover(&http(), &p, &format!("{b}/mcp"))
             .await
@@ -1090,14 +1247,11 @@ mod tests {
         assert_eq!(e, OAuthError::Discovery("fremder host"));
 
         // no S256
-        let b = mock_meta(
-            |b| b.to_string(),
-            |b| {
-                let mut m = good_meta(b, b);
-                m["code_challenge_methods_supported"] = serde_json::json!(["plain"]);
-                m
-            },
-        )
+        let b = mock_meta(good_prm, |b| {
+            let mut m = good_meta(b, b);
+            m["code_challenge_methods_supported"] = serde_json::json!(["plain"]);
+            m
+        })
         .await;
         let e = discover(&http(), &p, &format!("{b}/mcp"))
             .await
@@ -1110,7 +1264,19 @@ mod tests {
     async fn discovery_normalises_trailing_slash_and_falls_back_to_well_known() {
         // authorization_servers entry with trailing '/', issuer without (Vercel-like),
         // and no 401 header from the resource -> origin well-known fallback.
-        let b = mock_meta(|b| format!("{b}/"), |b| good_meta(b, b)).await;
+        // PRM `resource` differs only by a trailing '/' and an upper-case scheme/host.
+        let b = mock_meta(
+            |b| {
+                serde_json::json!({"resource": format!("{}/mcp/", b.to_uppercase()),
+                    "authorization_servers": [format!("{b}/")]})
+            },
+            |b| {
+                let mut m = good_meta(b, b);
+                m["authorization_response_iss_parameter_supported"] = serde_json::json!(true);
+                m
+            },
+        )
+        .await;
         let rec = discover(
             &http(),
             &UrlPolicy::allow_loopback_http(),
@@ -1122,6 +1288,7 @@ mod tests {
         assert_eq!(rec.resource, format!("{b}/mcp"));
         assert!(!rec.has_tokens() && rec.client_id.is_none());
         assert!(rec.registration_endpoint.is_none());
+        assert!(rec.iss_supported, "iss support taken from AS metadata");
         // no registration endpoint -> fixed discovery class
         let mut rec = rec;
         let e = register_client(
@@ -1203,6 +1370,339 @@ mod tests {
             assert!(!e.class().is_empty() && !e.class().contains("KANARIE"));
         }
         assert_eq!(OAuthError::Vault.class(), "tresor nicht verfuegbar");
+    }
+
+    // ─── Fix round 1: redirects (C1) ─────────────────────────────────────
+
+    /// A server that counts every request it receives (redirect target).
+    #[cfg(feature = "test-insecure-oauth")]
+    async fn steal_server() -> (String, Arc<std::sync::atomic::AtomicU32>) {
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let h = hits.clone();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = format!("http://{}", l.local_addr().unwrap());
+        let app = Router::new().fallback(move || {
+            let h = h.clone();
+            async move {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(
+                    serde_json::json!({"access_token":"STOLEN","client_id":"STOLEN",
+                    "resource": "x", "authorization_servers": ["x"]}),
+                )
+            }
+        });
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (b, hits)
+    }
+
+    /// AS whose every route answers `status` with `Location: {target}/steal`.
+    #[cfg(feature = "test-insecure-oauth")]
+    async fn redirecting_server(status: u16, target: String) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = format!("http://{}", l.local_addr().unwrap());
+        let app = Router::new().fallback(move || {
+            let t = target.clone();
+            async move {
+                let mut h = HeaderMap::new();
+                h.insert("location", format!("{t}/steal").parse().unwrap());
+                (StatusCode::from_u16(status).unwrap(), h)
+            }
+        });
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        b
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    fn record_on(b: &str) -> OAuthRecord {
+        let mut r = OAuthRecord::empty_for_tests();
+        r.resource = format!("{b}/mcp");
+        r.issuer = b.to_string();
+        r.authorization_endpoint = format!("{b}/authorize");
+        r.token_endpoint = format!("{b}/token");
+        r.registration_endpoint = Some(format!("{b}/register"));
+        r.revocation_endpoint = Some(format!("{b}/revoke"));
+        r.client_id = Some("KANARIE-CLIENT".into());
+        r.refresh_token = Some("KANARIE-RT".into());
+        r
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn token_register_revoke_redirects_are_not_followed() {
+        let (steal, hits) = steal_server().await;
+        let b = redirecting_server(307, steal).await;
+        let p = UrlPolicy::allow_loopback_http();
+        let c = http_client(&p).unwrap();
+        let mut rec = record_on(&b);
+        let w = OAuthError::Network("weiterleitung");
+        assert_eq!(
+            exchange_code(
+                &c,
+                &p,
+                &mut rec,
+                "CODE",
+                "VERIFIER",
+                "http://127.0.0.1:1/cb"
+            )
+            .await
+            .unwrap_err(),
+            w
+        );
+        assert_eq!(refresh(&c, &p, &mut rec).await.unwrap_err(), w);
+        assert_eq!(revoke(&c, &p, &rec).await.unwrap_err(), w);
+        assert_eq!(
+            register_client(&c, &p, &mut rec, "http://127.0.0.1:1/cb")
+                .await
+                .unwrap_err(),
+            w
+        );
+        assert!(rec.access_token.is_none());
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "redirect followed"
+        );
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn discovery_redirect_is_not_followed() {
+        let (steal, hits) = steal_server().await;
+        let b = redirecting_server(302, steal).await;
+        let p = UrlPolicy::allow_loopback_http();
+        let e = discover(&http_client(&p).unwrap(), &p, &format!("{b}/mcp"))
+            .await
+            .unwrap_err();
+        assert_eq!(e, OAuthError::Discovery("weiterleitung"));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn redirect_following_client_still_fails_closed() {
+        // Defence in depth: even a caller-supplied default client (which follows
+        // redirects) must not lead to an accepted result.
+        let (steal, _) = steal_server().await;
+        let b = redirecting_server(307, steal).await;
+        let p = UrlPolicy::allow_loopback_http();
+        let c = reqwest::Client::new();
+        let mut rec = record_on(&b);
+        assert_eq!(
+            refresh(&c, &p, &mut rec).await.unwrap_err(),
+            OAuthError::Network("weiterleitung")
+        );
+        assert!(rec.access_token.is_none());
+        assert_eq!(
+            discover(&c, &p, &format!("{b}/mcp")).await.unwrap_err(),
+            OAuthError::Discovery("weiterleitung")
+        );
+    }
+
+    #[test]
+    fn http_client_builds_for_strict_policy() {
+        assert!(http_client(&UrlPolicy::strict()).is_ok());
+    }
+
+    // ─── Fix round 1: resource binding (I1) ──────────────────────────────
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn discovery_rejects_prm_for_another_resource() {
+        let b = mock_meta(
+            |b| serde_json::json!({"resource": "https://evil.example/mcp", "authorization_servers": [b]}),
+            |b| good_meta(b, b),
+        )
+        .await;
+        let p = UrlPolicy::allow_loopback_http();
+        let e = discover(&http(), &p, &format!("{b}/mcp"))
+            .await
+            .unwrap_err();
+        assert_eq!(e, OAuthError::Discovery("resource passt nicht"));
+        // a missing `resource` is not readable metadata either
+        let b = mock_meta(
+            |b| serde_json::json!({"authorization_servers": [b]}),
+            |b| good_meta(b, b),
+        )
+        .await;
+        assert!(discover(&http(), &p, &format!("{b}/mcp")).await.is_err());
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn discovery_rejects_resource_metadata_on_foreign_origin() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = format!("http://{}", l.local_addr().unwrap());
+        // same port, other host spelling -> other origin (both loopback-allowed)
+        let foreign = b.replace("127.0.0.1", "localhost");
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(move || {
+                    let f = foreign.clone();
+                    async move {
+                        let mut h = HeaderMap::new();
+                        h.insert(
+                            "www-authenticate",
+                            format!("Bearer resource_metadata=\"{f}/.well-known/oauth-protected-resource\"")
+                                .parse()
+                                .unwrap(),
+                        );
+                        (StatusCode::UNAUTHORIZED, h)
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get({
+                    let b = b.clone();
+                    move || async move { Json(good_prm(&b)) }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let e = discover(
+            &http(),
+            &UrlPolicy::allow_loopback_http(),
+            &format!("{b}/mcp"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, OAuthError::Discovery("schutzbeschreibung fremder host"));
+    }
+
+    // ─── Fix round 1: SSRF (I2) ──────────────────────────────────────────
+
+    #[test]
+    fn strict_policy_rejects_internal_targets() {
+        let p = UrlPolicy::strict();
+        for u in [
+            "https://127.0.0.1/",
+            "https://10.0.0.1/",
+            "https://169.254.169.254/",
+            "https://[::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://2130706433/",
+            "https://localhost/",
+            "https://LOCALHOST./",
+            "https://foo.localhost/",
+            "https://printer.local/",
+            "https://db.internal/",
+            "https://foo.tail6c7d61.ts.net/",
+        ] {
+            assert_eq!(
+                p.check(u).unwrap_err(),
+                OAuthError::Discovery("unzulaessiger host"),
+                "{u}"
+            );
+        }
+        assert!(p.check("https://mcp.vercel.com/").is_ok());
+        assert!(p.check("https://vercel.com/api/login/oauth/token").is_ok());
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[test]
+    fn insecure_policy_still_rejects_non_loopback_internal_targets() {
+        let p = UrlPolicy::allow_loopback_http();
+        assert!(p.check("https://localhost:9/x").is_ok());
+        assert!(p.check("https://10.0.0.1/").is_err());
+        assert!(p.check("https://169.254.169.254/").is_err());
+        assert!(p.check("http://foo.local/").is_err());
+        assert!(p.check("https://foo.tail6c7d61.ts.net/").is_err());
+    }
+
+    // ─── Fix round 1: RFC 9207 iss (I3) ──────────────────────────────────
+
+    #[test]
+    fn callback_iss_check_covers_all_branches() {
+        let mut r = OAuthRecord::empty_for_tests();
+        r.issuer = "https://vercel.com".into();
+        let bad = Err(OAuthError::Discovery("iss passt nicht"));
+        // not advertised
+        assert_eq!(check_callback_iss(&r, None), Ok(()));
+        assert_eq!(check_callback_iss(&r, Some("https://vercel.com")), Ok(()));
+        assert_eq!(check_callback_iss(&r, Some("https://vercel.com/")), Ok(()));
+        assert_eq!(check_callback_iss(&r, Some("https://evil.example")), bad);
+        // advertised
+        r.iss_supported = true;
+        assert_eq!(check_callback_iss(&r, None), bad);
+        assert_eq!(check_callback_iss(&r, Some("https://vercel.com")), Ok(()));
+        assert_eq!(check_callback_iss(&r, Some("https://VERCEL.com")), bad);
+        assert_eq!(check_callback_iss(&r, Some("https://evil.example")), bad);
+        // old vault records without the field deserialise with iss_supported = false
+        let mut j = serde_json::to_value(&r).unwrap();
+        j.as_object_mut().unwrap().remove("iss_supported");
+        let old: OAuthRecord = serde_json::from_value(j).unwrap();
+        assert!(!old.iss_supported);
+    }
+
+    // ─── Fix round 1: minors (M1-M3) ─────────────────────────────────────
+
+    #[test]
+    fn debug_omits_query_strings_of_urls() {
+        let mut r = OAuthRecord::empty_for_tests();
+        r.resource = "https://mcp.example/?key=KANARIE-Q1".into();
+        r.authorization_endpoint = "https://as.example/a?x=KANARIE-Q2#frag".into();
+        r.token_endpoint = "https://as.example/t?KANARIE-Q3".into();
+        r.registration_endpoint = Some("https://as.example/r?KANARIE-Q4".into());
+        r.revocation_endpoint = Some("https://as.example/v?KANARIE-Q5".into());
+        let d = format!("{r:?}");
+        assert!(!d.contains("KANARIE"), "{d}");
+        assert!(d.contains("https://as.example/t"));
+    }
+
+    #[tokio::test]
+    async fn missing_client_id_is_never_sent_empty() {
+        let p = UrlPolicy::strict();
+        let c = http_client(&p).unwrap();
+        let mut r = OAuthRecord::empty_for_tests();
+        r.issuer = "https://as.example".into();
+        r.token_endpoint = "https://as.example/token".into();
+        r.revocation_endpoint = Some("https://as.example/revoke".into());
+        r.refresh_token = Some("RT".into());
+        // fails before any network access (as.example is never contacted)
+        assert_eq!(
+            refresh(&c, &p, &mut r).await.unwrap_err(),
+            OAuthError::Refresh(RefreshFailure::InvalidGrant)
+        );
+        assert_eq!(
+            revoke(&c, &p, &r).await.unwrap_err(),
+            OAuthError::Discovery("keine client_id")
+        );
+        r.client_id = Some(String::new());
+        assert_eq!(
+            refresh(&c, &p, &mut r).await.unwrap_err(),
+            OAuthError::Refresh(RefreshFailure::InvalidGrant)
+        );
+        assert_eq!(
+            revoke(&c, &p, &r).await.unwrap_err(),
+            OAuthError::Discovery("keine client_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_record_endpoints_fail_closed() {
+        let p = UrlPolicy::strict();
+        let c = http_client(&p).unwrap();
+        let mut r = OAuthRecord::empty_for_tests();
+        r.issuer = "https://as.example".into();
+        r.token_endpoint = "https://evil.example/token".into();
+        r.revocation_endpoint = Some("https://evil.example/revoke".into());
+        r.client_id = Some("CID".into());
+        r.refresh_token = Some("RT".into());
+        let f = OAuthError::Discovery("fremder host");
+        assert_eq!(
+            exchange_code(&c, &p, &mut r, "C", "V", "http://127.0.0.1:1/cb")
+                .await
+                .unwrap_err(),
+            f
+        );
+        assert_eq!(refresh(&c, &p, &mut r).await.unwrap_err(), f);
+        assert_eq!(revoke(&c, &p, &r).await.unwrap_err(), f);
+        // internal target in a tampered record is refused by the policy
+        r.token_endpoint = "https://169.254.169.254/token".into();
+        assert_eq!(
+            refresh(&c, &p, &mut r).await.unwrap_err(),
+            OAuthError::Discovery("unzulaessiger host")
+        );
     }
 
     #[test]
