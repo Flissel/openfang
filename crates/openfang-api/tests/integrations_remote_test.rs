@@ -221,16 +221,16 @@ async fn connected_with_env_key_and_value_never_leaks() {
     // Kanarienwert als Prozess-Umgebung (der CredentialResolver faellt auf env
     // zurueck). Er teilt keinen Teilstring mit irgendeinem Namen.
     const CANARY: &str = "kanarie-7f3a91";
-    let _env = EnvGuard::set("PROBE_KEY_GUT", CANARY);
+    let _env = EnvGuard::set("INTEGRATION_PROBE_KEY_GUT", CANARY);
     let url = start_mini_mcp().await;
-    let h = harness(template(&url, "PROBE_KEY_GUT", "admitted")).await;
+    let h = harness(template(&url, "INTEGRATION_PROBE_KEY_GUT", "admitted")).await;
     let (status, json) = add(&h).await;
     assert_eq!(status, 201, "{json}");
     assert_eq!(json["zustand"], "verbunden", "{json}");
     assert_value_never_leaks(&h, &json, CANARY).await;
     let list = body(&h, "/api/integrations").await;
     assert!(
-        list.contains("PROBE_KEY_GUT"),
+        list.contains("INTEGRATION_PROBE_KEY_GUT"),
         "reference name should be listed: {list}"
     );
     // Freigabe-Standard ueber den echten Kernel:
@@ -270,16 +270,16 @@ async fn connected_with_env_key_and_value_never_leaks() {
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_key_is_key_rejected() {
     const CANARY: &str = "kanarie-falsch-c42e";
-    let _env = EnvGuard::set("PROBE_KEY_FALSCH", CANARY);
+    let _env = EnvGuard::set("INTEGRATION_PROBE_KEY_FALSCH", CANARY);
     let url = start_mini_mcp().await;
-    let h = harness(template(&url, "PROBE_KEY_FALSCH", "admitted")).await;
+    let h = harness(template(&url, "INTEGRATION_PROBE_KEY_FALSCH", "admitted")).await;
     let (status, json) = add(&h).await;
     assert_eq!(status, 201, "{json}");
     assert_eq!(json["zustand"], "schluessel_abgelehnt", "{json}");
     assert_value_never_leaks(&h, &json, CANARY).await;
     let list = body(&h, "/api/integrations").await;
     assert!(
-        list.contains("PROBE_KEY_FALSCH"),
+        list.contains("INTEGRATION_PROBE_KEY_FALSCH"),
         "reference name should be listed: {list}"
     );
 }
@@ -287,20 +287,20 @@ async fn wrong_key_is_key_rejected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_key_is_reported_by_name() {
     let url = start_mini_mcp().await;
-    let h = harness(template(&url, "PROBE_KEY_FEHLT_UEBERALL", "admitted")).await;
+    let h = harness(template(&url, "INTEGRATION_PROBE_KEY_FEHLT_UEBERALL", "admitted")).await;
     let (status, json) = add(&h).await;
     assert_eq!(status, 201);
     assert_eq!(json["zustand"], "fehlt_schluessel", "{json}");
     assert!(json["detail"]
         .as_str()
         .unwrap()
-        .contains("PROBE_KEY_FEHLT_UEBERALL"));
+        .contains("INTEGRATION_PROBE_KEY_FEHLT_UEBERALL"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn review_required_is_not_installable() {
     let url = start_mini_mcp().await;
-    let h = harness(template(&url, "PROBE_KEY_EGAL", "review_required")).await;
+    let h = harness(template(&url, "INTEGRATION_PROBE_KEY_EGAL", "review_required")).await;
     let (status, json) = add(&h).await;
     assert_eq!(status, 409);
     assert_eq!(json["error"], "integration_not_admitted");
@@ -325,9 +325,9 @@ async fn review_required_is_not_installable() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn installed_template_switched_to_review_required_is_not_admitted_and_disconnected() {
-    let _env = EnvGuard::set("PROBE_KEY_UMSCHALT", "kanarie-7f3a91");
+    let _env = EnvGuard::set("INTEGRATION_PROBE_KEY_UMSCHALT", "kanarie-7f3a91");
     let url = start_mini_mcp().await;
-    let h = harness(template(&url, "PROBE_KEY_UMSCHALT", "admitted")).await;
+    let h = harness(template(&url, "INTEGRATION_PROBE_KEY_UMSCHALT", "admitted")).await;
     let (status, json) = add(&h).await;
     assert_eq!(status, 201, "{json}");
     assert_eq!(json["zustand"], "verbunden", "{json}");
@@ -336,7 +336,7 @@ async fn installed_template_switched_to_review_required_is_not_admitted_and_disc
     let dir = h.state.kernel.config.extensions.template_dirs[0].clone();
     std::fs::write(
         dir.join("probe.toml"),
-        template(&url, "PROBE_KEY_UMSCHALT", "review_required"),
+        template(&url, "INTEGRATION_PROBE_KEY_UMSCHALT", "review_required"),
     )
     .unwrap();
     let r = reqwest::Client::new()
@@ -366,9 +366,9 @@ async fn installed_template_switched_to_review_required_is_not_admitted_and_disc
 #[tokio::test(flavor = "multi_thread")]
 async fn vendor_503_body_never_leaves_the_daemon() {
     const CANARY: &str = "kanarie-503-wert-9d1b";
-    let _env = EnvGuard::set("PROBE_KEY_503", CANARY);
+    let _env = EnvGuard::set("INTEGRATION_PROBE_KEY_503", CANARY);
     let url = start_mini_mcp_503().await;
-    let h = harness(template(&url, "PROBE_KEY_503", "admitted")).await;
+    let h = harness(template(&url, "INTEGRATION_PROBE_KEY_503", "admitted")).await;
     let (status, json) = add(&h).await;
     assert_eq!(status, 201, "{json}");
     assert_eq!(json["zustand"], "nicht_erreichbar", "{json}");
@@ -389,7 +389,7 @@ async fn vendor_503_body_never_leaves_the_daemon() {
 #[tokio::test(flavor = "multi_thread")]
 async fn installed_without_health_entry_is_unknown_not_missing_key() {
     let url = start_mini_mcp().await;
-    let h = harness(template(&url, "PROBE_KEY_EGAL", "admitted")).await;
+    let h = harness(template(&url, "INTEGRATION_PROBE_KEY_EGAL", "admitted")).await;
     // Direkt in der Registry installiert, ohne Gesundheits-Eintrag.
     h.state
         .kernel
@@ -414,7 +414,7 @@ async fn installed_without_health_entry_is_unknown_not_missing_key() {
 async fn empty_mcp_allowlist_is_reported_as_all_except_integrations() {
     use openfang_types::agent::{AgentEntry, AgentId, AgentManifest, AgentMode, AgentState, SessionId};
     let url = start_mini_mcp().await;
-    let h = harness(template(&url, "PROBE_KEY_EGAL", "admitted")).await;
+    let h = harness(template(&url, "INTEGRATION_PROBE_KEY_EGAL", "admitted")).await;
     let agent_id = AgentId::new();
     let manifest = AgentManifest {
         name: "plain-agent".into(),

@@ -218,6 +218,7 @@ mod tests {
                 format: "Bearer {credential}".into(),
                 credential: "INTEG_KERN_TEST_KEY".into(),
             }],
+            oauth: false,
         }
     }
 

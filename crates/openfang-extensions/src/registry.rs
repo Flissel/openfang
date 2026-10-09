@@ -9,7 +9,7 @@ use crate::{
     IntegrationStatus, IntegrationTemplate, IntegrationsFile,
 };
 use openfang_types::config::{McpServerConfigEntry, McpTransportEntry};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -25,6 +25,21 @@ pub fn validate_template(t: &crate::IntegrationTemplate) -> Result<(), String> {
     }
     for h in &t.auth_headers {
         h.validate()?;
+    }
+    if let Some(auth) = &t.auth {
+        let _ = auth;
+        match t.transport {
+            crate::McpTransportTemplate::Http { .. } | crate::McpTransportTemplate::Sse { .. } => {}
+            crate::McpTransportTemplate::Stdio { .. } => return Err("oauth nur bei http/sse erlaubt".into()),
+        }
+        if !t.auth_headers.is_empty() {
+            return Err("oauth schliesst auth_headers aus".into());
+        }
+    }
+    if t.catalog.is_some()
+        && t.auth_headers.iter().any(|h| !h.credential.starts_with(crate::INTEGRATION_PREFIX))
+    {
+        return Err("auth_headers: Referenz muss mit INTEGRATION_ beginnen".into());
     }
     Ok(())
 }
@@ -55,6 +70,8 @@ pub struct IntegrationRegistry {
     installed: HashMap<String, InstalledIntegration>,
     /// Path to integrations.toml.
     integrations_path: PathBuf,
+    /// Ids, deren Ordner-Vorlage ungueltig war (kein stiller Rueckfall auf die eingebaute).
+    invalid_overrides: HashSet<String>,
 }
 
 impl IntegrationRegistry {
@@ -64,6 +81,7 @@ impl IntegrationRegistry {
             templates: HashMap::new(),
             installed: HashMap::new(),
             integrations_path: home_dir.join("integrations.toml"),
+            invalid_overrides: HashSet::new(),
         }
     }
 
@@ -113,19 +131,30 @@ impl IntegrationRegistry {
                 .collect();
             paths.sort();
             for path in paths {
+                let mut failed_id: Option<String> = None;
                 let parsed = std::fs::read_to_string(&path)
                     .map_err(|e| format!("nicht lesbar: {}", e.kind()))
                     .and_then(|s| {
                         toml::from_str::<IntegrationTemplate>(&s)
                             .map_err(|_| "TOML ungueltig".to_string())
                     })
-                    .and_then(|t| validate_template(&t).map(|_| t));
+                    .and_then(|t| match validate_template(&t) {
+                        Ok(()) => Ok(t),
+                        Err(why) => {
+                            failed_id = Some(t.id.clone());
+                            Err(why)
+                        }
+                    });
                 match parsed {
                     Ok(t) => {
+                        self.invalid_overrides.remove(&t.id);
                         self.templates.insert(t.id.clone(), t);
                         report.loaded += 1;
                     }
                     Err(why) => {
+                        if let Some(id) = failed_id {
+                            self.invalid_overrides.insert(id);
+                        }
                         warn!(file = %path.display(), reason = %why, "Integrations-Vorlage uebersprungen");
                         report.skipped.push((path, why));
                     }
@@ -163,6 +192,11 @@ impl IntegrationRegistry {
         }
         std::fs::write(&self.integrations_path, content)?;
         Ok(())
+    }
+
+    /// Ids, deren Ordner-Vorlage ungueltig war; installierte davon werden nie verbunden.
+    pub fn invalid_overrides(&self) -> &HashSet<String> {
+        &self.invalid_overrides
     }
 
     /// Get a template by ID.
@@ -264,6 +298,9 @@ impl IntegrationRegistry {
             .values()
             .filter(|inst| inst.enabled)
             .filter_map(|inst| {
+                if self.invalid_overrides.contains(&inst.id) {
+                    return None;
+                }
                 let template = self.templates.get(&inst.id)?;
                 // Nicht zugelassene Vorlagen werden nie verbunden (Spec 4.1/4.4).
                 if !template.is_admitted() {
@@ -296,7 +333,16 @@ impl IntegrationRegistry {
                     timeout_secs: 30,
                     env,
                     headers: Vec::new(),
-                    auth_headers: template.auth_headers.clone(),
+                    auth_headers: if template.auth.is_some() {
+                        vec![openfang_types::config::AuthHeaderRef {
+                            name: "Authorization".into(),
+                            format: "Bearer {credential}".into(),
+                            credential: crate::oauth_reference(&inst.id),
+                        }]
+                    } else {
+                        template.auth_headers.clone()
+                    },
+                    oauth: template.auth.is_some(),
                 })
             })
             .collect()
@@ -347,6 +393,30 @@ url = "https://api.githubcopilot.com/mcp/"
 [[auth_headers]]
 name = "Authorization"
 format = "Bearer {credential}"
+credential = "INTEGRATION_GITHUB_PAT"
+[[required_env]]
+name = "INTEGRATION_GITHUB_PAT"
+label = "GitHub PAT"
+help = "fein granuliert"
+[catalog]
+replaces_openai_plugin = "github"
+license = "MIT"
+admission = "admitted"
+"#;
+
+    /// Wie REMOTE, aber mit der alten Referenz (nicht INTEGRATION_) — fuer Negativtests.
+    const REMOTE_LEGACY: &str = r#"
+id = "github"
+name = "GitHub"
+description = "GitHub ueber den offiziellen Remote-MCP-Server"
+category = "devtools"
+read_only_tools = ["get_me"]
+[transport]
+type = "http"
+url = "https://api.githubcopilot.com/mcp/"
+[[auth_headers]]
+name = "Authorization"
+format = "Bearer {credential}"
 credential = "GITHUB_PAT_TOKEN"
 [[required_env]]
 name = "GITHUB_PAT_TOKEN"
@@ -358,6 +428,86 @@ license = "MIT"
 admission = "admitted"
 "#;
 
+    const VERCEL: &str = r#"
+id = "vercel"
+name = "Vercel"
+description = "Vercel ueber den offiziellen Remote-MCP-Server"
+category = "devtools"
+read_only_tools = ["list_projects"]
+[transport]
+type = "http"
+url = "https://mcp.vercel.com/"
+[auth]
+type = "oauth"
+scopes = ["offline_access"]
+[catalog]
+replaces_openai_plugin = "vercel"
+license = "proprietary-service"
+admission = "admitted"
+"#;
+
+    #[test]
+    fn oauth_template_parses_and_maps_to_oauth_entry_with_bearer_reference() {
+        let t: crate::IntegrationTemplate = toml::from_str(VERCEL).unwrap();
+        assert!(validate_template(&t).is_ok());
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vercel.toml"), VERCEL).unwrap();
+        let mut reg = IntegrationRegistry::new(home.path());
+        reg.load_bundled();
+        reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        reg.install(crate::InstalledIntegration { id: "vercel".into(), installed_at: chrono::Utc::now(),
+            enabled: true, oauth_provider: None, config: Default::default() }).unwrap();
+        let e = reg.to_mcp_configs().into_iter().find(|c| c.name == "vercel").unwrap();
+        assert!(e.oauth);
+        assert!(e.env.is_empty());
+        assert_eq!(e.auth_headers.len(), 1);
+        assert_eq!(e.auth_headers[0].name, "Authorization");
+        assert_eq!(e.auth_headers[0].format, "Bearer {credential}");
+        assert_eq!(e.auth_headers[0].credential, crate::oauth_reference("vercel"));
+    }
+
+    #[test]
+    fn oauth_reference_shape() {
+        assert_eq!(crate::oauth_reference("vercel"), "INTEGRATION_OAUTH_VERCEL");
+        assert_eq!(crate::oauth_reference("github-probe"), "INTEGRATION_OAUTH_GITHUB_PROBE");
+    }
+
+    #[test]
+    fn oauth_rejected_on_stdio_and_together_with_auth_headers() {
+        let mut t: crate::IntegrationTemplate = toml::from_str(VERCEL).unwrap();
+        t.transport = crate::McpTransportTemplate::Stdio { command: "npx".into(), args: vec![] };
+        assert!(validate_template(&t).is_err());
+        let mut t: crate::IntegrationTemplate = toml::from_str(VERCEL).unwrap();
+        t.auth_headers.push(openfang_types::config::AuthHeaderRef {
+            name: "Authorization".into(), format: "Bearer {credential}".into(), credential: "INTEGRATION_X".into() });
+        assert!(validate_template(&t).is_err());
+    }
+
+    #[test]
+    fn catalog_templates_require_integration_prefix_for_static_keys() {
+        let t: crate::IntegrationTemplate = toml::from_str(REMOTE_LEGACY).unwrap();
+        assert!(validate_template(&t).is_err(), "catalog template with non-INTEGRATION_ reference must be rejected");
+        let good = REMOTE_LEGACY.replace("credential = \"GITHUB_PAT_TOKEN\"", "credential = \"INTEGRATION_GITHUB_PAT\"");
+        let t: crate::IntegrationTemplate = toml::from_str(&good).unwrap();
+        assert!(validate_template(&t).is_ok());
+    }
+
+    #[test]
+    fn invalid_folder_override_blocks_installed_id_instead_of_falling_back_to_stdio() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // REMOTE_LEGACY uses GITHUB_PAT_TOKEN -> invalid for a catalog template
+        std::fs::write(dir.path().join("github.toml"), REMOTE_LEGACY).unwrap();
+        let mut reg = IntegrationRegistry::new(home.path());
+        reg.load_bundled();
+        let report = reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        assert_eq!(report.loaded, 0);
+        assert!(reg.invalid_overrides().contains("github"));
+        reg.install(crate::InstalledIntegration { id: "github".into(), installed_at: chrono::Utc::now(),
+            enabled: true, oauth_provider: None, config: Default::default() }).unwrap();
+        assert!(reg.to_mcp_configs().iter().all(|c| c.name != "github"), "no silent stdio fallback");
+    }
     fn write(dir: &std::path::Path, file: &str, body: &str) {
         std::fs::write(dir.join(file), body).unwrap();
     }
@@ -382,7 +532,7 @@ admission = "admitted"
         let gh = cfgs.iter().find(|c| c.name == "github").unwrap();
         assert!(gh.env.is_empty(), "remote template must not export env: {:?}", gh.env);
         assert_eq!(gh.auth_headers.len(), 1);
-        assert_eq!(gh.auth_headers[0].credential, "GITHUB_PAT_TOKEN");
+        assert_eq!(gh.auth_headers[0].credential, "INTEGRATION_GITHUB_PAT");
         assert!(gh.headers.is_empty());
     }
 
@@ -406,7 +556,7 @@ admission = "admitted"
     fn validation_messages_never_contain_values() {
         let t: crate::IntegrationTemplate = toml::from_str(
             &REMOTE
-                .replace("GITHUB_PAT_TOKEN\"\n[[required_env]]", "KANARIE-SECRET-1\"\n[[required_env]]")
+                .replace("INTEGRATION_GITHUB_PAT\"\n[[required_env]]", "KANARIE-SECRET-1\"\n[[required_env]]")
                 .replace("name = \"Authorization\"", "name = \"Auth KANARIE-SECRET-2\""),
         )
         .unwrap();
@@ -418,7 +568,7 @@ admission = "admitted"
         write(
             dir.path(),
             "a.toml",
-            &REMOTE.replace("credential = \"GITHUB_PAT_TOKEN\"", "credential = \"KANARIE-SECRET-1\""),
+            &REMOTE.replace("credential = \"INTEGRATION_GITHUB_PAT\"", "credential = \"KANARIE-SECRET-1\""),
         );
         write(
             dir.path(),
@@ -447,10 +597,10 @@ url = "https://api.githubcopilot.com/mcp/"
 [[auth_headers]]
 name = "Authorization"
 format = "Bearer {credential}"
-credential = "GITHUB_PAT_TOKEN"
+credential = "INTEGRATION_GITHUB_PAT"
 
 [[required_env]]
-name = "GITHUB_PAT_TOKEN"
+name = "INTEGRATION_GITHUB_PAT"
 label = "GitHub Personal Access Token (fein granuliert)"
 help = "Fein granulierter Token; Rechte nach Bedarf, fuer get_me reichen keine"
 is_secret = true
@@ -473,7 +623,7 @@ admission = "admitted"
             }
             other => panic!("expected http transport, got {other:?}"),
         }
-        assert_eq!(t.auth_headers[0].credential, "GITHUB_PAT_TOKEN");
+        assert_eq!(t.auth_headers[0].credential, "INTEGRATION_GITHUB_PAT");
         assert!(t.read_only_tools.iter().any(|n| n == "get_me"));
     }
 

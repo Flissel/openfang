@@ -5566,6 +5566,12 @@ fn cmd_integrations_list(query: Option<&str>) {
                 openfang_extensions::IntegrationStatus::NotAdmitted => {
                     "[Not admitted]".dimmed().to_string()
                 }
+                openfang_extensions::IntegrationStatus::LoginRequired(reason) => {
+                    format!("[Login required: {reason}]").yellow().to_string()
+                }
+                openfang_extensions::IntegrationStatus::TemplateInvalid => {
+                    "[Template invalid]".red().to_string()
+                }
             };
             println!(
                 "    {} {:<20} {:<12} {}",

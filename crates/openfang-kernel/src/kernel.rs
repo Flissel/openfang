@@ -8691,7 +8691,7 @@ url = "http://127.0.0.1:9/mcp"
 [[auth_headers]]
 name = "Authorization"
 format = "Bearer {{credential}}"
-credential = "PROBE_KEY_NOT_SET_ANYWHERE"
+credential = "INTEGRATION_PROBE_KEY_NOT_SET_ANYWHERE"
 [catalog]
 admission = "{admission}"
 "#
@@ -9609,6 +9609,7 @@ admission = "{admission}"
             env: vec![],
             headers: vec![],
             auth_headers: Vec::new(),
+            oauth: false,
         };
         let mut config = KernelConfig {
             home_dir: home_dir.clone(),
@@ -9752,6 +9753,7 @@ admission = "{admission}"
             env: vec![],
             headers: vec![],
             auth_headers: Vec::new(),
+            oauth: false,
         };
         let mut config = KernelConfig {
             home_dir: home_dir.clone(),
@@ -10570,6 +10572,7 @@ admission = "{admission}"
                 env: vec!["OPENAI_API_KEY".to_string()],
                 headers: vec![],
                 auth_headers: Vec::new(),
+                oauth: false,
             }],
             ..KernelConfig::default()
         };

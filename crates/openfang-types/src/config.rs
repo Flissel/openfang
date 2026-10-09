@@ -1523,6 +1523,9 @@ pub struct McpServerConfigEntry {
     /// Header, deren Werte der Kernel beim Verbinden aus dem Tresor einsetzt.
     #[serde(default)]
     pub auth_headers: Vec<AuthHeaderRef>,
+    /// OAuth-Integration: Der Bearer-Wert kommt aus dem Tresor, vom Kernel verwaltet.
+    #[serde(default)]
+    pub oauth: bool,
 }
 
 /// Returns the header name only if it is safe to echo into logs, errors and
@@ -1568,6 +1571,7 @@ impl std::fmt::Debug for McpServerConfigEntry {
             .field("env", &self.env)
             .field("headers", &headers)
             .field("auth_headers", &self.auth_headers)
+            .field("oauth", &self.oauth)
             .finish()
     }
 }
@@ -5057,6 +5061,7 @@ X-Evil: 1".into(), ..ok.clone() };
             env: vec![],
             headers: vec![h.into()],
             auth_headers: vec![],
+            oauth: false,
         };
         let dbg = format!("{:?}", mk("Authorization Bearer KANARIE-1:x"));
         assert!(!dbg.contains("KANARIE-1"), "{dbg}");
@@ -5074,6 +5079,7 @@ X-Evil: 1".into(), ..ok.clone() };
             env: vec![],
             headers: vec!["Authorization: Bearer KANARIE-123".into()],
             auth_headers: vec![],
+            oauth: false,
         };
         let dbg = format!("{e:?}");
         assert!(!dbg.contains("KANARIE-123"), "Debug leaks header value: {dbg}");
@@ -5091,6 +5097,12 @@ url = "https://example.com/mcp"
 "#;
         let e: McpServerConfigEntry = toml::from_str(toml_src).unwrap();
         assert!(e.auth_headers.is_empty());
+    }
+
+    #[test]
+    fn mcp_server_entry_oauth_defaults_false() {
+        let e: McpServerConfigEntry = toml::from_str("name = \"x\"\ntimeout_secs = 30\n[transport]\ntype = \"http\"\nurl = \"https://e/mcp\"\n").unwrap();
+        assert!(!e.oauth);
     }
 
     #[test]

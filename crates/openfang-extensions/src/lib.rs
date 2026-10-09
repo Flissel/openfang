@@ -170,6 +170,34 @@ pub struct CatalogMeta {
     pub admission: Admission,
 }
 
+/// Praefix aller vom Kernel verwalteten Tresor-Referenzen; nie ueber /api/credentials/* ausstellbar.
+pub const INTEGRATION_PREFIX: &str = "INTEGRATION_";
+
+/// Tresor-Referenz des OAuth-Tokens einer Integration (INTEGRATION_OAUTH_<ID>).
+pub fn oauth_reference(id: &str) -> String {
+    let up: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    format!("{INTEGRATION_PREFIX}OAUTH_{up}")
+}
+
+/// Art der Anmeldung einer Vorlage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthKind {
+    Oauth,
+}
+
+/// [auth]-Block einer Vorlage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthTemplate {
+    #[serde(rename = "type")]
+    pub kind: AuthKind,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
 /// A bundled integration template — describes how to set up an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrationTemplate {
@@ -210,6 +238,9 @@ pub struct IntegrationTemplate {
     /// Katalog-Metadaten (fehlt = zugelassen).
     #[serde(default)]
     pub catalog: Option<CatalogMeta>,
+    /// OAuth-Anmeldung (Teilprojekt 1b); schliesst uth_headers aus.
+    #[serde(default)]
+    pub auth: Option<AuthTemplate>,
 }
 
 impl IntegrationTemplate {
@@ -240,6 +271,10 @@ pub enum IntegrationStatus {
     Unreachable(String),
     /// Template is not admitted in the catalog.
     NotAdmitted,
+    /// Anmeldung noetig (OAuth nie angemeldet oder Erneuerung fehlgeschlagen).
+    LoginRequired(String),
+    /// Vorlage ist ungueltig und wird nicht verbunden.
+    TemplateInvalid,
 }
 
 impl IntegrationStatus {
@@ -249,7 +284,8 @@ impl IntegrationStatus {
             Self::Setup | Self::KeyMissing(_) => "fehlt_schluessel",
             Self::KeyRejected => "schluessel_abgelehnt",
             Self::Unreachable(_) | Self::Error(_) => "nicht_erreichbar",
-            Self::NotAdmitted => "nicht_zugelassen",
+            Self::NotAdmitted | Self::TemplateInvalid => "nicht_zugelassen",
+            Self::LoginRequired(_) => "anmeldung_noetig",
             Self::Available => "verfuegbar",
             Self::Disabled => "deaktiviert",
         }
@@ -258,6 +294,8 @@ impl IntegrationStatus {
         match self {
             Self::KeyMissing(names) => Some(format!("fehlende Schluessel: {}", names.join(", "))),
             Self::Unreachable(msg) | Self::Error(msg) => Some(msg.clone()),
+            Self::LoginRequired(r) => Some(r.clone()),
+            Self::TemplateInvalid => Some("vorlage ungueltig".into()),
             _ => None,
         }
     }
@@ -275,6 +313,8 @@ impl std::fmt::Display for IntegrationStatus {
             Self::KeyRejected => write!(f, "Key rejected"),
             Self::Unreachable(msg) => write!(f, "Unreachable: {msg}"),
             Self::NotAdmitted => write!(f, "Not admitted"),
+            Self::LoginRequired(r) => write!(f, "Login required: {r}"),
+            Self::TemplateInvalid => write!(f, "Template invalid"),
         }
     }
 }
@@ -332,6 +372,13 @@ mod tests {
         );
     }
 
+    #[test]
+    fn login_required_and_template_invalid_states() {
+        assert_eq!(IntegrationStatus::LoginRequired("nie angemeldet".into()).zustand(), "anmeldung_noetig");
+        assert_eq!(IntegrationStatus::LoginRequired("nie angemeldet".into()).detail().as_deref(), Some("nie angemeldet"));
+        assert_eq!(IntegrationStatus::TemplateInvalid.zustand(), "nicht_zugelassen");
+        assert_eq!(IntegrationStatus::TemplateInvalid.detail().as_deref(), Some("vorlage ungueltig"));
+    }
     #[test]
     fn category_display() {
         assert_eq!(IntegrationCategory::DevTools.to_string(), "Dev Tools");

@@ -232,6 +232,16 @@ mod tests {
     }
 
     #[test]
+    fn login_required_and_template_invalid_never_auto_reconnect() {
+        let m = HealthMonitor::new(HealthMonitorConfig::default());
+        m.register("a");
+        m.report_status("a", IntegrationStatus::LoginRequired("erneuerung fehlgeschlagen".into()));
+        assert!(!m.should_reconnect("a"));
+        m.report_status("a", IntegrationStatus::TemplateInvalid);
+        assert!(!m.should_reconnect("a"));
+    }
+
+    #[test]
     fn health_monitor_register_report() {
         let monitor = HealthMonitor::new(HealthMonitorConfig::default());
         monitor.register("github");
