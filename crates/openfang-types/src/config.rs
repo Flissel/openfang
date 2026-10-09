@@ -703,6 +703,10 @@ pub struct ExtensionsConfig {
     /// Zusaetzliche Ordner mit Integrations-Vorlagen (*.toml). Relative Pfade
     /// gelten relativ zum Ordner der geladenen Konfigdatei.
     pub template_dirs: Vec<std::path::PathBuf>,
+    /// Nur fuer Tests: erlaubt `http` auf Loopback in der MCP-OAuth-Ermittlung.
+    /// Wirkt ausschliesslich in Builds mit dem Cargo-Feature
+    /// `test-insecure-oauth` (openfang-kernel); sonst immer ignoriert.
+    pub oauth_allow_loopback_http: bool,
 }
 
 impl Default for ExtensionsConfig {
@@ -713,6 +717,7 @@ impl Default for ExtensionsConfig {
             reconnect_max_backoff_secs: 300,
             health_check_interval_secs: 60,
             template_dirs: Vec::new(),
+            oauth_allow_loopback_http: false,
         }
     }
 }

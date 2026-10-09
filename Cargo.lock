@@ -4146,6 +4146,7 @@ name = "openfang-kernel"
 version = "0.6.9"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "chrono-tz",
  "cron",

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Core kernel for the OpenFang Agent OS"
 
+[features]
+# Nur fuer Tests: reicht http auf Loopback an die MCP-OAuth-Schicht durch und
+# laesst `extensions.oauth_allow_loopback_http` wirken. Standard-Build: immer https.
+test-insecure-oauth = ["openfang-extensions/test-insecure-oauth"]
+
 [dependencies]
 openfang-types = { path = "../openfang-types" }
 openfang-memory = { path = "../openfang-memory" }
@@ -43,4 +48,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+axum = { workspace = true }
 tempfile = { workspace = true }
