@@ -11,6 +11,18 @@ use std::time::{Duration, Instant};
 /// Gueltigkeit eines `state` bzw. Einmal-Links.
 pub const LOGIN_TTL: Duration = Duration::from_secs(600);
 
+/// Obergrenze fuer offene Anmeldungen bzw. Einmal-Links.
+const MAX_ENTRIES: usize = 256;
+
+/// Verwirft Abgelaufene, dann die aeltesten, bis Platz fuer einen Eintrag ist.
+fn prune<V>(map: &mut HashMap<String, V>, created: impl Fn(&V) -> Instant) {
+    map.retain(|_, v| created(v).elapsed() <= LOGIN_TTL);
+    while map.len() >= MAX_ENTRIES {
+        let Some(oldest) = map.iter().min_by_key(|(_, v)| created(v)).map(|(k, _)| k.clone()) else { break };
+        map.remove(&oldest);
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -35,7 +47,9 @@ impl PendingLogins {
     }
 
     pub fn insert(&self, state: &str, login: PendingLogin) {
-        lock(&self.map).insert(state.to_string(), login);
+        let mut map = lock(&self.map);
+        prune(&mut map, |l| l.created);
+        map.insert(state.to_string(), login);
     }
 
     /// Atomar und einmalig: entfernt den Eintrag IMMER (fail closed), liefert
@@ -65,7 +79,9 @@ impl OneTimeLinks {
     }
 
     pub fn insert(&self, token: &str, link: OneTimeLink) {
-        lock(&self.map).insert(token.to_string(), link);
+        let mut map = lock(&self.map);
+        prune(&mut map, |l| l.created);
+        map.insert(token.to_string(), link);
     }
 
     /// GET: liefert die Referenz eines gueltigen Links, verbraucht ihn nicht.
@@ -101,11 +117,20 @@ impl RefreshLocks {
     }
 }
 
-/// Callback-URL des Daemons (Loopback; `0.0.0.0`/leer wird `127.0.0.1`).
-pub fn callback_url(api_listen: &str, id: &str) -> String {
-    let (host, port) = api_listen.rsplit_once(':').unwrap_or(("", api_listen));
-    let host = if host.is_empty() || host == "0.0.0.0" { "127.0.0.1" } else { host };
-    format!("http://{host}:{port}/api/integrations/{id}/oauth/callback")
+/// Callback-URL des Daemons. Immer Loopback (`127.0.0.1`); jeder andere Host
+/// fuehrt zu einem Fehler.
+pub fn callback_url(api_listen: &str, id: &str) -> Result<String, &'static str> {
+    let (host, port) = api_listen.rsplit_once(':').ok_or("api_listen ohne port")?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) || port.parse::<u16>().is_err() {
+        return Err("api_listen ohne port");
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host {
+        "" | "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" | "::" => {
+            Ok(format!("http://127.0.0.1:{port}/api/integrations/{id}/oauth/callback"))
+        }
+        _ => Err("api_listen nicht loopback"),
+    }
 }
 
 /// Statischer Schluessel: nicht leer, keine Steuerzeichen, <= 4096 Bytes.
@@ -146,7 +171,9 @@ mod tests {
     fn state_expires() {
         let p = PendingLogins::new();
         let mut l = login("vercel");
-        l.created = Instant::now() - Duration::from_secs(601);
+        // Frisch gebootete Maschine: Instant kann zu klein sein -> Assertion ueberspringen.
+        let Some(old) = Instant::now().checked_sub(Duration::from_secs(601)) else { return };
+        l.created = old;
         p.insert("S", l);
         assert!(p.take("S", "vercel", LOGIN_TTL).is_none());
     }
@@ -174,9 +201,29 @@ mod tests {
     }
 
     #[test]
-    fn callback_url_uses_loopback_and_port() {
-        assert_eq!(callback_url("127.0.0.1:4200", "vercel"), "http://127.0.0.1:4200/api/integrations/vercel/oauth/callback");
-        assert_eq!(callback_url("0.0.0.0:4200", "vercel"), "http://127.0.0.1:4200/api/integrations/vercel/oauth/callback");
+    fn callback_url_is_always_loopback_or_fails() {
+        let want = "http://127.0.0.1:4200/api/integrations/vercel/oauth/callback";
+        for l in ["127.0.0.1:4200", "0.0.0.0:4200", "[::]:4200", "[::1]:4200", "localhost:4200", ":4200"] {
+            assert_eq!(callback_url(l, "vercel").as_deref(), Ok(want), "{l}");
+        }
+        assert_eq!(callback_url("192.168.1.5:4200", "vercel"), Err("api_listen nicht loopback"));
+        assert_eq!(callback_url("example.com:4200", "vercel"), Err("api_listen nicht loopback"));
+        assert_eq!(callback_url("127.0.0.1", "vercel"), Err("api_listen ohne port"));
+        assert_eq!(callback_url("127.0.0.1:abc", "vercel"), Err("api_listen ohne port"));
+    }
+
+    #[test]
+    fn maps_are_bounded() {
+        let p = PendingLogins::new();
+        let l = OneTimeLinks::new();
+        for i in 0..300 {
+            p.insert(&format!("S{i}"), login("vercel"));
+            l.insert(&format!("T{i}"), OneTimeLink { integration: "github".into(), reference: "R".into(), created: Instant::now() });
+        }
+        assert!(p.map.lock().unwrap().len() <= 256);
+        assert!(l.map.lock().unwrap().len() <= 256);
+        assert!(p.take("S299", "vercel", LOGIN_TTL).is_some(), "neuester bleibt");
+        assert!(l.take("T299", "github", LOGIN_TTL).is_some(), "neuester bleibt");
     }
 
     #[test]
