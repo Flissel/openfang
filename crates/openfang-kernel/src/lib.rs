@@ -15,6 +15,7 @@ pub mod cron_delivery;
 pub mod error;
 pub mod event_bus;
 pub mod heartbeat;
+pub mod integration_oauth;
 pub mod integrations;
 pub mod kernel;
 pub mod metering;
