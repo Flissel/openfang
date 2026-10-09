@@ -198,6 +198,15 @@ pub trait KernelHandle: Send + Sync {
         let _ = tool_name;
     }
 
+    /// An OAuth integration tool call was rejected (HTTP 401/403). The kernel
+    /// refreshes the token once and reconnects the server. Returns `true` only
+    /// if a fresh token is in place and the connection is rebuilt, so the
+    /// runtime may retry the call once. Default: `false` (no refresh).
+    async fn refresh_integration_after_rejection(&self, tool_name: &str) -> bool {
+        let _ = tool_name;
+        false
+    }
+
     /// Record one integration tool call in the audit log. `approval` is one of
     /// `read_only`, `freigabe_erteilt`, `freigabe_abgelehnt`; `outcome` one of
     /// `ok`, `fehler`, `denied`. Must never receive tool inputs or outputs.

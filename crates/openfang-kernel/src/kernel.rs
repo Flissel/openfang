@@ -8630,6 +8630,35 @@ impl KernelHandle for OpenFangKernel {
         }
     }
 
+    async fn refresh_integration_after_rejection(&self, tool_name: &str) -> bool {
+        let crate::integrations::Owner::Single(id) = self.integration_owner(tool_name) else {
+            return false;
+        };
+        let is_oauth = self
+            .effective_mcp_servers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|s| s.name == id && s.oauth);
+        if !is_oauth {
+            return false;
+        }
+        // Self-Handle: `set_self_handle` legt ein Weak<OpenFangKernel> in `self_handle` ab.
+        let Some(me) = self.self_handle.get().and_then(|w| w.upgrade()) else {
+            return false;
+        };
+        // Das aktuelle Token ist genau das, das der Anbieter gerade abgelehnt hat.
+        let rejected = me.oauth_record(&id).and_then(|r| r.access_token);
+        if me
+            .oauth_fresh_access_token(&id, rejected.as_deref())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        me.reconnect_extension_mcp(&id).await.is_ok()
+    }
+
     fn record_integration_call(&self, agent_id: &str, tool_name: &str, approval: &str, outcome: &str) {
         self.audit_log.record(
             agent_id.to_string(),

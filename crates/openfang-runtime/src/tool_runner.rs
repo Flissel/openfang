@@ -517,33 +517,18 @@ pub async fn execute_tool(
         other => {
             // Fallback 1: MCP tools (mcp_{server}_{tool} prefix)
             if mcp::is_mcp_tool(other) {
-                let mcp_result: Result<String, String> = if let Some(mcp_conns) = mcp_connections {
-                    let mut conns = mcp_conns.lock().await;
-                    let known_names: Vec<String> =
-                        conns.iter().map(|c| c.name().to_string()).collect();
-                    let known_refs: Vec<&str> = known_names.iter().map(|s| s.as_str()).collect();
-                    if let Some(server_name) =
-                        mcp::extract_mcp_server_from_known(other, &known_refs)
+                let mut mcp_result = dispatch_mcp(mcp_connections, other, input).await;
+                // OAuth: one refresh and one retry when the vendor rejected the
+                // token. No lock on `mcp_connections` is held here (dispatch_mcp
+                // released it), because the kernel reconnects the server.
+                if let (Some(kh), Err(e)) = (kernel, &mcp_result) {
+                    if kh.is_integration_tool(other)
+                        && should_refresh_after_error(e)
+                        && kh.refresh_integration_after_rejection(other).await
                     {
-                        if let Some(conn) = conns.iter_mut().find(|c| c.name() == server_name) {
-                            debug!(
-                                tool = other,
-                                server = server_name,
-                                "Dispatching to MCP server"
-                            );
-                            match conn.call_tool(other, input).await {
-                                Ok(content) => Ok(content),
-                                Err(e) => Err(format!("MCP tool call failed: {e}")),
-                            }
-                        } else {
-                            Err(format!("MCP server '{server_name}' not connected"))
-                        }
-                    } else {
-                        Err(format!("Invalid MCP tool name: {other}"))
+                        mcp_result = dispatch_mcp(mcp_connections, other, input).await;
                     }
-                } else {
-                    Err(format!("MCP not available for tool: {other}"))
-                };
+                }
                 // Audit trail: exactly one row per integration call, whatever
                 // branch produced the result. Tool name + approval outcome
                 // only, never inputs or outputs.
@@ -605,6 +590,38 @@ pub async fn execute_tool(
             content: format!("Error: {err}"),
             is_error: true,
         },
+    }
+}
+
+/// Does this MCP call error mean the vendor rejected the credential?
+fn should_refresh_after_error(err: &str) -> bool {
+    mcp::classify_connect_error(err) == mcp::ConnectErrorClass::KeyRejected
+}
+
+/// Dispatch one MCP tool call. Takes the connection lock and releases it
+/// before returning.
+async fn dispatch_mcp(
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+    other: &str,
+    input: &serde_json::Value,
+) -> Result<String, String> {
+    let Some(mcp_conns) = mcp_connections else {
+        return Err(format!("MCP not available for tool: {other}"));
+    };
+    let mut conns = mcp_conns.lock().await;
+    let known_names: Vec<String> = conns.iter().map(|c| c.name().to_string()).collect();
+    let known_refs: Vec<&str> = known_names.iter().map(|s| s.as_str()).collect();
+    let Some(server_name) = mcp::extract_mcp_server_from_known(other, &known_refs) else {
+        return Err(format!("Invalid MCP tool name: {other}"));
+    };
+    if let Some(conn) = conns.iter_mut().find(|c| c.name() == server_name) {
+        debug!(tool = other, server = server_name, "Dispatching to MCP server");
+        match conn.call_tool(other, input).await {
+            Ok(content) => Ok(content),
+            Err(e) => Err(format!("MCP tool call failed: {e}")),
+        }
+    } else {
+        Err(format!("MCP server '{server_name}' not connected"))
     }
 }
 
@@ -5275,6 +5292,24 @@ mod tests {
         requires: bool,
         approve: bool,
         rejected: std::sync::Mutex<Vec<String>>,
+        refresh_result: bool,
+        refresh_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingKernel {
+        fn with_refresh(result: bool) -> Self {
+            Self {
+                calls: Default::default(),
+                requires: false,
+                approve: true,
+                rejected: Default::default(),
+                refresh_result: result,
+                refresh_count: Default::default(),
+            }
+        }
+        fn refresh_calls(&self) -> usize {
+            self.refresh_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
@@ -5351,6 +5386,11 @@ mod tests {
         fn report_integration_key_rejected(&self, tool_name: &str) {
             self.rejected.lock().unwrap().push(tool_name.to_string());
         }
+        async fn refresh_integration_after_rejection(&self, _t: &str) -> bool {
+            self.refresh_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.refresh_result
+        }
         fn record_integration_call(&self, _a: &str, t: &str, approval: &str, outcome: &str) {
             self.calls
                 .lock()
@@ -5366,6 +5406,8 @@ mod tests {
             requires: true,
             approve: false,
             rejected: Default::default(),
+            refresh_result: false,
+            refresh_count: Default::default(),
         });
         let k: Arc<dyn KernelHandle> = rec.clone();
         let result = execute_tool(
@@ -5399,6 +5441,8 @@ mod tests {
             requires,
             approve,
             rejected: Default::default(),
+            refresh_result: false,
+            refresh_count: Default::default(),
         });
         let k: Arc<dyn KernelHandle> = rec.clone();
         let conns: tokio::sync::Mutex<Vec<mcp::McpConnection>> = tokio::sync::Mutex::new(vec![]);
@@ -5464,6 +5508,33 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn non_auth_integration_error_never_triggers_refresh() {
+        let rec = Arc::new(RecordingKernel::with_refresh(true));
+        let k: Arc<dyn KernelHandle> = rec.clone();
+        let conns = tokio::sync::Mutex::new(Vec::new());
+        let _ = execute_tool(
+            "t",
+            "mcp_github_get_me",
+            &serde_json::json!({}),
+            Some(&k),
+            None,
+            Some("a"),
+            None,
+            Some(&conns),
+            None, None, None, None, None, None, None, None, None,
+        )
+        .await;
+        assert_eq!(rec.refresh_calls(), 0, "non-auth errors never trigger a refresh");
+    }
+
+    #[test]
+    fn should_refresh_only_on_key_rejected_class() {
+        assert!(should_refresh_after_error("MCP tool call failed: HTTP 401 Unauthorized: x"));
+        assert!(!should_refresh_after_error("MCP tool call failed: dns error"));
+        assert!(!should_refresh_after_error("Invalid MCP tool name: mcp_x"));
+    }
+
     #[test]
     fn key_rejection_on_integration_call_is_reported_to_kernel() {
         let rec = Arc::new(RecordingKernel {
@@ -5471,6 +5542,8 @@ mod tests {
             requires: false,
             approve: false,
             rejected: Default::default(),
+            refresh_result: false,
+            refresh_count: Default::default(),
         });
         let k: Arc<dyn KernelHandle> = rec.clone();
         let rejected = "MCP tool call failed: unexpected server response: HTTP 401 Unauthorized";
