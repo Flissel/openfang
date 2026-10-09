@@ -4,7 +4,7 @@ description = "Identitaet fuer Hub-Abnehmer (Claude Code, Spaces, Rowboat): sieh
 author = "vibemind"
 module = "builtin:chat"
 tags = ["integrations", "hub"]
-mcp_servers = ["github"]
+mcp_servers = ["github", "vercel"]
 
 [model]
 provider = "ollama"
