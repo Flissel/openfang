@@ -11,6 +11,7 @@ pub mod bundled;
 pub mod credentials;
 pub mod health;
 pub mod installer;
+pub mod mcp_oauth;
 pub mod oauth;
 pub mod registry;
 pub mod vault;

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Extension & integration system for OpenFang — one-click MCP server setup, credential vault, OAuth2 PKCE"
 
+[features]
+# Nur fuer Tests: erlaubt http auf Loopback in der MCP-OAuth-Ermittlung (Mock-Server).
+# Der Standard-Build lehnt http immer ab.
+test-insecure-oauth = []
+
 [dependencies]
 openfang-types = { path = "../openfang-types" }
 serde = { workspace = true }
