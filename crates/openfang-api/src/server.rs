@@ -807,6 +807,30 @@ async fn build_router_inner(
             "/api/integrations/reload",
             axum::routing::post(routes::reload_integrations),
         )
+        // OAuth-Anmeldung (Bearer) und Rueckruf (nur Loopback, ohne Bearer;
+        // die Ausnahme steht in middleware::auth).
+        .route(
+            "/api/integrations/{id}/oauth/start",
+            axum::routing::post(routes::integration_oauth_start),
+        )
+        .route(
+            "/api/integrations/{id}/oauth/callback",
+            axum::routing::get(routes::integration_oauth_callback),
+        )
+        .route(
+            "/api/integrations/{id}/oauth/abmelden",
+            axum::routing::post(routes::integration_oauth_abmelden),
+        )
+        // Einmal-Link (Bearer) und Schluesselseite (nur Loopback, ohne Bearer).
+        .route(
+            "/api/integrations/{id}/schluessel/link",
+            axum::routing::post(routes::integration_schluessel_link),
+        )
+        .route(
+            "/api/integrations/{id}/schluessel/{token}",
+            axum::routing::get(routes::integration_schluessel_page)
+                .post(routes::integration_schluessel_submit),
+        )
         // Device pairing endpoints
         .route(
             "/api/pairing/request",
@@ -875,7 +899,18 @@ async fn build_router_inner(
         .layer(axum::middleware::from_fn(middleware::security_headers))
         .layer(axum::middleware::from_fn(middleware::request_logging))
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        // SECURITY: the default span records the full URI including the query
+        // (OAuth code/state, ?token=) and the one-time token in the key-page
+        // path. Record only the redacted path.
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %middleware::log_safe_path(request.uri().path()),
+                )
+            },
+        ))
         .layer(cors)
         .with_state(state.clone());
 

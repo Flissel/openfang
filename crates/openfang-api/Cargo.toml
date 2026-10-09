@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "HTTP/WebSocket API server for the OpenFang Agent OS daemon"
 
+[features]
+# Nur fuer Tests: reicht `test-insecure-oauth` an den Kernel durch, damit
+# `extensions.oauth_allow_loopback_http` (http auf Loopback) wirken kann.
+test-insecure-oauth = ["openfang-kernel/test-insecure-oauth"]
+
 [dependencies]
 openfang-types = { path = "../openfang-types" }
 openfang-kernel = { path = "../openfang-kernel" }

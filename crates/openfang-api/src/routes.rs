@@ -9738,6 +9738,247 @@ pub async fn reconnect_integration(
     }
 }
 
+// ---------------------------------------------------------------------------
+// OAuth-Anmeldung und Einmal-Schluesselseite (Teilprojekt 1b)
+// ---------------------------------------------------------------------------
+//
+// SECURITY: Keine dieser Antworten enthaelt code, state, iss, ein Token, eine
+// client_id oder einen Schluesselwert. Seiten werden aus festen Texten gebaut;
+// eingesetzt wird nur die Fehlerklasse des Kernels (HTML-escaped).
+
+/// Peer-Adresse aus `ConnectInfo`. Fehlt sie, gilt die Anfrage als NICHT
+/// Loopback (fail closed), wie in `middleware::auth`.
+fn peer_is_loopback(peer: &Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>) -> bool {
+    peer.as_ref().is_some_and(|Extension(ci)| ci.0.ip().is_loopback())
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// HTML-Seite mit festen Sicherheits-Kopfzeilen. `body_html` muss bereits
+/// escaped sein.
+fn integration_html(status: StatusCode, title: &str, body_html: &str) -> axum::response::Response {
+    let page = format!(
+        "<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>{title}</title><style>body{{font-family:sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem}}\
+         input{{width:100%;padding:.4rem;margin:.5rem 0}}</style></head><body>{body_html}</body></html>",
+        title = html_escape(title),
+    );
+    (
+        status,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+            ),
+        ],
+        page,
+    )
+        .into_response()
+}
+
+fn integration_not_found() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, "").into_response()
+}
+
+/// POST /api/integrations/{id}/oauth/start — Anmeldung starten (Bearer).
+/// `200 {"anmelde_url"}` oder `409 {"error": "<klasse>"}`.
+pub async fn integration_oauth_start(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match state.kernel.oauth_start(&id).await {
+        Ok(url) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({"anmelde_url": url})),
+        )
+            .into_response(),
+        Err(klasse) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": klasse})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/integrations/{id}/oauth/callback — Rueckruf des Anbieters. Nur
+/// ueber Loopback, ohne Bearer (der Browser des Nutzers ruft ihn auf).
+pub async fn integration_oauth_callback(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    peer: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    query: Result<Query<HashMap<String, String>>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    // Defence in Depth: die Middleware prueft das bereits.
+    if !peer_is_loopback(&peer) {
+        return integration_not_found();
+    }
+    let q = query.map(|Query(q)| q).unwrap_or_default();
+    let result = state
+        .kernel
+        .oauth_callback(
+            &id,
+            q.get("code").map(String::as_str),
+            q.get("state").map(String::as_str).unwrap_or(""),
+            q.get("error").map(String::as_str),
+            q.get("iss").map(String::as_str),
+        )
+        .await;
+    match result {
+        Ok(()) => integration_html(
+            StatusCode::OK,
+            "Anmeldung erfolgreich",
+            "<h1>Anmeldung erfolgreich</h1><p>Die Integration ist angemeldet. \
+             Dieses Fenster kann geschlossen werden.</p>",
+        ),
+        Err(klasse) => integration_html(
+            StatusCode::BAD_REQUEST,
+            "Anmeldung fehlgeschlagen",
+            &format!(
+                "<h1>Anmeldung fehlgeschlagen</h1><p>Anmeldung fehlgeschlagen: {}</p>",
+                html_escape(&klasse)
+            ),
+        ),
+    }
+}
+
+/// POST /api/integrations/{id}/oauth/abmelden — Abmelden mit Widerruf (Bearer).
+pub async fn integration_oauth_abmelden(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match state.kernel.oauth_logout(&id).await {
+        Ok(()) => Json(serde_json::json!({"status": "abgemeldet"})).into_response(),
+        Err(klasse) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": klasse})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/integrations/{id}/schluessel/link — Einmal-Link fuer den
+/// statischen Schluessel (Bearer). Die URL zeigt immer auf Loopback.
+pub async fn integration_schluessel_link(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let conflict = |klasse: &str| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": klasse})),
+        )
+            .into_response()
+    };
+    // Basis-URL zuerst: ohne Loopback-Adresse wird gar kein Link angelegt.
+    let base = match openfang_kernel::integration_oauth::callback_url(
+        &state.kernel.config.api_listen,
+        &id,
+    ) {
+        Ok(cb) => match cb.strip_suffix("oauth/callback") {
+            Some(b) => b.to_string(),
+            None => return conflict("api_listen nicht loopback"),
+        },
+        Err(klasse) => return conflict(klasse),
+    };
+    match state.kernel.schluessel_link(&id) {
+        Ok(token) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({"url": format!("{base}schluessel/{token}")})),
+        )
+            .into_response(),
+        Err(klasse) => conflict(&klasse),
+    }
+}
+
+/// GET /api/integrations/{id}/schluessel/{token} — Formular. Nur ueber
+/// Loopback; gueltiger Link -> 200, sonst 404. Verbraucht den Link nicht.
+pub async fn integration_schluessel_page(
+    State(state): State<Arc<AppState>>,
+    Path((id, token)): Path<(String, String)>,
+    peer: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+) -> axum::response::Response {
+    if !peer_is_loopback(&peer) {
+        return integration_not_found();
+    }
+    let Some(reference) = state.kernel.schluessel_peek(&id, &token) else {
+        return integration_html(
+            StatusCode::NOT_FOUND,
+            "Link ungueltig",
+            "<h1>Link ungueltig</h1><p>Der Link ist ungueltig, abgelaufen oder bereits benutzt.</p>",
+        );
+    };
+    integration_html(
+        StatusCode::OK,
+        "Schluessel eintragen",
+        &format!(
+            "<h1>Schluessel eintragen</h1><p>Integration <b>{id}</b>, Referenz <code>{reference}</code>.</p>\
+             <form method=\"post\"><label for=\"wert\">Schluessel</label>\
+             <input id=\"wert\" type=\"password\" name=\"wert\" autocomplete=\"off\" required>\
+             <button type=\"submit\">Speichern</button></form>\
+             <p>Der Link gilt nur einmal.</p>",
+            id = html_escape(&id),
+            reference = html_escape(&reference),
+        ),
+    )
+}
+
+/// POST /api/integrations/{id}/schluessel/{token} — Wert speichern. Nur ueber
+/// Loopback, Formularfeld `wert`. Der Link wird immer verbraucht; der Wert
+/// erscheint nie in der Antwort.
+pub async fn integration_schluessel_submit(
+    State(state): State<Arc<AppState>>,
+    Path((id, token)): Path<(String, String)>,
+    peer: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    form: Result<
+        axum::extract::Form<HashMap<String, String>>,
+        axum::extract::rejection::FormRejection,
+    >,
+) -> axum::response::Response {
+    if !peer_is_loopback(&peer) {
+        return integration_not_found();
+    }
+    // Fehlendes Feld oder kaputtes Formular: leerer Wert -> der Kernel
+    // verbraucht den Link trotzdem und meldet "wert ungueltig" (fail closed).
+    let mut form = form.map(|axum::extract::Form(f)| f).unwrap_or_default();
+    let wert = form.remove("wert").unwrap_or_default();
+    drop(form);
+    match state.kernel.schluessel_store(&id, &token, &wert).await {
+        Ok(()) => integration_html(
+            StatusCode::OK,
+            "Schluessel gespeichert",
+            "<h1>Schluessel gespeichert</h1><p>Der Schluessel ist gespeichert. \
+             Dieses Fenster kann geschlossen werden.</p>",
+        ),
+        Err(klasse) => integration_html(
+            StatusCode::BAD_REQUEST,
+            "Speichern fehlgeschlagen",
+            &format!(
+                "<h1>Speichern fehlgeschlagen</h1><p>Speichern fehlgeschlagen: {}</p>",
+                html_escape(&klasse)
+            ),
+        ),
+    }
+}
+
 /// GET /api/integrations/health — Health status for all integrations.
 pub async fn integrations_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health_entries = state.kernel.extension_health.all_health();
@@ -13440,6 +13681,17 @@ pub async fn issue_credential(
         );
     }
 
+    // SECURITY: integration keys (`INTEGRATION_*`, incl. OAuth records) are
+    // never issuable, whatever the allowlist says. Refused right after the
+    // shape check: before any log line carrying the reference, before the
+    // allowlist is consulted, before any lookup. Same body as every refusal.
+    if reference.starts_with(openfang_extensions::INTEGRATION_PREFIX) {
+        return credential_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "credential_unavailable"}),
+        );
+    }
+
     // SECURITY: refuse outright when the daemon is running fail-open.
     //
     // `middleware::auth` runs every non-public route without any check when
@@ -13705,7 +13957,11 @@ pub async fn store_credential(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .trim();
-    if !is_valid_credential_reference(reference) {
+    // SECURITY: only the kernel writes `INTEGRATION_*` (one-time key page,
+    // OAuth login). This route never does, not even with `overwrite`.
+    if !is_valid_credential_reference(reference)
+        || reference.starts_with(openfang_extensions::INTEGRATION_PREFIX)
+    {
         return credential_response(
             StatusCode::BAD_REQUEST,
             serde_json::json!({"error": "reference_invalid"}),

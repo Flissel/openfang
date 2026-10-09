@@ -50,11 +50,39 @@ pub async fn tool_only_model_routes(
     next.run(request).await
 }
 
+/// Browser-Routen der Integrationen, die der Nutzer ohne Bearer aus dem
+/// lokalen Browser aufruft: `/api/integrations/{id}/oauth/callback` und
+/// `/api/integrations/{id}/schluessel/{token}` (nicht `.../schluessel/link`,
+/// das ist eine Bearer-Route). Sie sind NUR ueber Loopback erreichbar.
+pub fn is_browser_integration_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/integrations/") else {
+        return false;
+    };
+    let seg: Vec<&str> = rest.split('/').collect();
+    match seg.as_slice() {
+        [id, "oauth", "callback"] => !id.is_empty(),
+        [id, "schluessel", token] => !id.is_empty() && !token.is_empty() && *token != "link",
+        _ => false,
+    }
+}
+
+/// Pfad fuer Logs und Spans: das Einmal-Token der Schluesselseite wird
+/// geschwaerzt (Query-Strings werden ohnehin nie geloggt).
+pub fn log_safe_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if is_browser_integration_path(path) && path.contains("/schluessel/") {
+        if let Some((head, _token)) = path.rsplit_once('/') {
+            return std::borrow::Cow::Owned(format!("{head}/<geschwaerzt>"));
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// Middleware: inject a unique request ID and log the request/response.
 pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Body> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = request.method().clone();
-    let uri = request.uri().path().to_string();
+    // SECURITY: never log the one-time token of the key page.
+    let uri = log_safe_path(request.uri().path()).into_owned();
     let start = Instant::now();
 
     let mut response = next.run(request).await;
@@ -123,6 +151,16 @@ pub async fn auth(
     let path = request.uri().path();
     if path == "/api/shutdown" && is_loopback {
         return next.run(request).await;
+    }
+
+    // OAuth-Rueckruf und Einmal-Schluesselseite: der lokale Browser ruft sie
+    // ohne Bearer auf. Nur Loopback; alles andere sieht 404 (auch mit
+    // gueltigem Bearer und auch mit OPENFANG_ALLOW_NO_AUTH).
+    if is_browser_integration_path(path) {
+        if is_loopback {
+            return next.run(request).await;
+        }
+        return (StatusCode::NOT_FOUND, "").into_response();
     }
 
     // Public endpoints that don't require auth (dashboard needs these).
@@ -295,10 +333,14 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
                 .unwrap(),
         );
     }
-    headers.insert(
-        "referrer-policy",
-        "strict-origin-when-cross-origin".parse().unwrap(),
-    );
+    // A handler may set a stricter policy (the integration browser pages send
+    // `no-referrer` because their URL carries a one-time token).
+    if !headers.contains_key("referrer-policy") {
+        headers.insert(
+            "referrer-policy",
+            "strict-origin-when-cross-origin".parse().unwrap(),
+        );
+    }
     headers.insert(
         "cache-control",
         "no-store, no-cache, must-revalidate".parse().unwrap(),
@@ -326,6 +368,54 @@ mod tests {
     #[test]
     fn test_request_id_header_constant() {
         assert_eq!(REQUEST_ID_HEADER, "x-request-id");
+    }
+
+    #[test]
+    fn browser_integration_paths_are_exact() {
+        assert!(is_browser_integration_path("/api/integrations/probe/oauth/callback"));
+        assert!(is_browser_integration_path("/api/integrations/probe/schluessel/abc"));
+        assert!(!is_browser_integration_path("/api/integrations/probe/schluessel/link"));
+        assert!(!is_browser_integration_path("/api/integrations/probe/oauth/start"));
+        assert!(!is_browser_integration_path("/api/integrations/probe/oauth/abmelden"));
+        assert!(!is_browser_integration_path("/api/integrations/x/y/oauth/callback"));
+        assert!(!is_browser_integration_path("/api/agents/oauth/callback"));
+    }
+
+    #[test]
+    fn log_safe_path_redacts_one_time_token() {
+        assert_eq!(
+            log_safe_path("/api/integrations/probe/schluessel/KANARIE-TOKEN"),
+            "/api/integrations/probe/schluessel/<geschwaerzt>"
+        );
+        assert_eq!(
+            log_safe_path("/api/integrations/probe/schluessel/link"),
+            "/api/integrations/probe/schluessel/link"
+        );
+        assert_eq!(log_safe_path("/api/agents/1"), "/api/agents/1");
+    }
+
+    #[tokio::test]
+    async fn browser_integration_path_is_loopback_only_even_with_bearer() {
+        let app = Router::new()
+            .route("/api/integrations/{id}/schluessel/{t}", get(ok_handler))
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth_state_with_key("secret"),
+                auth,
+            ));
+        let req = |ip: &str, bearer: bool| {
+            let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
+            let mut b = Request::builder().uri("/api/integrations/p/schluessel/abc");
+            if bearer {
+                b = b.header("authorization", "Bearer secret");
+            }
+            let mut r = b.body(Body::empty()).unwrap();
+            r.extensions_mut().insert(ConnectInfo(addr));
+            r
+        };
+        let resp = app.clone().oneshot(req("127.0.0.1", false)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "loopback needs no bearer");
+        let resp = app.clone().oneshot(req("100.67.177.45", true)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "remote never, not even with bearer");
     }
 
     fn auth_state_empty() -> AuthState {
