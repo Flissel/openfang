@@ -13,8 +13,25 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+const OAUTH_RESERVED_PREFIX: &str = "INTEGRATION_OAUTH_";
+
+/// Vorlagen-id: `^[a-z0-9][a-z0-9-]{0,62}$` (macht `oauth_reference` injektiv).
+pub fn is_valid_template_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= 63
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
 /// Prueft eine Vorlage auf Konsistenz (auth_headers nur bei http/sse, gueltige Felder).
 pub fn validate_template(t: &crate::IntegrationTemplate) -> Result<(), String> {
+    if !is_valid_template_id(&t.id) {
+        return Err("id ungueltig (erlaubt: a-z, 0-9, -)".into());
+    }
+    if t.auth_headers.iter().any(|h| h.credential.starts_with(OAUTH_RESERVED_PREFIX)) {
+        return Err("auth_headers: INTEGRATION_OAUTH_ ist reserviert".into());
+    }
     if !t.auth_headers.is_empty() {
         match t.transport {
             crate::McpTransportTemplate::Http { .. } | crate::McpTransportTemplate::Sse { .. } => {}
@@ -26,8 +43,7 @@ pub fn validate_template(t: &crate::IntegrationTemplate) -> Result<(), String> {
     for h in &t.auth_headers {
         h.validate()?;
     }
-    if let Some(auth) = &t.auth {
-        let _ = auth;
+    if t.auth.is_some() {
         match t.transport {
             crate::McpTransportTemplate::Http { .. } | crate::McpTransportTemplate::Sse { .. } => {}
             crate::McpTransportTemplate::Stdio { .. } => return Err("oauth nur bei http/sse erlaubt".into()),
@@ -111,6 +127,7 @@ impl IntegrationRegistry {
     /// Ungueltige Dateien werden uebersprungen (Grund ohne Dateiinhalt).
     pub fn load_template_dirs(&mut self, dirs: &[std::path::PathBuf]) -> TemplateDirReport {
         let mut report = TemplateDirReport::default();
+        self.invalid_overrides.clear();
         for dir in dirs {
             let entries = match std::fs::read_dir(dir) {
                 Ok(e) => e,
@@ -135,8 +152,14 @@ impl IntegrationRegistry {
                 let parsed = std::fs::read_to_string(&path)
                     .map_err(|e| format!("nicht lesbar: {}", e.kind()))
                     .and_then(|s| {
-                        toml::from_str::<IntegrationTemplate>(&s)
-                            .map_err(|_| "TOML ungueltig".to_string())
+                        toml::from_str::<IntegrationTemplate>(&s).map_err(|_| {
+                            if let Some(stem) = path.file_stem().and_then(|x| x.to_str()) {
+                                if is_valid_template_id(stem) {
+                                    failed_id = Some(stem.to_string());
+                                }
+                            }
+                            "TOML ungueltig".to_string()
+                        })
                     })
                     .and_then(|t| match validate_template(&t) {
                         Ok(()) => Ok(t),
@@ -534,6 +557,7 @@ admission = "admitted"
         assert_eq!(gh.auth_headers.len(), 1);
         assert_eq!(gh.auth_headers[0].credential, "INTEGRATION_GITHUB_PAT");
         assert!(gh.headers.is_empty());
+        assert!(!gh.oauth, "static-key template must not be oauth");
     }
 
     #[test]
@@ -815,5 +839,66 @@ admission = "admitted"
         reg.set_enabled("github", false).unwrap();
         let configs = reg.to_mcp_configs();
         assert!(configs.is_empty()); // disabled = not in MCP configs
+    }
+
+    fn mk_inst(id: &str) -> crate::InstalledIntegration {
+        crate::InstalledIntegration { id: id.into(), installed_at: chrono::Utc::now(),
+            enabled: true, oauth_provider: None, config: Default::default() }
+    }
+
+    #[test]
+    fn invalid_overrides_are_cleared_on_every_load_run() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("github.toml"), REMOTE_LEGACY).unwrap();
+        let mut reg = IntegrationRegistry::new(home.path());
+        reg.load_bundled();
+        reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        assert!(reg.invalid_overrides().contains("github"));
+        std::fs::remove_file(dir.path().join("github.toml")).unwrap();
+        reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        assert!(!reg.invalid_overrides().contains("github"));
+    }
+
+    #[test]
+    fn template_ids_must_be_lowercase_dash_only() {
+        let mk = |id: &str| -> crate::IntegrationTemplate {
+            toml::from_str(&VERCEL.replace("id = \"vercel\"", &format!("id = \"{id}\""))).unwrap()
+        };
+        for bad in ["A", "a_b", "a b", "", "-a"] {
+            assert!(validate_template(&mk(bad)).is_err(), "{bad:?}");
+        }
+        for good in ["a-b", "google-calendar", "a1"] {
+            assert!(validate_template(&mk(good)).is_ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn integration_oauth_prefix_is_reserved_in_auth_headers() {
+        let t: crate::IntegrationTemplate = toml::from_str(
+            &REMOTE.replace("INTEGRATION_GITHUB_PAT\"
+[[required_env]]", "INTEGRATION_OAUTH_VERCEL\"
+[[required_env]]"),
+        ).unwrap();
+        assert!(validate_template(&t).is_err());
+        let mut t2 = t.clone();
+        t2.catalog = None;
+        let e = validate_template(&t2).unwrap_err();
+        assert!(e.contains("reserviert"), "{e}");
+    }
+
+    #[test]
+    fn unparseable_file_blocks_its_stem_id() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("github.toml"), "kaputt = = =").unwrap();
+        std::fs::write(dir.path().join("Bad_Name.toml"), "kaputt = = =").unwrap();
+        let mut reg = IntegrationRegistry::new(home.path());
+        reg.load_bundled();
+        reg.load_template_dirs(&[dir.path().to_path_buf()]);
+        assert!(reg.invalid_overrides().contains("github"));
+        assert!(!reg.invalid_overrides().contains("Bad_Name"));
+        reg.install(mk_inst("github")).unwrap();
+        assert!(reg.to_mcp_configs().iter().all(|c| c.name != "github"));
     }
 }

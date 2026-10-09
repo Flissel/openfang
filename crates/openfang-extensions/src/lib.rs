@@ -238,7 +238,7 @@ pub struct IntegrationTemplate {
     /// Katalog-Metadaten (fehlt = zugelassen).
     #[serde(default)]
     pub catalog: Option<CatalogMeta>,
-    /// OAuth-Anmeldung (Teilprojekt 1b); schliesst uth_headers aus.
+    /// OAuth-Anmeldung (Teilprojekt 1b); schliesst `auth_headers` aus.
     #[serde(default)]
     pub auth: Option<AuthTemplate>,
 }
