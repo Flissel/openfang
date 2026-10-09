@@ -6085,6 +6085,10 @@ impl OpenFangKernel {
         // from std::env — so we must ensure they're in std::env first.
         // Unchanged stdio path; remote integrations carry an empty `env`.
         for var_name in &server_config.env {
+            // Der rohe OAuth-Datensatz (JSON mit Tokens) wird nie exportiert.
+            if var_name.starts_with(OAUTH_REFERENCE_PREFIX) {
+                continue;
+            }
             if std::env::var(var_name).is_err() {
                 if let Some(val) = self.resolve_credential(var_name) {
                     std::env::set_var(var_name, &val);
@@ -6437,10 +6441,13 @@ impl OpenFangKernel {
             .await;
         self.extension_health.unregister(id);
 
-        // 1b. OAuth: beim Anbieter widerrufen und Tresor-Eintrag loeschen.
-        if self.is_oauth_integration(id) {
+        // 1b. OAuth: nach Daten entscheiden (auch bei ungueltiger Vorlage):
+        // beim Anbieter widerrufen; der Tresor-Eintrag wird immer geloescht.
+        if self.has_oauth_state(id) {
             let ergebnis = self.oauth_revoke_and_forget(id).await;
             self.audit_oauth(id, "entfernen", &ergebnis);
+        } else {
+            self.vault_del(&openfang_extensions::oauth_reference(id));
         }
 
         // 2. Only now uninstall in the registry (saves integrations.toml).
@@ -6588,13 +6595,28 @@ impl OpenFangKernel {
         self.vault_put(&openfang_extensions::oauth_reference(id), json)
     }
 
-    /// True, wenn die Vorlage von `id` eine OAuth-Vorlage ist.
+    /// OAuth nach Daten: OAuth-Vorlage ODER ein OAuth-Datensatz im Tresor.
+    /// Greift auch, wenn die Ordner-Vorlage inzwischen ungueltig ist.
+    fn has_oauth_state(&self, id: &str) -> bool {
+        self.is_oauth_integration(id) || self.oauth_record(id).is_some()
+    }
+
+    /// True, wenn die Vorlage von `id` eine gueltige OAuth-Vorlage ist.
     fn is_oauth_integration(&self, id: &str) -> bool {
         self.extension_registry
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get_template(id)
             .is_some_and(|t| t.auth.is_some())
+    }
+
+    /// True, wenn die Ordner-Vorlage von `id` ungueltig ist.
+    fn has_invalid_template(&self, id: &str) -> bool {
+        self.extension_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalid_overrides()
+            .contains(id)
     }
 
     /// Installierte, zugelassene OAuth-Integration mit gueltiger Vorlage:
@@ -6648,9 +6670,21 @@ impl OpenFangKernel {
         let _guard = lock.lock().await;
         let mut rec = match self.oauth_record(id) {
             Some(r) if r.resource == resource => r,
-            _ => m::discover(&http, &policy, &resource)
-                .await
-                .map_err(|e| e.class())?,
+            stale => {
+                // Ressource geaendert: alte Berechtigung widerrufen und den
+                // alten Datensatz verwerfen, bevor neu ermittelt wird.
+                if let Some(old) = stale {
+                    let ergebnis = match m::revoke(&http, &policy, &old).await {
+                        Ok(()) => "ok".to_string(),
+                        Err(e) => e.class(),
+                    };
+                    self.audit_oauth(id, "widerruf_alte_ressource", &ergebnis);
+                    self.vault_del(&openfang_extensions::oauth_reference(id));
+                }
+                m::discover(&http, &policy, &resource)
+                    .await
+                    .map_err(|e| e.class())?
+            }
         };
         // Scopes kommen immer aus der Vorlage (Vercel z. B. gibt ein
         // Refresh-Token nur mit `offline_access`).
@@ -6818,10 +6852,12 @@ impl OpenFangKernel {
             match m::refresh(&http, &self.oauth_policy(), &mut rec).await {
                 Ok(()) => {
                     if self.oauth_record_put(id, &rec).is_err() {
+                        // Das rotierte Refresh-Token ist verloren: neu anmelden.
                         self.audit_oauth(id, "erneuerung", "tresor nicht verfuegbar");
-                        return Err(IntegrationStatus::Unreachable(
-                            "tresor nicht verfuegbar".into(),
-                        ));
+                        let status =
+                            IntegrationStatus::LoginRequired("tresor nicht verfuegbar".into());
+                        self.extension_health.report_status(id, status.clone());
+                        return Err(status);
                     }
                     self.audit_oauth(id, "erneuerung", "ok");
                 }
@@ -6829,6 +6865,12 @@ impl OpenFangKernel {
                     self.audit_oauth(id, "erneuerung", &e.class());
                     let status = match e {
                         OAuthError::Refresh(RefreshFailure::InvalidGrant) => {
+                            // Tokens verwerfen: spaetere Aufrufe enden ohne
+                            // Netzzugriff bei "nie angemeldet" (keine Wiederholung).
+                            rec.access_token = None;
+                            rec.refresh_token = None;
+                            rec.expires_at = None;
+                            let _ = self.oauth_record_put(id, &rec);
                             IntegrationStatus::LoginRequired("erneuerung fehlgeschlagen".into())
                         }
                         other => IntegrationStatus::Unreachable(other.class()),
@@ -6874,17 +6916,20 @@ impl OpenFangKernel {
     /// Abmelden: Verbindung trennen, beim Anbieter widerrufen (ein Fehler
     /// landet nur im Audit), Tresor-Eintrag loeschen, Zustand `anmeldung_noetig`.
     pub async fn oauth_logout(self: &Arc<Self>, id: &str) -> Result<(), String> {
-        if !self.is_oauth_integration(id) {
+        if !self.has_oauth_state(id) {
             return Err("keine oauth-integration".into());
         }
         let _lifecycle_guard = self.mcp_lifecycle.lock().await;
         self.remove_mcp_connections_and_rebuild_cache(&[id.to_string()])
             .await;
         let ergebnis = self.oauth_revoke_and_forget(id).await;
-        self.extension_health.report_status(
-            id,
-            openfang_extensions::IntegrationStatus::LoginRequired("abgemeldet".into()),
-        );
+        // Eine ungueltige Vorlage bleibt als solche sichtbar.
+        if !self.has_invalid_template(id) {
+            self.extension_health.report_status(
+                id,
+                openfang_extensions::IntegrationStatus::LoginRequired("abgemeldet".into()),
+            );
+        }
         self.audit_oauth(id, "abmeldung", &ergebnis);
         Ok(())
     }
@@ -6904,6 +6949,9 @@ impl OpenFangKernel {
             let template = registry
                 .get_template(id)
                 .ok_or_else(|| "keine integration".to_string())?;
+            if !template.is_admitted() {
+                return Err("keine integration".into());
+            }
             let reference = template
                 .auth_headers
                 .first()
@@ -11493,6 +11541,93 @@ admission = "admitted"
         kernel.shutdown();
     }
 
+    fn manual_entry(
+        name: &str,
+        transport: openfang_types::config::McpTransportEntry,
+        env: Vec<String>,
+        auth_headers: Vec<openfang_types::config::AuthHeaderRef>,
+    ) -> openfang_types::config::McpServerConfigEntry {
+        openfang_types::config::McpServerConfigEntry {
+            name: name.to_string(),
+            transport,
+            timeout_secs: 5,
+            env,
+            headers: Vec::new(),
+            auth_headers,
+            oauth: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stdio_env_never_exports_raw_oauth_record() {
+        const VAR: &str = "INTEGRATION_OAUTH_ENVPROBE_T4";
+        let (tmp, kernel) = static_key_kernel();
+        install_test_vault(&kernel, tmp.path());
+        kernel
+            .vault_put(
+                VAR,
+                zeroize::Zeroizing::new("{\"access_token\":\"KANARIE-AT-9\"}".into()),
+            )
+            .unwrap();
+        assert!(std::env::var(VAR).is_err());
+        let entry = manual_entry(
+            "envprobe",
+            openfang_types::config::McpTransportEntry::Stdio {
+                command: "openfang-command-that-does-not-exist-t4".into(),
+                args: vec![],
+            },
+            vec![VAR.to_string()],
+            vec![],
+        );
+        let _ = kernel.connect_one_mcp(&entry).await;
+        assert!(
+            std::env::var(VAR).is_err(),
+            "raw OAuth record exported to env"
+        );
+        kernel.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_oauth_entry_never_resolves_raw_oauth_record() {
+        let (tmp, kernel) = static_key_kernel();
+        install_test_vault(&kernel, tmp.path());
+        kernel
+            .vault_put(
+                "INTEGRATION_OAUTH_X",
+                zeroize::Zeroizing::new("{\"access_token\":\"KANARIE-AT-9\"}".into()),
+            )
+            .unwrap();
+        kernel.extension_health.register("manualx");
+        let entry = manual_entry(
+            "manualx",
+            openfang_types::config::McpTransportEntry::Http {
+                url: "http://127.0.0.1:9/mcp".into(),
+            },
+            vec![],
+            vec![openfang_types::config::AuthHeaderRef {
+                name: "Authorization".into(),
+                format: "Bearer {credential}".into(),
+                credential: "INTEGRATION_OAUTH_X".into(),
+            }],
+        );
+        let err = kernel.connect_one_mcp(&entry).await.unwrap_err();
+        assert_eq!(err, "fehlende Schluessel: INTEGRATION_OAUTH_X");
+        assert!(!err.contains("KANARIE"));
+        let h = kernel.extension_health.get_health("manualx").unwrap();
+        assert_eq!(h.status.zustand(), "fehlt_schluessel");
+        kernel.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_time_link_refused_for_not_admitted_template() {
+        let (_tmp, kernel) = probe_kernel("review_required");
+        assert!(kernel.schluessel_link("probe").is_err());
+        let (_tmp2, admitted) = probe_kernel("admitted");
+        assert!(admitted.schluessel_link("probe").is_ok());
+        kernel.shutdown();
+        admitted.shutdown();
+    }
+
     #[cfg(not(feature = "test-insecure-oauth"))]
     #[test]
     fn oauth_policy_is_strict_without_feature_even_with_flag() {
@@ -11953,6 +12088,15 @@ scopes = ["offline_access"]
             assert_eq!(err.detail().as_deref(), Some("erneuerung fehlgeschlagen"));
             assert_eq!(counters.refresh_calls(), 1);
             assert_eq!(zustand(&kernel), "anmeldung_noetig");
+            // Keine Wiederholung: Tokens sind verworfen, weitere Aufrufe gehen nicht ins Netz.
+            let again = kernel
+                .oauth_fresh_access_token("probe", None)
+                .await
+                .unwrap_err();
+            assert_eq!(again.detail().as_deref(), Some("nie angemeldet"));
+            kernel.connect_mcp_servers().await;
+            assert_eq!(counters.refresh_calls(), 1, "no automatic retry");
+            assert_eq!(zustand(&kernel), "anmeldung_noetig");
             assert_audit_clean(&kernel, &[]);
             kernel.shutdown();
         }
@@ -11992,10 +12136,7 @@ scopes = ["offline_access"]
                 )
                 .await
                 .unwrap_err();
-            assert!(
-                err == "state ungueltig" || err.starts_with("ermittlung fehlgeschlagen"),
-                "{err}"
-            );
+            assert_eq!(err, "ermittlung fehlgeschlagen: iss passt nicht");
             assert_eq!(
                 counters.code_calls(),
                 0,
@@ -12003,16 +12144,19 @@ scopes = ["offline_access"]
             );
             // Der Anmeldeserver kuendigt iss an: fehlendes iss wird ebenfalls abgelehnt.
             let url = kernel.oauth_start("probe").await.unwrap();
-            assert!(kernel
-                .oauth_callback(
-                    "probe",
-                    Some("CODE-OK"),
-                    &url_param(&url, "state"),
-                    None,
-                    None
-                )
-                .await
-                .is_err());
+            assert_eq!(
+                kernel
+                    .oauth_callback(
+                        "probe",
+                        Some("CODE-OK"),
+                        &url_param(&url, "state"),
+                        None,
+                        None
+                    )
+                    .await
+                    .unwrap_err(),
+                "ermittlung fehlgeschlagen: iss passt nicht"
+            );
             assert_eq!(counters.code_calls(), 0);
             assert_ne!(zustand(&kernel), "verbunden");
             kernel.shutdown();
@@ -12071,6 +12215,150 @@ scopes = ["offline_access"]
             assert!(kernel
                 .resolve_credential(&openfang_extensions::oauth_reference("probe"))
                 .is_none());
+            kernel.shutdown();
+        }
+
+        /// Zweiter Kernel auf demselben Home (eigenes data-Verzeichnis), der den
+        /// vorhandenen Tresor mit dem Testschluessel oeffnet.
+        async fn reboot_same_home(home: &std::path::Path) -> Arc<OpenFangKernel> {
+            let mut config = KernelConfig {
+                home_dir: home.to_path_buf(),
+                data_dir: home.join("data2"),
+                api_listen: "127.0.0.1:4200".to_string(),
+                ..KernelConfig::default()
+            };
+            config.extensions.template_dirs = vec![home.join("integrations")];
+            config.extensions.oauth_allow_loopback_http = true;
+            config.runtime.tool_only = true;
+            let kernel = Arc::new(OpenFangKernel::boot_with_config(config).unwrap());
+            kernel.set_self_handle();
+            let mut v = openfang_extensions::vault::CredentialVault::new(home.join("vault.enc"));
+            v.unlock_with_key(zeroize::Zeroizing::new([7u8; 32]))
+                .unwrap();
+            *kernel.credential_resolver.lock().unwrap() =
+                openfang_extensions::credentials::CredentialResolver::new(Some(v), None);
+            kernel.connect_mcp_servers().await;
+            kernel
+        }
+
+        /// Anmelden, danach die Vorlage durch eine ungueltige Datei ersetzen und
+        /// neu booten: die Integration ist installiert, hat aber keine Vorlage.
+        async fn logged_in_then_template_invalid(
+        ) -> (tempfile::TempDir, Arc<OpenFangKernel>, Arc<Counters>) {
+            let (base, counters) = start_mock_oauth_and_mcp().await;
+            let (tmp, kernel) = boot_with_oauth_template(&base).await;
+            let url = kernel.oauth_start("probe").await.unwrap();
+            kernel
+                .oauth_callback(
+                    "probe",
+                    Some("CODE-OK"),
+                    &url_param(&url, "state"),
+                    None,
+                    Some(&base),
+                )
+                .await
+                .unwrap();
+            kernel.shutdown();
+            std::fs::write(
+                tmp.path().join("integrations").join("probe.toml"),
+                "id = \"probe\"\n[[[kaputt",
+            )
+            .unwrap();
+            let kernel = reboot_same_home(tmp.path()).await;
+            assert_eq!(zustand(&kernel), "nicht_zugelassen");
+            assert!(kernel
+                .extension_registry
+                .read()
+                .unwrap()
+                .get_template("probe")
+                .is_none());
+            assert!(kernel
+                .resolve_credential(&openfang_extensions::oauth_reference("probe"))
+                .is_some());
+            (tmp, kernel, counters)
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn remove_integration_revokes_even_when_template_became_invalid() {
+            let (_tmp, kernel, counters) = logged_in_then_template_invalid().await;
+            kernel.remove_integration("probe").await.unwrap();
+            assert_eq!(counters.revoke_calls(), 1);
+            assert!(kernel
+                .resolve_credential(&openfang_extensions::oauth_reference("probe"))
+                .is_none());
+            kernel.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn logout_revokes_even_when_template_became_invalid() {
+            let (_tmp, kernel, counters) = logged_in_then_template_invalid().await;
+            kernel.oauth_logout("probe").await.unwrap();
+            assert_eq!(counters.revoke_calls(), 1);
+            assert!(kernel
+                .resolve_credential(&openfang_extensions::oauth_reference("probe"))
+                .is_none());
+            kernel.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn refresh_ok_but_vault_write_fails_requires_login() {
+            let (base, counters) = start_mock_oauth_and_mcp().await;
+            let (tmp, kernel) = boot_with_oauth_template(&base).await;
+            let url = kernel.oauth_start("probe").await.unwrap();
+            kernel
+                .oauth_callback(
+                    "probe",
+                    Some("CODE-OK"),
+                    &url_param(&url, "state"),
+                    None,
+                    Some(&base),
+                )
+                .await
+                .unwrap();
+            // Tresor-Datei durch einen Ordner ersetzen: Lesen (Speicher) geht, Schreiben scheitert.
+            let vault = tmp.path().join("vault.enc");
+            std::fs::remove_file(&vault).unwrap();
+            std::fs::create_dir(&vault).unwrap();
+            let err = kernel
+                .oauth_fresh_access_token("probe", Some("KANARIE-AT-1"))
+                .await
+                .unwrap_err();
+            assert_eq!(counters.refresh_calls(), 1);
+            assert_eq!(err.zustand(), "anmeldung_noetig");
+            assert_eq!(err.detail().as_deref(), Some("tresor nicht verfuegbar"));
+            let h = kernel.extension_health.get_health("probe").unwrap();
+            assert_eq!(h.status.zustand(), "anmeldung_noetig");
+            assert_eq!(h.last_error.as_deref(), Some("tresor nicht verfuegbar"));
+            kernel.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn start_with_changed_resource_revokes_the_old_grant() {
+            let (base, counters) = start_mock_oauth_and_mcp().await;
+            let (tmp, kernel) = boot_with_oauth_template(&base).await;
+            let url = kernel.oauth_start("probe").await.unwrap();
+            kernel
+                .oauth_callback(
+                    "probe",
+                    Some("CODE-OK"),
+                    &url_param(&url, "state"),
+                    None,
+                    Some(&base),
+                )
+                .await
+                .unwrap();
+            // Vorlage zeigt jetzt auf eine andere Ressourcen-URL.
+            let path = tmp.path().join("integrations").join("probe.toml");
+            let body = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, body.replace("/mcp\"", "/mcp/\"")).unwrap();
+            kernel.reload_extension_mcps().await.unwrap();
+            assert_eq!(counters.revoke_calls(), 0);
+            kernel.oauth_start("probe").await.unwrap();
+            assert_eq!(
+                counters.revoke_calls(),
+                1,
+                "old grant revoked before rediscovery"
+            );
             kernel.shutdown();
         }
     }
