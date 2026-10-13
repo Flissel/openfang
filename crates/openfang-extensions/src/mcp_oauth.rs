@@ -572,8 +572,8 @@ fn normalised_resource(s: &str) -> Option<String> {
     Some(u.as_str().trim_end_matches('/').to_string())
 }
 
-/// Re-check a stored endpoint before posting to it: policy plus same host as
-/// the issuer. A tampered record fails closed.
+/// Re-check a stored endpoint before posting to it: policy plus host binding
+/// (issuer host or a subdomain of it, see `endpoint_host_allowed`). A tampered record fails closed.
 fn issuer_endpoint(
     policy: &UrlPolicy,
     rec: &OAuthRecord,
@@ -581,15 +581,33 @@ fn issuer_endpoint(
 ) -> Result<url::Url, OAuthError> {
     let ep = policy.check(endpoint)?;
     let issuer = policy.check(&rec.issuer)?;
-    if !same_host(&ep, &issuer) {
+    if !endpoint_host_allowed(&ep, &issuer) {
         return Err(OAuthError::Discovery("fremder host"));
     }
     Ok(ep)
 }
 
-fn same_host(a: &url::Url, b: &url::Url) -> bool {
-    a.host_str().map(str::to_ascii_lowercase) == b.host_str().map(str::to_ascii_lowercase)
-        && a.port_or_known_default() == b.port_or_known_default()
+/// Endpoint host binding: the endpoint may live on the issuer's host or on a
+/// subdomain of it (dot boundary: `api.vercel.com` under `vercel.com` is fine,
+/// `evilvercel.com` and `vercel.com.evil.com` are not; never upward). Ports
+/// must match. Hosts compare ASCII-lowercase; a trailing dot is rejected. An IP
+/// issuer or one without a '.' (single label) allows exact equality only.
+fn endpoint_host_allowed(ep: &url::Url, issuer: &url::Url) -> bool {
+    if ep.port_or_known_default() != issuer.port_or_known_default() {
+        return false;
+    }
+    let (Some(eh), Some(ih)) = (ep.host_str(), issuer.host_str()) else {
+        return false;
+    };
+    let (eh, ih) = (eh.to_ascii_lowercase(), ih.to_ascii_lowercase());
+    if eh.ends_with('.') || ih.ends_with('.') {
+        return false;
+    }
+    if eh == ih {
+        return true;
+    }
+    let issuer_is_domain = matches!(issuer.host(), Some(url::Host::Domain(_)));
+    issuer_is_domain && ih.contains('.') && eh.ends_with(&format!(".{ih}"))
 }
 
 // ─── Discovery ───────────────────────────────────────────────────────────────
@@ -760,8 +778,9 @@ pub async fn discover(
         return Err(OAuthError::Discovery("issuer passt nicht"));
     }
 
-    // 4c. All endpoints live on the issuer's host.
-    if !endpoints.iter().all(|e| same_host(e, &issuer)) {
+    // 4c. All endpoints live on the issuer's host or a subdomain of it
+    // (see `endpoint_host_allowed`).
+    if !endpoints.iter().all(|e| endpoint_host_allowed(e, &issuer)) {
         return Err(OAuthError::Discovery("fremder host"));
     }
 
@@ -2027,6 +2046,41 @@ mod tests {
         let c = http_client_with_fixed_dns(&p, vec!["10.0.0.5".parse().unwrap()]).unwrap();
         let e = c.0.get(target.as_str()).send().await.unwrap_err();
         assert_eq!(network_error(&e), OAuthError::Network("unzulaessiges ziel"));
+    }
+
+    #[test]
+    fn endpoint_host_allowed_table() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let ok = |ep: &str, iss: &str| endpoint_host_allowed(&u(ep), &u(iss));
+        assert!(ok("https://vercel.com/t", "https://vercel.com"));
+        assert!(ok("https://api.vercel.com/t", "https://vercel.com"));
+        assert!(ok("https://a.b.vercel.com/t", "https://vercel.com"));
+        assert!(ok("https://API.Vercel.COM/t", "https://vercel.com"));
+        assert!(!ok("https://evilvercel.com/t", "https://vercel.com"));
+        assert!(!ok("https://vercel.com.evil.com/t", "https://vercel.com"));
+        assert!(!ok("https://vercel.com/t", "https://api.vercel.com"));
+        assert!(!ok("https://api.vercel.com:8443/t", "https://vercel.com"));
+        assert!(!ok("https://api.vercel.com./t", "https://vercel.com"));
+        assert!(!ok("https://vercel.com./t", "https://vercel.com"));
+        // IP issuer: exact only
+        assert!(ok("https://203.0.113.5/t", "https://203.0.113.5"));
+        assert!(!ok("https://203.0.113.5.evil.com/t", "https://203.0.113.5"));
+        assert!(!ok("https://4.113.5/t", "https://203.0.113.5"));
+        // single-label issuer: exact only
+        assert!(ok("https://localhost/t", "https://localhost"));
+        assert!(!ok("https://api.localhost/t", "https://localhost"));
+    }
+
+    #[test]
+    fn issuer_endpoint_allows_subdomain_but_not_foreign_host() {
+        let p = UrlPolicy::strict();
+        let mut r = OAuthRecord::empty_for_tests();
+        r.issuer = "https://as.example".into();
+        assert!(issuer_endpoint(&p, &r, "https://api.as.example/token").is_ok());
+        assert_eq!(
+            issuer_endpoint(&p, &r, "https://evilas.example/token").unwrap_err(),
+            OAuthError::Discovery("fremder host")
+        );
     }
 
     #[test]
