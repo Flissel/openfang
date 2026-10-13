@@ -147,6 +147,30 @@ pub fn validate_static_key(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Normalisiert den eingegebenen statischen Schluessel: trimmt Raender,
+/// lehnt ein vorangestelltes `Bearer `/`token ` ab und verlangt sichtbares
+/// ASCII (0x21..=0x7E). Liefert den getrimmten Wert.
+pub fn normalise_static_key(value: &str) -> Result<String, &'static str> {
+    let v = value.trim();
+    let b = v.as_bytes();
+    let prefixed = |p: &str| {
+        b.len() > p.len() && b[..p.len()].eq_ignore_ascii_case(p.as_bytes()) && b[p.len()] == b' '
+    };
+    if prefixed("bearer") || prefixed("token") {
+        return Err("Bitte nur den Schluessel selbst eintragen, ohne 'Bearer'/'token' davor");
+    }
+    if v.is_empty() {
+        return Err("Wert darf nicht leer sein");
+    }
+    if v.len() > 4096 {
+        return Err("Wert ist zu lang");
+    }
+    if !v.chars().all(|c| ('!'..='~').contains(&c)) {
+        return Err("Wert enthaelt Leerzeichen oder unsichtbare/nicht-ASCII-Zeichen");
+    }
+    Ok(v.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +256,33 @@ mod tests {
         assert!(validate_static_key("").is_err());
         assert!(validate_static_key("a\r\nb").is_err());
         assert!(validate_static_key(&"x".repeat(4097)).is_err());
+    }
+
+    #[test]
+    fn normalise_trims_and_accepts_plain_keys() {
+        assert_eq!(normalise_static_key("  github_pat_ABC  ").unwrap(), "github_pat_ABC");
+        assert_eq!(normalise_static_key("github_pat_A\u{00A0}").unwrap(), "github_pat_A");
+        assert_eq!(normalise_static_key("ghp_abc123").unwrap(), "ghp_abc123");
+    }
+
+    #[test]
+    fn normalise_rejects_scheme_prefix() {
+        let m = "Bitte nur den Schluessel selbst eintragen, ohne 'Bearer'/'token' davor";
+        assert_eq!(normalise_static_key("Bearer github_pat_X").unwrap_err(), m);
+        assert_eq!(normalise_static_key("  bearer x").unwrap_err(), m);
+        assert_eq!(normalise_static_key("token ghp_X").unwrap_err(), m);
+        assert_eq!(normalise_static_key("TOKEN ghp_X").unwrap_err(), m);
+    }
+
+    #[test]
+    fn normalise_rejects_empty_long_and_invisible() {
+        assert_eq!(normalise_static_key("").unwrap_err(), "Wert darf nicht leer sein");
+        assert_eq!(normalise_static_key("   ").unwrap_err(), "Wert darf nicht leer sein");
+        assert_eq!(normalise_static_key(&"x".repeat(4097)).unwrap_err(), "Wert ist zu lang");
+        let m = "Wert enthaelt Leerzeichen oder unsichtbare/nicht-ASCII-Zeichen";
+        assert_eq!(normalise_static_key("github_pat_A B").unwrap_err(), m);
+        assert_eq!(normalise_static_key("a\u{00A0}b").unwrap_err(), m);
+        assert_eq!(normalise_static_key("a\u{200B}b").unwrap_err(), m);
+        assert_eq!(normalise_static_key("a\r\nb").unwrap_err(), m);
     }
 }

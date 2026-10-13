@@ -997,6 +997,34 @@ async fn one_time_key_page_stores_once_and_never_echoes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn one_time_key_page_rejects_bearer_prefix_with_clear_message() {
+    let mock = start_mock().await;
+    let h = harness(Opts {
+        template: Some(static_template(&mock.base, "INTEGRATION_PROBE_KEY")),
+        with_vault: true,
+        files: vec![],
+    })
+    .await;
+    let (s, j) = post(&h, "/api/integrations/add", serde_json::json!({"id":"probe"})).await;
+    assert_eq!(s, 201, "{j}");
+    let (s, j) = post(
+        &h,
+        "/api/integrations/probe/schluessel/link",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(s, 200, "{j}");
+    let url = j["url"].as_str().unwrap().to_string();
+    let (s, body) = post_form(&url, &[("wert", "Bearer KANARIE-BEARER-7")]).await;
+    assert_eq!(s, 400, "{body}");
+    assert!(
+        body.contains("Bitte nur den Schluessel selbst eintragen"),
+        "{body}"
+    );
+    assert!(!body.contains("KANARIE-BEARER-7"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_routes_refuse_non_loopback_peers() {
     let mock = start_mock().await;
     let h = harness(Opts {

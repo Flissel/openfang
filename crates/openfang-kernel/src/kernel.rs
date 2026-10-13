@@ -7000,11 +7000,12 @@ impl OpenFangKernel {
         else {
             return Err("link ungueltig".into());
         };
-        if crate::integration_oauth::validate_static_key(value).is_err() {
-            return Err("wert ungueltig".into());
-        }
+        let value = match crate::integration_oauth::normalise_static_key(value) {
+            Ok(v) => zeroize::Zeroizing::new(v),
+            Err(msg) => return Err(msg.to_string()),
+        };
         if self
-            .vault_put(&reference, zeroize::Zeroizing::new(value.to_string()))
+            .vault_put(&reference, value)
             .is_err()
         {
             return Err("tresor nicht verfuegbar".into());
@@ -11517,7 +11518,7 @@ admission = "admitted"
                 .schluessel_store("probe", &token, "a\r\nb")
                 .await
                 .unwrap_err(),
-            "wert ungueltig"
+            "Wert enthaelt Leerzeichen oder unsichtbare/nicht-ASCII-Zeichen"
         );
         assert_eq!(
             kernel
@@ -11536,6 +11537,18 @@ admission = "admitted"
                 .resolve_credential("INTEGRATION_PROBE_KEY")
                 .as_deref(),
             Some("KANARIE-KEY-1")
+        );
+        // Normalisierung: getrimmter Wert landet im Tresor
+        let token3 = kernel.schluessel_link("probe").unwrap();
+        kernel
+            .schluessel_store("probe", &token3, "  KANARIE-KEY-3  ")
+            .await
+            .unwrap();
+        assert_eq!(
+            kernel
+                .resolve_credential("INTEGRATION_PROBE_KEY")
+                .as_deref(),
+            Some("KANARIE-KEY-3")
         );
         assert_eq!(
             kernel
