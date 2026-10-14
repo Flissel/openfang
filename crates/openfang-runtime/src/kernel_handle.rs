@@ -192,18 +192,33 @@ pub trait KernelHandle: Send + Sync {
     }
 
     /// An integration tool call failed because the vendor rejected the key
-    /// (HTTP 401/403). The kernel marks the owning integration as
-    /// `schluessel_abgelehnt`. Receives only the tool name. Default: no-op.
-    fn report_integration_key_rejected(&self, tool_name: &str) {
-        let _ = tool_name;
+    /// (HTTP 401/403). `unauthorized` is true for a 401 (credential invalid),
+    /// false for a 403 (rights missing). The kernel marks the owning
+    /// integration as `schluessel_abgelehnt`, or for OAuth integrations as
+    /// `anmeldung_noetig` on a 401 (never overwriting `anmeldung_noetig`).
+    /// Receives only the tool name and the class. Default: no-op.
+    fn report_integration_key_rejected(&self, tool_name: &str, unauthorized: bool) {
+        let _ = (tool_name, unauthorized);
     }
 
-    /// An OAuth integration tool call was rejected (HTTP 401/403). The kernel
-    /// refreshes the token once and reconnects the server. Returns `true` only
-    /// if a fresh token is in place and the connection is rebuilt, so the
-    /// runtime may retry the call once. Default: `false` (no refresh).
-    async fn refresh_integration_after_rejection(&self, tool_name: &str) -> bool {
+    /// Fingerprint (SHA-256 hex prefix, never the token) of the OAuth access
+    /// token the integration's current connection was built with. The runtime
+    /// reads it BEFORE a call so a later rejection names the token that was
+    /// actually sent. Default: `None`.
+    fn integration_credential_fingerprint(&self, tool_name: &str) -> Option<String> {
         let _ = tool_name;
+        None
+    }
+
+    /// An OAuth integration tool call was rejected with HTTP 401. `sent` is
+    /// the fingerprint read before the call (see
+    /// `integration_credential_fingerprint`). The kernel refreshes only if the
+    /// vault still holds that token (deduplication, spec 4.6) and reconnects
+    /// if the connection does not carry the fresh token yet. Returns `true`
+    /// only if a fresh token is in place, so the runtime may retry the call
+    /// once. Without `sent`: `false`. Default: `false` (no refresh).
+    async fn refresh_integration_after_rejection(&self, tool_name: &str, sent: Option<&str>) -> bool {
+        let _ = (tool_name, sent);
         false
     }
 

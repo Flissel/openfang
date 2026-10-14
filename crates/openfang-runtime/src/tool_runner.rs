@@ -517,14 +517,26 @@ pub async fn execute_tool(
         other => {
             // Fallback 1: MCP tools (mcp_{server}_{tool} prefix)
             if mcp::is_mcp_tool(other) {
+                // Fingerprint of the OAuth token BEFORE the call: a rejection
+                // then names the token that was really sent, never a token a
+                // parallel caller already refreshed to (dedup, spec 4.6).
+                let sent_fingerprint = kernel
+                    .filter(|kh| kh.is_integration_tool(other))
+                    .and_then(|kh| kh.integration_credential_fingerprint(other));
                 let mut mcp_result = dispatch_mcp(mcp_connections, other, input).await;
                 // OAuth: one refresh and one retry when the vendor rejected the
-                // token. No lock on `mcp_connections` is held here (dispatch_mcp
+                // token with 401 (a 403 is a rights problem: no refresh). No
+                // lock on `mcp_connections` is held here (dispatch_mcp
                 // released it), because the kernel reconnects the server.
                 if let (Some(kh), Err(e)) = (kernel, &mcp_result) {
                     if kh.is_integration_tool(other)
                         && should_refresh_after_error(e)
-                        && kh.refresh_integration_after_rejection(other).await
+                        && kh
+                            .refresh_integration_after_rejection(
+                                other,
+                                sent_fingerprint.as_deref(),
+                            )
+                            .await
                     {
                         mcp_result = dispatch_mcp(mcp_connections, other, input).await;
                     }
@@ -593,9 +605,10 @@ pub async fn execute_tool(
     }
 }
 
-/// Does this MCP call error mean the vendor rejected the credential?
+/// Does this MCP call error justify an OAuth refresh? Only HTTP 401; a 403
+/// (rights missing) would fail again after a refresh.
 fn should_refresh_after_error(err: &str) -> bool {
-    mcp::classify_connect_error(err) == mcp::ConnectErrorClass::KeyRejected
+    mcp::is_unauthorized_error(err)
 }
 
 /// Dispatch one MCP tool call. Takes the connection lock and releases it
@@ -632,7 +645,7 @@ fn report_integration_call_error(kh: &dyn KernelHandle, tool_name: &str, err: &s
     if kh.is_integration_tool(tool_name)
         && mcp::classify_connect_error(err) == mcp::ConnectErrorClass::KeyRejected
     {
-        kh.report_integration_key_rejected(tool_name);
+        kh.report_integration_key_rejected(tool_name, mcp::is_unauthorized_error(err));
     }
 }
 
@@ -5383,10 +5396,13 @@ mod tests {
         fn is_integration_tool(&self, t: &str) -> bool {
             t.starts_with("mcp_github_")
         }
-        fn report_integration_key_rejected(&self, tool_name: &str) {
-            self.rejected.lock().unwrap().push(tool_name.to_string());
+        fn report_integration_key_rejected(&self, tool_name: &str, unauthorized: bool) {
+            self.rejected
+                .lock()
+                .unwrap()
+                .push(format!("{tool_name} unauthorized={unauthorized}"));
         }
-        async fn refresh_integration_after_rejection(&self, _t: &str) -> bool {
+        async fn refresh_integration_after_rejection(&self, _t: &str, _sent: Option<&str>) -> bool {
             self.refresh_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.refresh_result
@@ -5531,6 +5547,9 @@ mod tests {
     #[test]
     fn should_refresh_only_on_key_rejected_class() {
         assert!(should_refresh_after_error("MCP tool call failed: HTTP 401 Unauthorized: x"));
+        assert!(!should_refresh_after_error(
+            "MCP tool call failed: unexpected server response: HTTP 403 Forbidden"
+        ));
         assert!(!should_refresh_after_error("MCP tool call failed: dns error"));
         assert!(!should_refresh_after_error("Invalid MCP tool name: mcp_x"));
     }
@@ -5551,9 +5570,18 @@ mod tests {
         // Network errors and non-integration tools are not key rejections.
         report_integration_call_error(k.as_ref(), "mcp_github_get_me", "error sending request: dns error");
         report_integration_call_error(k.as_ref(), "mcp_rowboat_status", rejected);
+        // 403: still a key rejection, but marked as not-401 (no OAuth re-login).
+        report_integration_call_error(
+            k.as_ref(),
+            "mcp_github_get_me",
+            "MCP tool call failed: unexpected server response: HTTP 403 Forbidden",
+        );
         assert_eq!(
             rec.rejected.lock().unwrap().as_slice(),
-            &["mcp_github_get_me".to_string()]
+            &[
+                "mcp_github_get_me unauthorized=true".to_string(),
+                "mcp_github_get_me unauthorized=false".to_string()
+            ]
         );
     }
 }

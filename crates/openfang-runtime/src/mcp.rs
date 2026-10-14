@@ -449,8 +449,31 @@ pub fn classify_connect_error(message: &str) -> ConnectErrorClass {
 /// path, address or longer number (":4010", "/4031", "10.0.4.403") does not
 /// count — otherwise a network error would wrongly suppress auto-reconnect.
 fn has_auth_status_code(m: &str) -> bool {
+    has_status_code(m, &["401", "403"])
+}
+
+/// True only when the vendor answered HTTP 401 (credential invalid or
+/// expired), not 403 (credential valid, rights missing). An explicit status
+/// code wins over reason words; without one, "forbidden" means 403 and
+/// "unauthorized"/"auth required" mean 401. Only a 401 justifies an OAuth
+/// refresh; a 403 would come back after a refresh, too.
+pub fn is_unauthorized_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    if m.contains("mcp header invalid") {
+        return false;
+    }
+    if has_status_code(&m, &["401"]) {
+        return true;
+    }
+    if has_status_code(&m, &["403"]) || m.contains("forbidden") {
+        return false;
+    }
+    m.contains("unauthorized") || m.contains("auth required")
+}
+
+fn has_status_code(m: &str, codes: &[&str]) -> bool {
     let bytes = m.as_bytes();
-    for code in ["401", "403"] {
+    for &code in codes {
         for (i, _) in m.match_indices(code) {
             let prev = i.checked_sub(1).map(|j| bytes[j]);
             let next = bytes.get(i + code.len()).copied();
@@ -714,6 +737,25 @@ mod tests {
         // The real rmcp network-error text stays Unreachable.
         let refused = "MCP HTTP connection failed: Send message error Transport [rmcp::transport::worker::WorkerTransport<rmcp::transport::streamable_http_client::StreamableHttpClientWorker<reqwest::async_impl::client::Client>>] error: Client error: error sending request for url (http://127.0.0.1:4010/mcp), when send initialize request";
         assert_eq!(classify_connect_error(refused), ConnectErrorClass::Unreachable);
+    }
+
+    #[test]
+    fn only_401_counts_as_unauthorized() {
+        let real_401 = "MCP tool call failed: unexpected server response: HTTP 401 Unauthorized: {\"error\":\"unauthorized\"}";
+        assert!(is_unauthorized_error(real_401));
+        assert!(is_unauthorized_error("HTTP 401"));
+        assert!(is_unauthorized_error("Auth required"));
+        // 401 status wins over a body that says "forbidden".
+        assert!(is_unauthorized_error("HTTP 401: {\"error\":\"forbidden\"}"));
+        // 403: rights missing, a refresh would not help.
+        assert!(!is_unauthorized_error("unexpected server response: HTTP 403 Forbidden"));
+        assert!(!is_unauthorized_error("HTTP 403: {\"error\":\"unauthorized\"}"));
+        assert!(!is_unauthorized_error("... 403 Forbidden ..."));
+        assert!(!is_unauthorized_error("status: 403"));
+        // Network and header errors are never 401.
+        assert!(!is_unauthorized_error("error sending request for url (http://h:401/mcp)"));
+        assert!(!is_unauthorized_error("MCP header invalid: Authorization"));
+        assert!(!is_unauthorized_error("dns error"));
     }
 
     #[test]

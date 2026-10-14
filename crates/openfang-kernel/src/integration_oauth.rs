@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 /// Gueltigkeit eines `state` bzw. Einmal-Links.
 pub const LOGIN_TTL: Duration = Duration::from_secs(600);
 
+/// Meldung fuer einen abgelaufenen oder verbrauchten Einmal-Link (Formular-POST).
+pub const LINK_UNGUELTIG: &str =
+    "Link abgelaufen oder bereits benutzt \u{2013} bitte neuen Link anfordern";
+
 /// Obergrenze fuer offene Anmeldungen bzw. Einmal-Links.
 const MAX_ENTRIES: usize = 256;
 
@@ -28,6 +32,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Eine laufende Anmeldung (kein `Debug`: enthaelt den PKCE-Verifier).
+///
+/// Zeroizing-Luecke (bewusst): `state` als Map-Schluessel und `redirect_uri`
+/// sind gewoehnliche `String`s und werden beim Freigeben nicht ueberschrieben;
+/// nur der Verifier ist `Zeroizing`. `state` ist einmalig und kurzlebig.
 pub struct PendingLogin {
     pub integration: String,
     pub verifier: zeroize::Zeroizing<String>,
@@ -60,7 +68,8 @@ impl PendingLogins {
     }
 }
 
-/// Einmal-Link (kein `Debug`).
+/// Einmal-Link (kein `Debug`). Zeroizing-Luecke (bewusst): das Einmal-Token
+/// ist als Map-Schluessel ein gewoehnlicher `String` (einmalig, <= 10 min).
 pub struct OneTimeLink {
     pub integration: String,
     pub reference: String,
@@ -133,18 +142,12 @@ pub fn callback_url(api_listen: &str, id: &str) -> Result<String, &'static str> 
     }
 }
 
-/// Statischer Schluessel: nicht leer, keine Steuerzeichen, <= 4096 Bytes.
-pub fn validate_static_key(value: &str) -> Result<(), &'static str> {
-    if value.is_empty() {
-        return Err("Wert darf nicht leer sein");
-    }
-    if value.len() > 4096 {
-        return Err("Wert ist zu lang");
-    }
-    if value.chars().any(|c| c.is_control()) {
-        return Err("Wert enthaelt Steuerzeichen");
-    }
-    Ok(())
+/// Fingerabdruck eines Tokens: die ersten 8 Bytes von SHA-256 als Hex (16
+/// Zeichen). Dient nur dem Vergleich "dasselbe Token?"; das Token selbst wird
+/// nie gespeichert, geloggt oder verglichen.
+pub fn token_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(token.as_bytes())[..8])
 }
 
 /// Normalisiert den eingegebenen statischen Schluessel: trimmt Raender,
@@ -156,7 +159,9 @@ pub fn normalise_static_key(value: &str) -> Result<String, &'static str> {
     let prefixed = |p: &str| {
         b.len() > p.len() && b[..p.len()].eq_ignore_ascii_case(p.as_bytes()) && b[p.len()] == b' '
     };
-    if prefixed("bearer") || prefixed("token") {
+    // Auch ein nacktes "Bearer"/"token" (z. B. nur das Schema kopiert).
+    let bare = v.eq_ignore_ascii_case("bearer") || v.eq_ignore_ascii_case("token");
+    if bare || prefixed("bearer") || prefixed("token") {
         return Err("Bitte nur den Schluessel selbst eintragen, ohne 'Bearer'/'token' davor");
     }
     if v.is_empty() {
@@ -193,13 +198,29 @@ mod tests {
 
     #[test]
     fn state_expires() {
+        // Ablauf ueber eine kurze TTL statt eines rueckdatierten Instant: laeuft
+        // immer (kein stilles Ueberspringen kurz nach dem Booten).
         let p = PendingLogins::new();
-        let mut l = login("vercel");
-        // Frisch gebootete Maschine: Instant kann zu klein sein -> Assertion ueberspringen.
-        let Some(old) = Instant::now().checked_sub(Duration::from_secs(601)) else { return };
-        l.created = old;
-        p.insert("S", l);
-        assert!(p.take("S", "vercel", LOGIN_TTL).is_none());
+        p.insert("S", login("vercel"));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(p.take("S", "vercel", Duration::from_millis(5)).is_none(), "abgelaufen");
+        p.insert("S2", login("vercel"));
+        assert!(p.take("S2", "vercel", LOGIN_TTL).is_some(), "frisch gueltig");
+        // Dasselbe fuer Einmal-Links.
+        let l = OneTimeLinks::new();
+        l.insert("T", OneTimeLink { integration: "github".into(), reference: "R".into(), created: Instant::now() });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(l.peek("T", "github", Duration::from_millis(5)).is_none());
+        assert!(l.take("T", "github", Duration::from_millis(5)).is_none());
+    }
+
+    #[test]
+    fn token_fingerprint_is_stable_short_and_not_the_token() {
+        let a = token_fingerprint("KANARIE-AT-1");
+        assert_eq!(a, token_fingerprint("KANARIE-AT-1"));
+        assert_ne!(a, token_fingerprint("KANARIE-AT-2"));
+        assert_eq!(a.len(), 16);
+        assert!(!a.contains("KANARIE"));
     }
 
     #[test]
@@ -251,14 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn static_key_validation() {
-        assert!(validate_static_key("ghp_abc").is_ok());
-        assert!(validate_static_key("").is_err());
-        assert!(validate_static_key("a\r\nb").is_err());
-        assert!(validate_static_key(&"x".repeat(4097)).is_err());
-    }
-
-    #[test]
     fn normalise_trims_and_accepts_plain_keys() {
         assert_eq!(normalise_static_key("  github_pat_ABC  ").unwrap(), "github_pat_ABC");
         assert_eq!(normalise_static_key("github_pat_A\u{00A0}").unwrap(), "github_pat_A");
@@ -272,6 +285,30 @@ mod tests {
         assert_eq!(normalise_static_key("  bearer x").unwrap_err(), m);
         assert_eq!(normalise_static_key("token ghp_X").unwrap_err(), m);
         assert_eq!(normalise_static_key("TOKEN ghp_X").unwrap_err(), m);
+        // Nacktes Schema (nach dem Trimmen), jede Schreibweise.
+        assert_eq!(normalise_static_key("Bearer").unwrap_err(), m);
+        assert_eq!(normalise_static_key("  bearer  ").unwrap_err(), m);
+        assert_eq!(normalise_static_key("TOKEN").unwrap_err(), m);
+        assert_eq!(normalise_static_key("token\n").unwrap_err(), m);
+        // Aber ein Schluessel, der nur so anfaengt, ist ein Schluessel.
+        assert_eq!(normalise_static_key("tokenABC").unwrap(), "tokenABC");
+        assert_eq!(normalise_static_key("Bearer_x").unwrap(), "Bearer_x");
+    }
+
+    #[test]
+    fn normalise_boundaries() {
+        // Genau 4096 Bytes: erlaubt; 4097: zu lang (siehe unten).
+        let max = "x".repeat(4096);
+        assert_eq!(normalise_static_key(&max).unwrap(), max);
+        // Raender des sichtbaren ASCII-Bereichs (0x21 '!' und 0x7E '~').
+        assert_eq!(normalise_static_key("!abc~").unwrap(), "!abc~");
+        assert_eq!(normalise_static_key("!").unwrap(), "!");
+        assert_eq!(normalise_static_key("~").unwrap(), "~");
+        let m = "Wert enthaelt Leerzeichen oder unsichtbare/nicht-ASCII-Zeichen";
+        // DEL (0x7F) ist kein sichtbares Zeichen.
+        assert_eq!(normalise_static_key("abc\u{7f}").unwrap_err(), m);
+        // U+200B wird von trim() NICHT entfernt und muss abgelehnt werden.
+        assert_eq!(normalise_static_key("\u{200B}ghp_abc").unwrap_err(), m);
     }
 
     #[test]

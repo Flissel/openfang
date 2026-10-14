@@ -8311,6 +8311,13 @@ pub async fn set_provider_key(
                 format!("{}_API_KEY", name.to_uppercase().replace('-', "_"))
             })
     };
+    // INTEGRATION_* gehoert dem Kernel (z. B. Anbieter "integration-foo").
+    if is_integration_reference(&env_var) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "reserved provider name"})),
+        );
+    }
 
     // Store in vault (best-effort — no-op if vault not initialized)
     state.kernel.store_credential(&env_var, &key);
@@ -8481,6 +8488,13 @@ pub async fn delete_provider_key(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Provider does not require an API key"})),
+        );
+    }
+    // INTEGRATION_* gehoert dem Kernel: nie ueber die Anbieter-Route loeschen.
+    if is_integration_reference(&env_var) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "reserved provider name"})),
         );
     }
 
@@ -9682,10 +9696,14 @@ pub async fn remove_integration(
         );
     }
     if let Err(e) = state.kernel.remove_integration(&id).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e})),
-        );
+        // Tresor nicht schreibbar: die Integration bleibt installiert und
+        // abgemeldet; der Aufrufer kann es spaeter erneut versuchen.
+        let status = if e == "tresor nicht verfuegbar" {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return (status, Json(serde_json::json!({"error": e})));
     }
 
     (
@@ -9933,7 +9951,8 @@ pub async fn integration_schluessel_page(
         return integration_html(
             StatusCode::NOT_FOUND,
             "Link ungueltig",
-            "<h1>Link ungueltig</h1><p>Der Link ist ungueltig, abgelaufen oder bereits benutzt.</p>",
+            "<h1>Link ungueltig</h1><p>Der Link ist ungueltig, abgelaufen oder bereits benutzt. \
+             Bitte einen neuen Link anfordern.</p>",
         );
     };
     integration_html(
@@ -9944,7 +9963,7 @@ pub async fn integration_schluessel_page(
              <form method=\"post\"><label for=\"wert\">Schluessel</label>\
              <input id=\"wert\" type=\"password\" name=\"wert\" autocomplete=\"off\" required>\
              <button type=\"submit\">Speichern</button></form>\
-             <p>Der Link gilt nur einmal.</p>",
+             <p>Der Link gilt 10 Minuten und nur fuer einen Versuch.</p>",
             id = html_escape(&id),
             reference = html_escape(&reference),
         ),
@@ -9976,7 +9995,11 @@ pub async fn integration_schluessel_submit(
         }
     }
     // Fehlendes Feld oder kaputtes Formular: leerer Wert -> der Kernel
-    // verbraucht den Link trotzdem und meldet "wert ungueltig" (fail closed).
+    // verbraucht den Link trotzdem und meldet "Wert darf nicht leer sein"
+    // (fail closed; jeder Versuch kostet den Link).
+    // Zeroizing-Luecke (bewusst): die Formular-Map haelt den Wert als
+    // gewoehnlichen String, bis sie hier verworfen wird; der Kernel
+    // normalisiert in ein `Zeroizing`.
     let mut form = form.map(|axum::extract::Form(f)| f).unwrap_or_default();
     let wert = form.remove("wert").unwrap_or_default();
     drop(form);
@@ -13627,10 +13650,7 @@ use openfang_types::config::is_valid_credential_reference;
 /// lookup on Windows is case-insensitive, so `integration_x` names the same
 /// variable as `INTEGRATION_X`. Only the kernel reads or writes these.
 fn is_integration_reference(reference: &str) -> bool {
-    let prefix = openfang_extensions::INTEGRATION_PREFIX;
-    reference
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    openfang_extensions::is_integration_reference(reference)
 }
 
 /// Build a credential-endpoint response. Every response from this endpoint --

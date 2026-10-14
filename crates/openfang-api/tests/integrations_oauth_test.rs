@@ -38,6 +38,12 @@ struct Counters {
     revoke: AtomicUsize,
     /// Schalter: MCP akzeptiert nur noch `KANARIE-AT-2`.
     only_at2: AtomicBool,
+    /// Schalter: MCP lehnt jedes Token mit 401 ab.
+    reject_all: AtomicBool,
+    /// Schalter: `tools/call` antwortet 403 (Token gueltig, Rechte fehlen).
+    forbid_calls: AtomicBool,
+    /// Schalter: Erneuerung antwortet immer `invalid_grant`.
+    dead_refresh: AtomicBool,
 }
 
 struct Mock {
@@ -50,7 +56,9 @@ fn mock_mcp(base: &str, c: &Counters, headers: HeaderMap, req: serde_json::Value
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let accepted = if c.only_at2.load(Ordering::SeqCst) {
+    let accepted = if c.reject_all.load(Ordering::SeqCst) {
+        false
+    } else if c.only_at2.load(Ordering::SeqCst) {
         auth == "Bearer KANARIE-AT-2"
     } else {
         auth.starts_with("Bearer KANARIE-AT-") || auth == "Bearer KANARIE-STATIC-9"
@@ -68,6 +76,9 @@ fn mock_mcp(base: &str, c: &Counters, headers: HeaderMap, req: serde_json::Value
     let Some(id) = req.get("id").cloned() else {
         return StatusCode::ACCEPTED.into_response();
     };
+    if req["method"] == "tools/call" && c.forbid_calls.load(Ordering::SeqCst) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let result = match req["method"].as_str().unwrap_or("") {
         "initialize" => {
             serde_json::json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"mini","version":"1"}})
@@ -98,7 +109,9 @@ fn mock_token(c: &Counters, f: HashMap<String, String>) -> Response {
         }
         Some("refresh_token") => {
             let n = c.refresh.fetch_add(1, Ordering::SeqCst) + 1;
-            if f.get("refresh_token") != Some(&format!("KANARIE-RT-{n}")) {
+            if c.dead_refresh.load(Ordering::SeqCst)
+                || f.get("refresh_token") != Some(&format!("KANARIE-RT-{n}"))
+            {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"error":"invalid_grant"})),
@@ -683,6 +696,214 @@ async fn rejected_token_on_tool_call_refreshes_once_and_audits_once() {
     }
 }
 
+/// Registriert einen Agenten, der die Integration `probe` nutzen darf.
+fn register_probe_caller(h: &H) -> openfang_types::agent::AgentId {
+    use openfang_types::agent::{
+        AgentEntry, AgentId, AgentManifest, AgentMode, AgentState, SessionId,
+    };
+    let agent_id = AgentId::new();
+    let manifest = AgentManifest {
+        name: "probe-caller".into(),
+        mcp_servers: vec!["probe".into()],
+        ..Default::default()
+    };
+    h.state
+        .kernel
+        .registry
+        .register(AgentEntry {
+            id: agent_id,
+            name: manifest.name.clone(),
+            manifest,
+            state: AgentState::Running,
+            mode: AgentMode::default(),
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+            parent: None,
+            children: vec![],
+            session_id: SessionId::new(),
+            tags: vec![],
+            identity: Default::default(),
+            onboarding_completed: false,
+            onboarding_completed_at: None,
+        })
+        .unwrap();
+    agent_id
+}
+
+/// `mcp_probe_get_me` ueber die echte `/mcp`-Route.
+async fn call_get_me(h: &H, agent_id: &openfang_types::agent::AgentId) -> serde_json::Value {
+    let r = reqwest::Client::new()
+        .post(format!("{}/mcp", h.base))
+        .bearer_auth(API_KEY)
+        .header("X-OpenFang-Agent-Id", agent_id.to_string())
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "mcp_probe_get_me", "arguments": {}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    r.json().await.unwrap()
+}
+
+fn assert_tool_call_failed(j: &serde_json::Value) {
+    let failed = j.get("error").is_some() || j["result"]["isError"] == true;
+    assert!(failed, "{j}");
+}
+
+/// 403 = Rechte fehlen: keine Erneuerung, genau eine Audit-Zeile, Zustand
+/// schluessel_abgelehnt (nicht anmeldung_noetig).
+#[tokio::test(flavor = "multi_thread")]
+async fn forbidden_tool_call_never_refreshes_and_audits_once() {
+    let mock = start_mock().await;
+    let h = harness_with_oauth_probe(&mock).await;
+    login(&h).await;
+    let agent = register_probe_caller(&h);
+    mock.c.forbid_calls.store(true, Ordering::SeqCst);
+    let j = call_get_me(&h, &agent).await;
+    assert_tool_call_failed(&j);
+    assert_eq!(mock.c.refresh.load(Ordering::SeqCst), 0, "403 never refreshes");
+    let rows = integration_rows(&h).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["outcome"], "fehler", "{rows:?}");
+    assert_eq!(
+        zustand_of(&get_json(&h, "/api/integrations").await),
+        "schluessel_abgelehnt"
+    );
+}
+
+/// Abgelehntes Token, Erneuerung scheitert (invalid_grant): der Zustand ist
+/// anmeldung_noetig und wird vom 401 nicht zu schluessel_abgelehnt.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_refresh_during_tool_call_ends_as_login_required() {
+    let mock = start_mock().await;
+    let h = harness_with_oauth_probe(&mock).await;
+    login(&h).await;
+    let agent = register_probe_caller(&h);
+    mock.c.only_at2.store(true, Ordering::SeqCst);
+    mock.c.dead_refresh.store(true, Ordering::SeqCst);
+    let j = call_get_me(&h, &agent).await;
+    assert_tool_call_failed(&j);
+    assert_eq!(mock.c.refresh.load(Ordering::SeqCst), 1);
+    assert_eq!(integration_rows(&h).await.len(), 1);
+    assert_eq!(
+        zustand_of(&get_json(&h, "/api/integrations").await),
+        "anmeldung_noetig"
+    );
+}
+
+/// Dauerhaftes 401 (auch das frische Token wird abgelehnt): anmeldung_noetig.
+#[tokio::test(flavor = "multi_thread")]
+async fn persistent_401_after_refresh_ends_as_login_required() {
+    let mock = start_mock().await;
+    let h = harness_with_oauth_probe(&mock).await;
+    login(&h).await;
+    let agent = register_probe_caller(&h);
+    mock.c.reject_all.store(true, Ordering::SeqCst);
+    let j = call_get_me(&h, &agent).await;
+    assert_tool_call_failed(&j);
+    assert_eq!(mock.c.refresh.load(Ordering::SeqCst), 1, "exactly one refresh");
+    assert_eq!(integration_rows(&h).await.len(), 1);
+    assert_eq!(
+        zustand_of(&get_json(&h, "/api/integrations").await),
+        "anmeldung_noetig"
+    );
+}
+
+/// Tresor nicht schreibbar: Abmelden und Entfernen antworten 409 mit der
+/// Klasse, die Integration bleibt installiert und abgemeldet.
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_and_remove_with_unwritable_vault_answer_409() {
+    let mock = start_mock().await;
+    let h = harness_with_oauth_probe(&mock).await;
+    login(&h).await;
+    let vault = h._tmp.path().join("vault.enc");
+    std::fs::remove_file(&vault).unwrap();
+    std::fs::create_dir(&vault).unwrap();
+
+    let (s, j) = post(
+        &h,
+        "/api/integrations/probe/oauth/abmelden",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(s, 409, "{j}");
+    assert_eq!(j["error"], "tresor nicht verfuegbar");
+    assert_eq!(
+        zustand_of(&get_json(&h, "/api/integrations").await),
+        "anmeldung_noetig"
+    );
+
+    let r = reqwest::Client::new()
+        .delete(format!("{}/api/integrations/probe", h.base))
+        .bearer_auth(API_KEY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409);
+    let j: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(j["error"], "tresor nicht verfuegbar");
+    assert_eq!(
+        zustand_of(&get_json(&h, "/api/integrations").await),
+        "anmeldung_noetig",
+        "still installed, logged out"
+    );
+    for p in READ_PATHS {
+        let b = get_text(&h, p).await.1;
+        assert!(!b.contains("KANARIE-AT-") && !b.contains("KANARIE-RT-"), "{p}");
+    }
+}
+
+/// Anbieter-Schluessel-Routen duerfen keinen `INTEGRATION_`-Namen ableiten
+/// (z. B. eigener Anbieter "integration-foo" -> INTEGRATION_FOO_API_KEY).
+/// Die Handler direkt (ohne Middleware): der Tool-only-Riegel der Middleware
+/// wuerde sonst vorher mit 503 antworten.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_key_routes_refuse_integration_names() {
+    let h = harness(Opts {
+        template: None,
+        with_vault: true,
+        files: vec![],
+    })
+    .await;
+    let bare = Router::new()
+        .route(
+            "/api/providers/{name}/key",
+            rpost(routes::set_provider_key).delete(routes::delete_provider_key),
+        )
+        .with_state(h.state.clone());
+    for name in ["integration-foo", "Integration_Bar", "INTEGRATION-OAUTH-PROBE"] {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/providers/{name}/key"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"key":"KANARIE-PROVIDER-1"}"#))
+            .unwrap();
+        let resp = bare.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400, "{name}");
+        let j: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(j["error"], "reserved provider name", "{name}");
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/providers/{name}/key"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = bare.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 400, "{name} DELETE");
+    }
+    for var in [
+        "INTEGRATION_FOO_API_KEY",
+        "INTEGRATION_BAR_API_KEY",
+        "INTEGRATION_OAUTH_PROBE_API_KEY",
+    ] {
+        assert!(std::env::var(var).is_err(), "{var} set in process env");
+        assert!(h.state.kernel.resolve_credential(var).is_none(), "{var} stored");
+    }
+    let secrets = std::fs::read_to_string(h._tmp.path().join("secrets.env")).unwrap_or_default();
+    assert!(!secrets.contains("KANARIE-PROVIDER-1"));
+}
+
 async fn integration_rows(h: &H) -> Vec<serde_json::Value> {
     get_json(h, "/api/audit/recent?n=200").await["entries"]
         .as_array()
@@ -975,6 +1196,10 @@ async fn one_time_key_page_stores_once_and_never_echoes() {
     assert_eq!(s, 200, "{form}");
     assert!(form.contains("type=\"password\""), "{form}");
     assert!(form.contains("name=\"wert\""), "{form}");
+    assert!(
+        form.contains("Der Link gilt 10 Minuten und nur fuer einen Versuch."),
+        "{form}"
+    );
     assert_html_headers(&headers);
 
     let (s, body) = post_form(&url, &[("wert", "KANARIE-STATIC-9")]).await;
@@ -989,6 +1214,10 @@ async fn one_time_key_page_stores_once_and_never_echoes() {
     let (s, body) = post_form(&url, &[("wert", "noch einmal")]).await;
     assert_eq!(s, 400, "single use");
     assert!(!body.contains("noch einmal"));
+    assert!(
+        body.contains("Link abgelaufen oder bereits benutzt \u{2013} bitte neuen Link anfordern"),
+        "{body}"
+    );
     assert_eq!(get_page(&url).await.0, 404, "consumed link is gone");
 
     for p in READ_PATHS {
@@ -1055,8 +1284,8 @@ async fn browser_routes_refuse_non_loopback_peers() {
         path.as_str(),
     ] {
         let resp = oneshot_from(&h.app, far, "GET", p).await;
-        let st = resp.status();
-        assert!(st == 401 || st == 404, "{p}: {st}");
+        // Die Middleware antwortet Nicht-Loopback-Peers auf Browser-Routen mit 404.
+        assert_eq!(resp.status(), 404, "{p}");
         assert!(!body_text(resp).await.contains("password"), "{p}");
     }
     // POST vom Fernnetz verbraucht den Link nicht.
@@ -1072,11 +1301,7 @@ async fn browser_routes_refuse_non_loopback_peers() {
         ))
         .await
         .unwrap();
-    assert!(
-        resp.status() == 401 || resp.status() == 404,
-        "{}",
-        resp.status()
-    );
+    assert_eq!(resp.status(), 404);
     // Loopback sieht das Formular weiterhin (Link nicht verbraucht).
     let resp = oneshot_from(&h.app, "127.0.0.1:5555", "GET", &path).await;
     assert_eq!(resp.status(), 200);
