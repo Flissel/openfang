@@ -135,6 +135,11 @@ impl CredentialResolver {
     }
 
     /// Remove a credential from the vault (if available).
+    /// True if a vault is configured (locked or unlocked).
+    pub fn has_vault(&self) -> bool {
+        self.vault.is_some()
+    }
+
     pub fn remove_from_vault(&mut self, key: &str) -> ExtensionResult<bool> {
         if let Some(ref mut vault) = self.vault {
             vault.remove(key)

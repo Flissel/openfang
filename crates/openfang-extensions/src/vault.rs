@@ -154,26 +154,51 @@ impl CredentialVault {
     }
 
     /// Store a secret in the vault.
+    ///
+    /// Memory and disk stay consistent: if the master key cannot be resolved
+    /// or `save()` fails, the in-memory change is rolled back (the previous
+    /// value, if any, is restored) and the error is returned.
     pub fn set(&mut self, key: String, value: Zeroizing<String>) -> ExtensionResult<()> {
         if !self.unlocked {
             return Err(ExtensionError::VaultLocked);
         }
-        self.entries.insert(key, value);
-        let master_key = self.resolve_master_key()?;
-        self.save(&master_key)
+        let previous = self.entries.insert(key.clone(), value);
+        let result = self
+            .resolve_master_key()
+            .and_then(|master_key| self.save(&master_key));
+        if result.is_err() {
+            match previous {
+                Some(old) => {
+                    self.entries.insert(key, old);
+                }
+                None => {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+        result
     }
 
     /// Remove a secret from the vault.
+    ///
+    /// If the master key cannot be resolved or `save()` fails, the entry is
+    /// put back in memory and the error is returned (no "removed in memory,
+    /// still on disk" state).
     pub fn remove(&mut self, key: &str) -> ExtensionResult<bool> {
         if !self.unlocked {
             return Err(ExtensionError::VaultLocked);
         }
-        let removed = self.entries.remove(key).is_some();
-        if removed {
-            let master_key = self.resolve_master_key()?;
-            self.save(&master_key)?;
+        let Some(old) = self.entries.remove(key) else {
+            return Ok(false);
+        };
+        let result = self
+            .resolve_master_key()
+            .and_then(|master_key| self.save(&master_key));
+        if let Err(e) = result {
+            self.entries.insert(key.to_string(), old);
+            return Err(e);
         }
-        Ok(removed)
+        Ok(true)
     }
 
     /// List all keys in the vault (not values).
@@ -638,6 +663,48 @@ mod tests {
         let mut vault2 = CredentialVault::new(dir.path().join("vault.enc"));
         vault2.unlock_with_key(key).unwrap();
         assert_eq!(vault2.get("KEY").unwrap().as_str(), "val");
+    }
+
+    /// Makes `save()` fail by replacing the vault file with a directory.
+    fn break_vault_file(vault: &CredentialVault) {
+        std::fs::remove_file(&vault.path).unwrap();
+        std::fs::create_dir(&vault.path).unwrap();
+    }
+
+    #[test]
+    fn vault_set_rolls_back_when_save_fails() {
+        let (_dir, mut vault) = test_vault();
+        vault.init_with_key(random_key()).unwrap();
+        vault
+            .set("OLD".to_string(), Zeroizing::new("v1".to_string()))
+            .unwrap();
+        break_vault_file(&vault);
+
+        // New key: must not stay in memory.
+        assert!(vault
+            .set("NEW".to_string(), Zeroizing::new("x".to_string()))
+            .is_err());
+        assert!(vault.get("NEW").is_none());
+
+        // Existing key: the previous value must be restored.
+        assert!(vault
+            .set("OLD".to_string(), Zeroizing::new("v2".to_string()))
+            .is_err());
+        assert_eq!(vault.get("OLD").unwrap().as_str(), "v1");
+        assert_eq!(vault.len(), 1);
+    }
+
+    #[test]
+    fn vault_remove_rolls_back_when_save_fails() {
+        let (_dir, mut vault) = test_vault();
+        vault.init_with_key(random_key()).unwrap();
+        vault
+            .set("KEEP".to_string(), Zeroizing::new("v1".to_string()))
+            .unwrap();
+        break_vault_file(&vault);
+
+        assert!(vault.remove("KEEP").is_err());
+        assert_eq!(vault.get("KEEP").unwrap().as_str(), "v1");
     }
 
     #[test]
