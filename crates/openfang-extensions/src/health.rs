@@ -77,6 +77,8 @@ impl IntegrationHealth {
         if !matches!(status, IntegrationStatus::Ready) {
             self.connected_since = None;
             self.consecutive_failures += 1;
+            // Werkzeuge zaehlen nur, solange die Integration verbunden ist.
+            self.tool_count = 0;
         }
         self.status = status;
         self.reconnecting = false;
@@ -277,6 +279,25 @@ mod tests {
         let h = monitor.get_health("slack").unwrap();
         assert_eq!(h.consecutive_failures, 0);
         assert_eq!(h.status, IntegrationStatus::Ready);
+    }
+
+    #[test]
+    fn tool_count_is_reported_only_while_ready() {
+        let monitor = HealthMonitor::new(HealthMonitorConfig::default());
+        monitor.register("vercel");
+        monitor.report_ok("vercel", 236);
+        assert_eq!(monitor.get_health("vercel").unwrap().tool_count, 236);
+        monitor.report_status(
+            "vercel",
+            IntegrationStatus::LoginRequired("abgemeldet".into()),
+        );
+        assert_eq!(monitor.get_health("vercel").unwrap().tool_count, 0);
+        monitor.report_ok("vercel", 236);
+        monitor.report_status("vercel", IntegrationStatus::KeyRejected);
+        assert_eq!(monitor.get_health("vercel").unwrap().tool_count, 0);
+        monitor.report_ok("vercel", 12);
+        monitor.report_status("vercel", IntegrationStatus::Ready);
+        assert_eq!(monitor.get_health("vercel").unwrap().tool_count, 12);
     }
 
     #[test]

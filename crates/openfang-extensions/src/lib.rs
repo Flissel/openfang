@@ -174,6 +174,14 @@ pub struct CatalogMeta {
 /// Praefix aller vom Kernel verwalteten Tresor-Referenzen; nie ueber /api/credentials/* ausstellbar.
 pub const INTEGRATION_PREFIX: &str = "INTEGRATION_";
 
+/// True fuer jeden vom Kernel verwalteten Integrations-Namen (`INTEGRATION_*`)
+/// in JEDER Schreibweise: die Umgebung ist unter Windows case-insensitiv,
+/// `integration_x` meint dieselbe Variable wie `INTEGRATION_X`.
+pub fn is_integration_reference(name: &str) -> bool {
+    name.get(..INTEGRATION_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(INTEGRATION_PREFIX))
+}
+
 /// Tresor-Referenz des OAuth-Tokens einer Integration (INTEGRATION_OAUTH_<ID>).
 pub fn oauth_reference(id: &str) -> String {
     let up: String = id

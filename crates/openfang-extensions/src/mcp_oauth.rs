@@ -385,6 +385,11 @@ fn is_tls_error(e: &reqwest::Error) -> bool {
 
 /// Everything needed to log in, refresh and revoke for one integration.
 /// Stored in the vault (serialised as JSON).
+///
+/// Zeroizing-Luecke (bewusst, kein Umbau): Tokens und `client_id` sind
+/// gewoehnliche `String`s und werden beim Freigeben nicht ueberschrieben. Der
+/// Datensatz lebt nur kurz im Speicher (gelesen aus dem Tresor, geschrieben
+/// als `Zeroizing`-JSON); `Debug` ist nicht abgeleitet.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthRecord {
     pub v: u8,
@@ -600,6 +605,10 @@ fn endpoint_host_allowed(ep: &url::Url, issuer: &url::Url) -> bool {
         return false;
     };
     let (eh, ih) = (eh.to_ascii_lowercase(), ih.to_ascii_lowercase());
+    // Bleibt bewusst: `Url::parse` laesst `host.` (FQDN mit Endpunkt) stehen
+    // und `is_public_host` akzeptiert ihn. `api.vercel.com.` und `vercel.com`
+    // waeren dann zwei Schreibweisen desselben Hosts mit unklarer Bindung;
+    // fail closed statt normalisieren.
     if eh.ends_with('.') || ih.ends_with('.') {
         return false;
     }
@@ -933,6 +942,8 @@ pub fn authorize_url(
 
 // ─── Token endpoint ──────────────────────────────────────────────────────────
 
+/// Zeroizing-Luecke (bewusst): die Token-Strings der Anbieterantwort werden
+/// in den `OAuthRecord` verschoben, nicht ueberschrieben.
 #[derive(Deserialize)]
 struct TokenResponse {
     #[serde(default)]
@@ -1072,6 +1083,13 @@ pub async fn refresh(
 
 /// Revoke the refresh token (or, without one, the access token) at the
 /// provider. Without a revocation endpoint or without any token this is a no-op.
+///
+/// Only ONE token is revoked (RFC 7009 lets the provider decide whether
+/// revoking the refresh token also invalidates its access tokens). An access
+/// token handed out earlier may stay valid at the provider until it expires
+/// (typically <= 1 h); the kernel stops using it at once (connection dropped,
+/// integration marked logged out). A second call with
+/// `token_type_hint=access_token` is deliberately not made.
 pub async fn revoke(
     http: &OAuthHttp,
     policy: &UrlPolicy,
@@ -2062,7 +2080,10 @@ mod tests {
         assert!(!ok("https://api.vercel.com:8443/t", "https://vercel.com"));
         assert!(!ok("https://api.vercel.com./t", "https://vercel.com"));
         assert!(!ok("https://vercel.com./t", "https://vercel.com"));
-        // IP issuer: exact only
+        // IP issuer: exact only. Die beiden Ablehnungen unten scheitern schon
+        // am Suffixvergleich bzw. an der IPv4-Normalisierung von Url::parse und
+        // erreichen den `issuer_is_domain`-Riegel nicht (Url::parse macht aus
+        // "x.203.0.113.5" keinen Domain-Host); der Riegel ist Defence in Depth.
         assert!(ok("https://203.0.113.5/t", "https://203.0.113.5"));
         assert!(!ok("https://203.0.113.5.evil.com/t", "https://203.0.113.5"));
         assert!(!ok("https://4.113.5/t", "https://203.0.113.5"));

@@ -1529,7 +1529,9 @@ pub struct McpServerConfigEntry {
     #[serde(default)]
     pub auth_headers: Vec<AuthHeaderRef>,
     /// OAuth-Integration: Der Bearer-Wert kommt aus dem Tresor, vom Kernel verwaltet.
-    #[serde(default)]
+    /// Nur die Integrations-Registry setzt das Feld; aus config.toml/JSON ist es
+    /// nicht setzbar (`skip_deserializing`, immer `false`).
+    #[serde(default, skip_deserializing)]
     pub oauth: bool,
 }
 
@@ -4595,6 +4597,29 @@ mod tests {
     fn test_fallback_config_default_empty() {
         let config = KernelConfig::default();
         assert!(config.fallback_providers.is_empty());
+    }
+
+    /// `oauth` is set only by the integration registry. A manual
+    /// `[[mcp_servers]]` entry (config.toml, JSON) can never switch it on.
+    #[test]
+    fn mcp_server_oauth_flag_is_not_settable_from_config() {
+        let toml_str = r#"
+            [[mcp_servers]]
+            name = "vercel"
+            oauth = true
+            [mcp_servers.transport]
+            type = "http"
+            url = "https://mcp.vercel.com"
+        "#;
+        let config: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert!(!config.mcp_servers[0].oauth, "oauth must not come from config");
+        let json = serde_json::json!({
+            "name": "vercel", "oauth": true,
+            "transport": {"type": "http", "url": "https://mcp.vercel.com"}
+        });
+        let entry: McpServerConfigEntry = serde_json::from_value(json).unwrap();
+        assert!(!entry.oauth);
     }
 
     #[test]
