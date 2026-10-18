@@ -9676,6 +9676,33 @@ pub async fn add_integration(
     )
 }
 
+/// Fuehrt eine zustandsaendernde Kernel-Aktion in einer eigenen Task aus.
+/// Bricht der HTTP-Client ab, verwirft hyper/axum nur das Handler-Future;
+/// die Task laeuft trotzdem zu Ende (Audit, Zustand, Tresor). `Err(())`
+/// heisst: die Task ist gepanickt oder wurde abgebrochen.
+async fn run_to_completion<T, F>(action: &'static str, fut: F) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(fut).await.map_err(|e| {
+        // Kein Panik-Text: weder in die Antwort noch ins Log.
+        tracing::error!(
+            action,
+            panicked = e.is_panic(),
+            "integration task did not complete"
+        );
+    })
+}
+
+/// 500 mit fester Meldung, wenn die Task aus `run_to_completion` scheitert.
+fn integration_task_failed() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "interner fehler"})),
+    )
+}
+
 /// DELETE /api/integrations/:id — Remove an integration.
 pub async fn remove_integration(
     State(state): State<Arc<AppState>>,
@@ -9695,7 +9722,19 @@ pub async fn remove_integration(
             Json(serde_json::json!({"error": format!("Integration not installed: {id}")})),
         );
     }
-    if let Err(e) = state.kernel.remove_integration(&id).await {
+    // Zu Ende fuehren, auch wenn der Client vorher abbricht.
+    let kernel = state.kernel.clone();
+    let task_id = id.clone();
+    let result = match run_to_completion(
+        "remove_integration",
+        async move { kernel.remove_integration(&task_id).await },
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => return integration_task_failed(),
+    };
+    if let Err(e) = result {
         // Tresor nicht schreibbar: die Integration bleibt installiert und
         // abgemeldet; der Aufrufer kann es spaeter erneut versuchen.
         let status = if e == "tresor nicht verfuegbar" {
@@ -9736,7 +9775,19 @@ pub async fn reconnect_integration(
         );
     }
 
-    match state.kernel.reconnect_extension_mcp(&id).await {
+    // Zu Ende fuehren, auch wenn der Client vorher abbricht.
+    let kernel = state.kernel.clone();
+    let task_id = id.clone();
+    let result = match run_to_completion(
+        "reconnect_integration",
+        async move { kernel.reconnect_extension_mcp(&task_id).await },
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => return integration_task_failed(),
+    };
+    match result {
         Ok(tool_count) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -9829,7 +9880,18 @@ pub async fn integration_oauth_start(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    match state.kernel.oauth_start(&id).await {
+    // Zu Ende fuehren (Registrierung, Anmeldedatensatz), auch wenn der Client
+    // vorher abbricht.
+    let kernel = state.kernel.clone();
+    let result = match run_to_completion("integration_oauth_start", async move {
+        kernel.oauth_start(&id).await
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => return integration_task_failed().into_response(),
+    };
+    match result {
         Ok(url) => (
             StatusCode::OK,
             [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -9891,7 +9953,18 @@ pub async fn integration_oauth_abmelden(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    match state.kernel.oauth_logout(&id).await {
+    // Zu Ende fuehren, auch wenn der Client vorher abbricht: sonst bleibt die
+    // Abmeldung halb (kein Audit, Zustand weiter `verbunden`).
+    let kernel = state.kernel.clone();
+    let result = match run_to_completion("integration_oauth_abmelden", async move {
+        kernel.oauth_logout(&id).await
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(()) => return integration_task_failed().into_response(),
+    };
+    match result {
         Ok(()) => Json(serde_json::json!({"status": "abgemeldet"})).into_response(),
         Err(klasse) => (
             StatusCode::CONFLICT,

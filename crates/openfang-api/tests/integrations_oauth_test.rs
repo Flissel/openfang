@@ -20,7 +20,7 @@ use openfang_kernel::OpenFangKernel;
 use openfang_types::config::KernelConfig;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -44,6 +44,8 @@ struct Counters {
     forbid_calls: AtomicBool,
     /// Schalter: Erneuerung antwortet immer `invalid_grant`.
     dead_refresh: AtomicBool,
+    /// Verzoegerung des Widerrufs in ms (0 = sofort).
+    revoke_delay_ms: AtomicU64,
 }
 
 struct Mock {
@@ -203,6 +205,10 @@ async fn start_mock() -> Mock {
             rpost(move || {
                 let c = c3.clone();
                 async move {
+                    let delay = c.revoke_delay_ms.load(Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
                     c.revoke.fetch_add(1, Ordering::SeqCst);
                     StatusCode::OK
                 }
@@ -853,6 +859,140 @@ async fn logout_and_remove_with_unwritable_vault_answer_409() {
         let b = get_text(&h, p).await.1;
         assert!(!b.contains("KANARIE-AT-") && !b.contains("KANARIE-RT-"), "{p}");
     }
+}
+
+/// Audit-Zeilen `integration_oauth=probe ereignis=<ereignis> ...`.
+async fn oauth_audit_rows(h: &H, ereignis: &str) -> Vec<String> {
+    let needle = format!("integration_oauth=probe ereignis={ereignis} ");
+    get_json(h, "/api/audit/recent?n=500").await["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["detail"].as_str().map(str::to_string))
+        .filter(|d| d.starts_with(&needle))
+        .collect()
+}
+
+fn probe_installed(list: &serde_json::Value) -> bool {
+    list["installed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["id"] == "probe")
+}
+
+/// Anfrage mit Bearer ueber den echten Router (inkl. Middleware); der Client
+/// "gibt auf", indem das Antwort-Future nach `after` fallen gelassen wird.
+/// Liefert `true`, wenn das Future tatsaechlich vorzeitig abgebrochen wurde.
+async fn bearer_request_dropped_after(
+    h: &H,
+    method: &str,
+    path: &str,
+    after: std::time::Duration,
+) -> bool {
+    let mut req = oneshot_req("127.0.0.1:50123", method, path, Body::empty(), false);
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {API_KEY}").parse().unwrap(),
+    );
+    let fut = h.app.clone().oneshot(req);
+    tokio::time::timeout(after, fut).await.is_err()
+}
+
+/// Wartet bis `cond` gilt (hoechstens `max`).
+async fn poll_until<F, Fut>(max: std::time::Duration, mut cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + max;
+    loop {
+        if cond().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Live-Befund: Rowboat bricht `abmelden` nach 10 s ab, hyper/axum verwirft
+/// das Handler-Future, die Abmeldung bleibt halb (kein Audit, Zustand
+/// `verbunden`). Zustandsaendernde Aktionen muessen zu Ende laufen, auch wenn
+/// der Client vorher abbricht.
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_completes_even_if_client_disconnects() {
+    let mock = start_mock().await;
+    let h = harness_with_oauth_probe(&mock).await;
+    login(&h).await;
+    assert_eq!(
+        zustand_of(&get_json(&h, "/api/integrations").await),
+        "verbunden"
+    );
+    // Widerruf langsam machen, damit der Abbruch mitten in den Ablauf faellt.
+    mock.c.revoke_delay_ms.store(1500, Ordering::SeqCst);
+
+    let dropped = bearer_request_dropped_after(
+        &h,
+        "POST",
+        "/api/integrations/probe/oauth/abmelden",
+        std::time::Duration::from_millis(150),
+    )
+    .await;
+    assert!(dropped, "client future must have been dropped mid-flight");
+    assert!(
+        oauth_audit_rows(&h, "abmeldung").await.is_empty(),
+        "logout cannot be finished yet (revoke still pending)"
+    );
+
+    let done = poll_until(std::time::Duration::from_secs(10), || async {
+        zustand_of(&get_json(&h, "/api/integrations").await) == "anmeldung_noetig"
+            && !oauth_audit_rows(&h, "abmeldung").await.is_empty()
+    })
+    .await;
+    assert!(
+        done,
+        "logout must complete after client drop; zustand={} audit={:?}",
+        zustand_of(&get_json(&h, "/api/integrations").await),
+        oauth_audit_rows(&h, "abmeldung").await
+    );
+    assert_eq!(
+        oauth_audit_rows(&h, "abmeldung").await,
+        vec!["integration_oauth=probe ereignis=abmeldung ergebnis=ok".to_string()]
+    );
+    assert_eq!(mock.c.revoke.load(Ordering::SeqCst), 1);
+}
+
+/// Wie oben fuer `DELETE /api/integrations/{id}`: Entfernen laeuft zu Ende.
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_completes_even_if_client_disconnects() {
+    let mock = start_mock().await;
+    let h = harness_with_oauth_probe(&mock).await;
+    login(&h).await;
+    mock.c.revoke_delay_ms.store(1500, Ordering::SeqCst);
+
+    let dropped = bearer_request_dropped_after(
+        &h,
+        "DELETE",
+        "/api/integrations/probe",
+        std::time::Duration::from_millis(150),
+    )
+    .await;
+    assert!(dropped, "client future must have been dropped mid-flight");
+
+    let done = poll_until(std::time::Duration::from_secs(10), || async {
+        !probe_installed(&get_json(&h, "/api/integrations").await)
+            && !oauth_audit_rows(&h, "entfernen").await.is_empty()
+    })
+    .await;
+    assert!(
+        done,
+        "remove must complete after client drop; installed={} audit={:?}",
+        probe_installed(&get_json(&h, "/api/integrations").await),
+        oauth_audit_rows(&h, "entfernen").await
+    );
+    assert_eq!(mock.c.revoke.load(Ordering::SeqCst), 1);
 }
 
 /// Anbieter-Schluessel-Routen duerfen keinen `INTEGRATION_`-Namen ableiten
