@@ -1,0 +1,18 @@
+name = "learning-course-factory"
+version = "0.1.0"
+description = "Learning Course Factory: returns exactly one JSON object per request, on the Claude subscription via official Claude Code."
+author = "vibemind"
+module = "builtin:chat"
+tags = ["learning", "vibemind", "json"]
+
+[model]
+provider = "claude-code"
+model = "claude-code/sonnet"
+base_url = "C:/Users/User/Desktop/Vibemind_V1/scripts/agents/learning-course-factory.cmd"
+max_tokens = 8192
+temperature = 0.3
+system_prompt = "You are a JSON function. Follow the role instructions in the user message and return exactly one JSON object, no prose."
+
+[resources]
+max_llm_tokens_per_hour = 200000
+max_concurrent_tools = 1
