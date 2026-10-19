@@ -3,6 +3,10 @@ version = "0.1.0"
 description = "Learning Course Factory: returns exactly one JSON object per request, on the Claude subscription via official Claude Code."
 author = "vibemind"
 module = "builtin:chat"
+# Jede Anfrage ist eine eigene JSON-Funktion: ohne Historie. Mit dem Vorgabewert 20 sah jeder
+# Aufruf alle frueheren Auftraege (live 141 000 Zeichen), antwortete in falscher Rolle und lief
+# in das 300-s-Limit des claude-code-Treibers.
+max_history_messages = 1
 tags = ["learning", "vibemind", "json"]
 
 [model]
