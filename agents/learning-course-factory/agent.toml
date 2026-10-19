@@ -16,3 +16,7 @@ system_prompt = "You are a JSON function. Follow the role instructions in the us
 [resources]
 max_llm_tokens_per_hour = 200000
 max_concurrent_tools = 1
+
+[capabilities]
+# Reine JSON-Funktion: ohne Werkzeuge (sonst reicht OpenFang alle ~333 mit).
+tools = []
