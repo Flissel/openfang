@@ -60,6 +60,9 @@ default_agent = "brain-gateway"
 [default_model]
 provider = "claude-code"
 model = "claude-code/sonnet"
+# claude-code-Treiber: Vorgabe 300 s war zu knapp fuer den Quellenpruefer der Learning
+# Course Factory (~5 min). Obergrenze fuer alle claude-code-Agenten; Wrapper bleiben darunter.
+subprocess_timeout_secs = 600
 
 # ── Brain MCP Server ────────────────────────────────────────────
 # Gives agents access to cognitive state via SSE
