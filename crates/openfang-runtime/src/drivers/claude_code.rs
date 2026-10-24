@@ -156,6 +156,68 @@ impl ClaudeCodeDriver {
         parts.join("\n\n")
     }
 
+    /// Stdin for the CLI and its `--input-format`.
+    ///
+    /// Without images: the text prompt (`text`), unchanged. With images in a user
+    /// message: one stream-json user message carrying the text (without attachment
+    /// markers) and the images as base64 blocks (`stream-json`), so the model sees
+    /// them. The VibeMind subscription wrapper validates exactly this shape.
+    fn stdin_payload(request: &CompletionRequest) -> (String, &'static str) {
+        let images: Vec<(&str, &str)> = request
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .filter_map(|m| match &m.content {
+                MessageContent::Blocks(blocks) => Some(blocks),
+                MessageContent::Text(_) => None,
+            })
+            .flatten()
+            .filter_map(|b| match b {
+                ContentBlock::Image { media_type, data } => Some((media_type.as_str(), data.as_str())),
+                _ => None,
+            })
+            .collect();
+        if images.is_empty() {
+            return (Self::build_prompt(request), "text");
+        }
+        let text = request
+            .messages
+            .iter()
+            .filter_map(|msg| {
+                let role_label = match msg.role {
+                    Role::User => "User",
+                    Role::Assistant => "Assistant",
+                    Role::System => "System",
+                };
+                let rendered = match &msg.content {
+                    MessageContent::Text(s) => s.clone(),
+                    MessageContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text, .. } if !text.is_empty() => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                (!rendered.is_empty()).then(|| format!("[{role_label}]\n{rendered}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut content = vec![serde_json::json!({"type": "text", "text": text})];
+        content.extend(images.into_iter().map(|(media_type, data)| {
+            serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data},
+            })
+        }));
+        let message = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": content},
+        });
+        (message.to_string(), "stream-json")
+    }
+
     /// Render message content for the text-only CLI prompt.
     ///
     /// Text blocks pass through verbatim. Image blocks are rendered as
@@ -373,10 +435,19 @@ fn build_cli_args(
     system_prompt_file: Option<&std::path::Path>,
     skip_permissions: bool,
 ) -> Vec<String> {
+    build_cli_args_with_input(model, system_prompt_file, skip_permissions, "text")
+}
+
+fn build_cli_args_with_input(
+    model: Option<&str>,
+    system_prompt_file: Option<&std::path::Path>,
+    skip_permissions: bool,
+    input_format: &str,
+) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
         "--input-format".to_string(),
-        "text".to_string(),
+        input_format.to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
@@ -576,7 +647,7 @@ fn normalized_extended_path_for_cmd(path: &std::path::Path) -> Option<std::path:
 #[async_trait]
 impl LlmDriver for ClaudeCodeDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let prompt = Self::build_prompt(&request);
+        let (prompt, input_format) = Self::stdin_payload(&request);
         let model_flag = Self::model_flag(&request.model);
         let uses_cmd = cli_uses_windows_cmd(&self.cli_path);
         if uses_cmd {
@@ -608,10 +679,11 @@ impl LlmDriver for ClaudeCodeDriver {
         // text, which hid whether the model invoked any skills/tools. We still
         // return only the final text (behaviour preserved); the tool_use blocks
         // are logged for observability. --verbose is required by stream-json.
-        let cli_args = build_cli_args(
+        let cli_args = build_cli_args_with_input(
             model_flag.as_deref(),
             sys_prompt_tempfile.as_ref().map(SystemPromptFile::path),
             self.skip_permissions,
+            input_format,
         );
         if uses_cmd {
             validate_cmd_args(&cli_args).map_err(|_| {
@@ -1544,6 +1616,69 @@ mod tests {
         assert!(!prompt.contains("You are helpful."));
         assert!(prompt.contains("[User]"));
         assert!(prompt.contains("Hello"));
+    }
+
+    fn image_request() -> CompletionRequest {
+        use openfang_types::message::{ContentBlock, Message, MessageContent};
+        CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "grade this drawing".to_string(),
+                        provider_metadata: None,
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: "iVBORw0KGgo=".to_string(),
+                    },
+                ]),
+                ..Default::default()
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+        }
+    }
+
+    #[test]
+    fn test_text_request_keeps_the_text_stdin_path() {
+        let mut request = image_request();
+        request.messages[0].content = MessageContent::Text("plain".to_string());
+        let (payload, format) = ClaudeCodeDriver::stdin_payload(&request);
+        assert_eq!(format, "text");
+        assert_eq!(payload, ClaudeCodeDriver::build_prompt(&request));
+    }
+
+    #[test]
+    fn test_image_request_sends_one_stream_json_user_message() {
+        // The subscription wrapper validates exactly this shape and lets the CLI
+        // see the image; the text-only path rendered it as "not viewable".
+        let (payload, format) = ClaudeCodeDriver::stdin_payload(&image_request());
+        assert_eq!(format, "stream-json");
+        assert!(!payload.contains('\n'), "one line");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["type"], "user");
+        assert_eq!(value["message"]["role"], "user");
+        let content = value["message"]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"].as_str().unwrap().contains("grade this drawing"));
+        assert!(!content[0]["text"].as_str().unwrap().contains("[attachment"));
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn test_cli_args_carry_the_input_format() {
+        let args = build_cli_args_with_input(Some("sonnet"), None, false, "stream-json");
+        let at = args.iter().position(|a| a == "--input-format").unwrap();
+        assert_eq!(args[at + 1], "stream-json");
+        assert_eq!(build_cli_args(Some("sonnet"), None, false), build_cli_args_with_input(Some("sonnet"), None, false, "text"));
     }
 
     #[test]

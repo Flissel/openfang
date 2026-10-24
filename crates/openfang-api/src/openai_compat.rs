@@ -336,6 +336,18 @@ fn convert_messages(oai_messages: &[OaiMessage]) -> Vec<Message> {
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 /// POST /v1/chat/completions
+/// The content blocks of a message when it carries at least one image.
+fn image_content_blocks(content: &MessageContent) -> Option<Vec<ContentBlock>> {
+    match content {
+        MessageContent::Blocks(blocks)
+            if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) =>
+        {
+            Some(blocks.clone())
+        }
+        _ => None,
+    }
+}
+
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
@@ -359,12 +371,13 @@ pub async fn chat_completions(
 
     // Extract the last user message as the input
     let messages = convert_messages(&req.messages);
-    let last_user_msg = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == Role::User)
+    let last_user = messages.iter().rev().find(|m| m.role == Role::User);
+    let last_user_msg = last_user
         .map(|m| m.content.text_content())
         .unwrap_or_default();
+    // Images in the last user message travel as content blocks to the agent loop;
+    // without them the text-only path stays as before.
+    let image_blocks = last_user.and_then(|m| image_content_blocks(&m.content));
 
     if last_user_msg.is_empty() {
         return (
@@ -416,7 +429,14 @@ pub async fn chat_completions(
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
         .kernel
-        .send_message_with_handle(agent_id, &last_user_msg, Some(kernel_handle), None, None)
+        .send_message_with_handle_and_blocks(
+            agent_id,
+            &last_user_msg,
+            Some(kernel_handle),
+            image_blocks,
+            None,
+            None,
+        )
         .await
     {
         Ok(result) => {
@@ -880,6 +900,23 @@ mod tests {
             }
             _ => panic!("Expected Blocks"),
         }
+    }
+
+    #[test]
+    fn test_image_blocks_are_forwarded_only_when_an_image_is_present() {
+        // Learning grades drawings over the subscription; the text-only path
+        // used to drop the image before the agent loop.
+        let with_image = MessageContent::Blocks(vec![
+            ContentBlock::Text { text: "grade".to_string(), provider_metadata: None },
+            ContentBlock::Image { media_type: "image/png".to_string(), data: "iVBORw0KGgo=".to_string() },
+        ]);
+        let text_only = MessageContent::Blocks(vec![ContentBlock::Text {
+            text: "grade".to_string(),
+            provider_metadata: None,
+        }]);
+        assert_eq!(image_content_blocks(&with_image).map(|b| b.len()), Some(2));
+        assert!(image_content_blocks(&text_only).is_none());
+        assert!(image_content_blocks(&MessageContent::Text("grade".to_string())).is_none());
     }
 
     #[test]
