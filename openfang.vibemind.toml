@@ -232,13 +232,18 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/business/poc_pitch_deck/m
 # Web & Research MCP Servers (npm/npx)
 # ═══════════════════════════════════════════════════════════════════
 
+# Windows (09.11.2026): Rust sucht ohne Endung nur nach "<name>.exe". npx und npm-Werkzeuge
+# gibt es hier nur als .cmd - ohne Endung meldet OpenFang "verbindung fehlgeschlagen".
+# Deshalb ueberall "npx.cmd" bzw. "tavily-mcp.cmd" ausschreiben.
+
 # Tavily — web search, extraction, crawling
 [[mcp_servers]]
 name = "tavily"
 timeout_secs = 30
+env = ["TAVILY_API_KEY"]
 [mcp_servers.transport]
 type = "stdio"
-command = "tavily-mcp"
+command = "tavily-mcp.cmd"
 args = []
 # NOTE: Requires TAVILY_API_KEY env var
 
@@ -258,7 +263,7 @@ name = "context7"
 timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
-command = "npx"
+command = "npx.cmd"
 args = ["-y", "@upstash/context7-mcp@latest"]
 
 # Playwright — browser automation for SPAs, forms
@@ -267,7 +272,7 @@ name = "playwright"
 timeout_secs = 60
 [mcp_servers.transport]
 type = "stdio"
-command = "npx"
+command = "npx.cmd"
 args = ["-y", "@playwright/mcp@latest"]
 
 # ═══════════════════════════════════════════════════════════════════
@@ -280,7 +285,7 @@ name = "filesystem"
 timeout_secs = 10
 [mcp_servers.transport]
 type = "stdio"
-command = "npx"
+command = "npx.cmd"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "C:/Users/User/Desktop/Vibemind_V1"]
 
 # GitHub — PRs, issues, collaboration
@@ -341,7 +346,8 @@ timeout_secs = 15
 type = "stdio"
 command = "C:/Users/User/.local/bin/mcp-server-qdrant.exe"
 args = []
-env = { QDRANT_URL = "http://localhost:6340" }
+# 09.11.2026: 6340 lauscht nicht mehr; 6730 = Brain-Qdrant (wie beim Server knowledge).
+env = { QDRANT_URL = "http://localhost:6730" }
 
 # ═══════════════════════════════════════════════════════════════════
 # Memory & Productivity MCP Servers (npm)
@@ -353,7 +359,7 @@ name = "memory"
 timeout_secs = 15
 [mcp_servers.transport]
 type = "stdio"
-command = "npx"
+command = "npx.cmd"
 args = ["-y", "@modelcontextprotocol/server-memory"]
 
 # Redis — event bus monitoring, locks, cache
@@ -362,7 +368,7 @@ name = "redis"
 timeout_secs = 10
 [mcp_servers.transport]
 type = "stdio"
-command = "npx"
+command = "npx.cmd"
 args = ["-y", "@modelcontextprotocol/server-redis", "redis://localhost:6379"]
 
 # Postgres — SQL queries, schema inspection
@@ -381,7 +387,7 @@ name = "taskmanager"
 timeout_secs = 10
 [mcp_servers.transport]
 type = "stdio"
-command = "npx"
+command = "npx.cmd"
 args = ["-y", "@kazuph/mcp-taskmanager"]
 
 # ═══════════════════════════════════════════════════════════════════
@@ -501,15 +507,15 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_server_rowboat_ui.py"]
 # (mcp.rs env_clear) und der Daemon laedt die Root-.env bewusst nicht; deshalb
 # holt scripts/mcp_mit_env.py nur die genannten Schluessel aus der .env.
 # knowledge_write schreibt nur, wenn jeder Beleg an der Quelle bestaetigt ist.
-# Der Wissens-Server laeuft aus dem Laufzeit-Checkout C:/Users/User/ClaudeWork/vos-runtime
-# (vibemind-os, detached; nachziehen mit git checkout --detach <master-sha>).
+# Der Wissens-Server laeuft aus dem PC-Betriebscheckout Vibemind_V1/vibemind-os (detached auf
+# origin/master). Der fruehere Laufzeit-Checkout ClaudeWork/vos-runtime ist seit 25.10.2026 weg.
 [[mcp_servers]]
 name = "knowledge"
 timeout_secs = 60
 [mcp_servers.transport]
 type = "stdio"
 command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "SUPABASE_ANON_KEY", "--env", "OPENFANG_API_KEY", "--set", "SUPABASE_URL=http://localhost:54321", "--set", "QDRANT_URL=http://localhost:6730", "--set", "OPENFANG_URL=http://127.0.0.1:4200", "--set", "KNOWLEDGE_DIR=C:/Users/User/.rowboat/knowledge", "--", "C:/Users/User/ClaudeWork/vos-runtime/spaces/rowboat/knowledge_mcp_server.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "SUPABASE_ANON_KEY", "--env", "OPENFANG_API_KEY", "--set", "SUPABASE_URL=http://localhost:54321", "--set", "QDRANT_URL=http://localhost:6730", "--set", "OPENFANG_URL=http://127.0.0.1:4200", "--set", "KNOWLEDGE_DIR=C:/Users/User/.rowboat/knowledge", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/rowboat/knowledge_mcp_server.py"]
 
 [[mcp_servers]]
 name = "openfang-agents"
@@ -567,7 +573,7 @@ timeout_secs = 120
 env = ["N8N_API_URL", "N8N_API_KEY", "MCP_MODE", "LOG_LEVEL"]
 [mcp_servers.transport]
 type = "stdio"
-command = "npx"
+command = "npx.cmd"
 args = ["-y", "n8n-mcp"]
 
 # ═══════════════════════════════════════════════════════════════════
