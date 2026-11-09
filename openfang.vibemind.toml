@@ -55,7 +55,9 @@ allowed_users = ["1092040975"]
 # Note: ~/.openfang/config.toml already had default_agent = "brain-gateway"
 # but this file (--config openfang.vibemind.toml) takes precedence and
 # was still overriding it back to "desktop". Both now agree.
-default_agent = "brain-gateway"
+# 24.10.2026 (cc-brain-devops-neu, User-OK): Telegram an brain-devops statt brain-gateway - brain-gateway
+# braucht brain-core (:5000), das bis zur groesseren Docker-VM aus ist. Rueckweg: wieder "brain-gateway".
+default_agent = "brain-devops"
 
 [default_model]
 provider = "claude-code"
