@@ -74,3 +74,7 @@ agents-phi3/
 
 # Personal deploy scripts
 scripts/deploy-remote.sh
+
+# Python-Bytecode (09.11.2026: getrackte .pyc machten den Betriebscheckout bei jedem MCP-Start dirty)
+__pycache__/
+*.pyc
