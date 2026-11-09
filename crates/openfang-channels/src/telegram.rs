@@ -31,6 +31,12 @@ const STARTUP_API_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default Telegram Bot API base URL.
 const DEFAULT_API_URL: &str = "https://api.telegram.org";
 
+/// reqwest-Fehler tragen die Anfrage-URL, und die enthaelt hier `/bot<TOKEN>/`.
+/// Jeder Fehler, der geloggt oder weitergereicht wird, verliert deshalb vorher die URL.
+fn ohne_token(e: reqwest::Error) -> reqwest::Error {
+    e.without_url()
+}
+
 #[derive(Serialize)]
 struct TelegramBotCommand<'a> {
     command: &'a str,
@@ -120,7 +126,15 @@ impl TelegramAdapter {
     /// Validate the bot token by calling `getMe`.
     pub async fn validate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/bot{}/getMe", self.api_base_url, self.token.as_str());
-        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let resp: serde_json::Value = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(ohne_token)?
+            .json()
+            .await
+            .map_err(ohne_token)?;
 
         if resp["ok"].as_bool() != Some(true) {
             let desc = resp["description"].as_str().unwrap_or("unknown error");
@@ -160,9 +174,11 @@ impl TelegramAdapter {
             .timeout(STARTUP_API_TIMEOUT)
             .json(&serde_json::json!({ "commands": commands }))
             .send()
-            .await?
+            .await
+            .map_err(ohne_token)?
             .json()
-            .await?;
+            .await
+            .map_err(ohne_token)?;
 
         if resp["ok"].as_bool() != Some(true) {
             let desc = resp["description"].as_str().unwrap_or("unknown error");
@@ -217,7 +233,13 @@ impl TelegramAdapter {
                 body["message_thread_id"] = serde_json::json!(tid);
             }
 
-            let resp = self.client.post(&url).json(&body).send().await?;
+            let resp = self
+                .client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(ohne_token)?;
             let status = resp.status();
             if !status.is_success() {
                 let body_text = resp.text().await.unwrap_or_default();
@@ -255,7 +277,13 @@ impl TelegramAdapter {
         if let Some(tid) = thread_id {
             body["message_thread_id"] = serde_json::json!(tid);
         }
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ohne_token)?;
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -286,7 +314,13 @@ impl TelegramAdapter {
         if let Some(tid) = thread_id {
             body["message_thread_id"] = serde_json::json!(tid);
         }
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ohne_token)?;
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -326,7 +360,13 @@ impl TelegramAdapter {
             form = form.text("message_thread_id", tid.to_string());
         }
 
-        let resp = self.client.post(&url).multipart(form).send().await?;
+        let resp = self
+            .client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(ohne_token)?;
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -353,7 +393,13 @@ impl TelegramAdapter {
         if let Some(tid) = thread_id {
             body["message_thread_id"] = serde_json::json!(tid);
         }
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ohne_token)?;
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -384,7 +430,13 @@ impl TelegramAdapter {
         if let Some(tid) = thread_id {
             body["message_thread_id"] = serde_json::json!(tid);
         }
-        let resp = self.client.post(&url).json(&body).send().await?;
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ohne_token)?;
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -414,7 +466,13 @@ impl TelegramAdapter {
         if let Some(tid) = thread_id {
             body["message_thread_id"] = serde_json::json!(tid);
         }
-        let _ = self.client.post(&url).json(&body).send().await?;
+        let _ = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ohne_token)?;
         Ok(())
     }
 
@@ -458,7 +516,13 @@ impl TelegramAdapter {
         let rejected_cache = self.rejected_reactions.clone();
         let emoji = emoji.to_string();
         tokio::spawn(async move {
-            match client.post(&url).json(&body).send().await {
+            match client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(ohne_token)
+            {
                 Ok(resp) if !resp.status().is_success() => {
                     let body_text = resp.text().await.unwrap_or_default();
                     debug!("Telegram setMessageReaction failed: {body_text}");
@@ -594,6 +658,7 @@ impl ChannelAdapter for TelegramAdapter {
                 .timeout(STARTUP_API_TIMEOUT)
                 .send()
                 .await
+                .map_err(ohne_token)
             {
                 Ok(_) => info!("Telegram: cleared webhook, polling mode active"),
                 Err(e) => tracing::warn!("Telegram: deleteWebhook failed (non-fatal): {e}"),
@@ -649,6 +714,7 @@ impl ChannelAdapter for TelegramAdapter {
                             .timeout(request_timeout)
                             .send()
                             .await
+                            .map_err(ohne_token)
                     } => res,
                     _ = shutdown.changed() => {
                         break;
@@ -695,7 +761,7 @@ impl ChannelAdapter for TelegramAdapter {
                 }
 
                 // Parse response
-                let body: serde_json::Value = match resp.json().await {
+                let body: serde_json::Value = match resp.json().await.map_err(ohne_token) {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("Telegram getUpdates parse error: {e}");
@@ -1211,6 +1277,49 @@ mod tests {
 
     fn test_client() -> reqwest::Client {
         reqwest::Client::new()
+    }
+
+    // 09.11.2026: Netzfehler von reqwest tragen die Anfrage-URL im Text - und die
+    // enthaelt /bot<TOKEN>/. Im OpenFang-Log stand so der echte Bot-Token.
+    const KANARIE: &str = "123456:KANARIE_GEHEIM_abcdef";
+
+    fn adapter_gegen_toten_port() -> TelegramAdapter {
+        TelegramAdapter::new(
+            KANARIE.to_string(),
+            vec![],
+            Duration::from_secs(1),
+            Some("http://127.0.0.1:1".to_string()),
+        )
+    }
+
+    #[tokio::test]
+    async fn netzfehler_bei_get_me_enthaelt_keinen_token() {
+        let fehler = adapter_gegen_toten_port()
+            .validate_token()
+            .await
+            .unwrap_err();
+        let text = format!("{fehler} {fehler:?}");
+        assert!(!text.contains("KANARIE"), "Token im Fehlertext: {text}");
+    }
+
+    #[tokio::test]
+    async fn netzfehler_beim_senden_enthaelt_keinen_token() {
+        let fehler = adapter_gegen_toten_port()
+            .api_send_message(1, "hallo", None)
+            .await
+            .unwrap_err();
+        let text = format!("{fehler} {fehler:?}");
+        assert!(!text.contains("KANARIE"), "Token im Fehlertext: {text}");
+    }
+
+    #[tokio::test]
+    async fn netzfehler_bei_bot_kommandos_enthaelt_keinen_token() {
+        let fehler = adapter_gegen_toten_port()
+            .register_bot_commands()
+            .await
+            .unwrap_err();
+        let text = format!("{fehler} {fehler:?}");
+        assert!(!text.contains("KANARIE"), "Token im Fehlertext: {text}");
     }
 
     #[tokio::test]

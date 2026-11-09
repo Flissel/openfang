@@ -3029,7 +3029,7 @@ async fn send_channel_test_message(channel_name: &str, target_id: &str) -> Resul
                 .json(&serde_json::json!({ "chat_id": target_id, "text": test_msg }))
                 .send()
                 .await
-                .map_err(|e| format!("HTTP request failed: {e}"))?;
+                .map_err(|e| format!("HTTP request failed: {}", e.without_url()))?;
             if !resp.status().is_success() {
                 let body = resp.text().await.unwrap_or_default();
                 return Err(format!("Telegram API error: {body}"));
