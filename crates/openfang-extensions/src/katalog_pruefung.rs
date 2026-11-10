@@ -101,9 +101,14 @@ pub fn einordnen(
         None => e(Ergebnis::Unklar, "nicht_geprueft"),
         Some(Antwort::Umleitung) => e(Ergebnis::NichtErreichbar, "umleitung"),
         Some(Antwort::Netz) => e(Ergebnis::NichtErreichbar, "netz"),
-        Some(Antwort::Status(s)) if (200..300).contains(&s) => {
-            e(Ergebnis::EinrichtbarOhneAnmeldung, "offen")
-        }
+        // Wird eine Anmeldung erwartet, sagt ein 2xx auf `initialize` nichts
+        // ueber die Werkzeuge: unklar statt "ohne Anmeldung".
+        Some(Antwort::Status(s)) if (200..300).contains(&s) => match anmeldung {
+            Anmeldung::Unbekannt => e(Ergebnis::EinrichtbarOhneAnmeldung, "offen"),
+            Anmeldung::Oauth | Anmeldung::Schluessel => {
+                e(Ergebnis::Unklar, "antwortet_ohne_anmeldung")
+            }
+        },
         Some(Antwort::Status(s)) if s == 401 || s == 403 => match anmeldung {
             Anmeldung::Schluessel => e(Ergebnis::EinrichtbarSchluessel, "schluessel"),
             Anmeldung::Unbekannt => e(Ergebnis::Unklar, "anmeldeart_unbekannt"),
@@ -171,9 +176,17 @@ mod tests {
     #[test]
     fn status_tabelle() {
         let f = |a, s| einordnen(U, a, Some(Err(FEHL.into())), Some(Antwort::Status(s)));
-        assert_eq!(
-            f(Anmeldung::Oauth, 200).ergebnis,
-            Ergebnis::EinrichtbarOhneAnmeldung
+        // R4: 2xx trotz erwarteter Anmeldung ist unklar (Werkzeuge brauchen sie evtl. doch)
+        ist(f(Anmeldung::Oauth, 200), Ergebnis::Unklar, "antwortet_ohne_anmeldung");
+        ist(
+            f(Anmeldung::Schluessel, 200),
+            Ergebnis::Unklar,
+            "antwortet_ohne_anmeldung",
+        );
+        ist(
+            f(Anmeldung::Unbekannt, 200),
+            Ergebnis::EinrichtbarOhneAnmeldung,
+            "offen",
         );
         for s in [401, 403] {
             ist(
