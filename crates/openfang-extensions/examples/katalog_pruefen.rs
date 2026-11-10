@@ -133,7 +133,10 @@ async fn messen(
         ),
         Err(err) => {
             let antwort = match mcp_oauth::probe_initialize_status(http, policy, url).await {
-                Ok(s) => Antwort::Status(s),
+                Ok(p) if (200..300).contains(&p.status) && !p.mcp_content_type => {
+                    Antwort::KeinMcpTyp
+                }
+                Ok(p) => Antwort::Status(p.status),
                 Err(OAuthError::Discovery("weiterleitung")) => Antwort::Umleitung,
                 Err(_) => Antwort::Netz,
             };

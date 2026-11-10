@@ -663,14 +663,31 @@ fn initialize_probe_body() -> serde_json::Value {
     })
 }
 
+/// Result of [`probe_initialize_status`]: the HTTP status and whether the
+/// response declared an MCP content type (`application/json` or
+/// `text/event-stream`). Only the header is inspected, never the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeStatus {
+    pub status: u16,
+    pub mcp_content_type: bool,
+}
+
+/// True for `application/json` and `text/event-stream` (parameters such as
+/// `; charset=utf-8` and letter case are ignored).
+pub fn is_mcp_content_type(value: &str) -> bool {
+    let media = value.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    media == "application/json" || media == "text/event-stream"
+}
+
 /// Send the same unauthenticated `initialize` as [`discover`] and return only
-/// the HTTP status. Redirects fail with `Discovery("weiterleitung")`. Never
-/// reads or returns the response body (used by the catalog check program).
+/// the HTTP status and the MCP-content-type flag. Redirects fail with
+/// `Discovery("weiterleitung")`. Never reads or returns the response body
+/// (used by the catalog check program).
 pub async fn probe_initialize_status(
     http: &OAuthHttp,
     policy: &UrlPolicy,
     resource_url: &str,
-) -> Result<u16, OAuthError> {
+) -> Result<ProbeStatus, OAuthError> {
     let resource = policy.check(resource_url)?;
     let resp = http
         .0
@@ -685,7 +702,15 @@ pub async fn probe_initialize_status(
         .await
         .map_err(|e| network_error(&e))?;
     ensure_direct(&resp, &resource, OAuthError::Discovery("weiterleitung"))?;
-    Ok(resp.status().as_u16())
+    let mcp_content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_mcp_content_type);
+    Ok(ProbeStatus {
+        status: resp.status().as_u16(),
+        mcp_content_type,
+    })
 }
 
 /// Discover the authorization server of an MCP resource and validate its
@@ -2283,5 +2308,20 @@ mod tests {
         assert!(r.needs_refresh(now));
         r.expires_at = Some(now + chrono::Duration::seconds(600));
         assert!(!r.needs_refresh(now));
+    }
+
+    #[test]
+    fn mcp_content_type_erkennung() {
+        for ok in [
+            "application/json",
+            "Application/JSON; charset=utf-8",
+            "text/event-stream",
+            " text/event-stream ;x=y",
+        ] {
+            assert!(is_mcp_content_type(ok), "{ok}");
+        }
+        for nein in ["text/html", "text/html; charset=utf-8", "", "application/xml"] {
+            assert!(!is_mcp_content_type(nein), "{nein}");
+        }
     }
 }

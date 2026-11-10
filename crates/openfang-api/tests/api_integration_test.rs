@@ -491,6 +491,10 @@ async fn start_test_server_with_provider(
         .route("/api/health", axum::routing::get(routes::health))
         .route("/api/status", axum::routing::get(routes::status))
         .route(
+            "/api/integrations/available",
+            axum::routing::get(routes::list_available_integrations),
+        )
+        .route(
             "/v1/embeddings",
             axum::routing::post(openfang_api::openai_compat::embeddings),
         )
@@ -652,6 +656,28 @@ memory_write = ["self.*"]
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_integrations_available_entries_carry_boolean_verified() {
+    let server = start_test_server().await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/integrations/available", server.base_url))
+        .send()
+        .await
+        .expect("the local test server should respond");
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("response is JSON");
+    let entries = body["integrations"].as_array().expect("integrations array");
+    assert!(!entries.is_empty(), "no templates listed");
+    for entry in entries {
+        assert!(
+            entry["verified"].is_boolean(),
+            "entry {} lacks boolean verified",
+            entry["id"]
+        );
+    }
+}
 
 #[tokio::test]
 async fn test_embeddings_rejects_unconfigured_non_openai_provider() {

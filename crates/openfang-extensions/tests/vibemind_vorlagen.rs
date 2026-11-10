@@ -14,9 +14,16 @@ fn alle_vibemind_vorlagen_laden() {
         return;
     }
     let mut reg = IntegrationRegistry::new(&std::env::temp_dir().join("vibemind-vorlagen-test"));
-    let report = reg.load_template_dirs(&[dir]);
+    let report = reg.load_template_dirs(&[dir.clone()]);
     assert!(report.skipped.is_empty(), "Vorlagen mit Fehlern: {:?}", report.skipped);
     assert_eq!(report.unreadable_dirs, 0);
+    let dateien = std::fs::read_dir(&dir)
+        .expect("Vorlagenordner lesbar")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
+        .count();
+    assert!(dateien > 0, "keine *.toml im Ordner {}", dir.display());
+    assert_eq!(report.loaded, dateien, "nicht alle Vorlagen geladen");
     for t in reg.list_templates() {
         if let Some(c) = &t.catalog {
             assert!(

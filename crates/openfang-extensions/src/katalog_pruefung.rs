@@ -28,7 +28,10 @@ impl Anmeldung {
 /// Antwort des unauthentifizierten `initialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Antwort {
+    /// Antwort ohne Sonderfall (2xx nur mit MCP-Inhaltstyp, sonst jeder Status).
     Status(u16),
+    /// 2xx ohne `application/json`/`text/event-stream` (z. B. HTML-Auffangseite).
+    KeinMcpTyp,
     Umleitung,
     Netz,
 }
@@ -101,6 +104,8 @@ pub fn einordnen(
         None => e(Ergebnis::Unklar, "nicht_geprueft"),
         Some(Antwort::Umleitung) => e(Ergebnis::NichtErreichbar, "umleitung"),
         Some(Antwort::Netz) => e(Ergebnis::NichtErreichbar, "netz"),
+        // Ein 2xx ohne MCP-Inhaltstyp ist keine MCP-Antwort (HTML-Auffangseite).
+        Some(Antwort::KeinMcpTyp) => e(Ergebnis::Unklar, "keine_mcp_antwort"),
         // Wird eine Anmeldung erwartet, sagt ein 2xx auf `initialize` nichts
         // ueber die Werkzeuge: unklar statt "ohne Anmeldung".
         Some(Antwort::Status(s)) if (200..300).contains(&s) => match anmeldung {
@@ -201,6 +206,11 @@ mod tests {
             );
             // R2: OAuth angegeben, Ermittlung gescheitert -> unklar mit Ermittlungsklasse
             ist(f(Anmeldung::Oauth, s), Ergebnis::Unklar, FEHL);
+        }
+        // F8: 2xx ohne MCP-Inhaltstyp zaehlt nie als einrichtbar
+        for a in [Anmeldung::Oauth, Anmeldung::Schluessel, Anmeldung::Unbekannt] {
+            let x = einordnen(U, a, Some(Err(FEHL.into())), Some(Antwort::KeinMcpTyp));
+            ist(x, Ergebnis::Unklar, "keine_mcp_antwort");
         }
         ist(f(Anmeldung::Oauth, 404), Ergebnis::NichtErreichbar, "status_404");
         ist(f(Anmeldung::Oauth, 500), Ergebnis::Unklar, "status_500");
