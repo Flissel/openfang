@@ -407,6 +407,9 @@ pub struct OAuthRecord {
     /// AS advertised `authorization_response_iss_parameter_supported` (RFC 9207).
     #[serde(default)]
     pub iss_supported: bool,
+    /// `scopes_supported` of the AS metadata (informational; not requested).
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
 }
 
 /// Validate the `iss` parameter of the authorization response (RFC 9207).
@@ -495,6 +498,7 @@ impl OAuthRecord {
             expires_at: None,
             scopes: Vec::new(),
             iss_supported: false,
+            scopes_supported: Vec::new(),
         }
     }
 }
@@ -642,6 +646,46 @@ struct AuthServerMetadata {
     code_challenge_methods_supported: Vec<String>,
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+}
+
+fn initialize_probe_body() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "OpenFang", "version": env!("CARGO_PKG_VERSION")}
+        }
+    })
+}
+
+/// Send the same unauthenticated `initialize` as [`discover`] and return only
+/// the HTTP status. Redirects fail with `Discovery("weiterleitung")`. Never
+/// reads or returns the response body (used by the catalog check program).
+pub async fn probe_initialize_status(
+    http: &OAuthHttp,
+    policy: &UrlPolicy,
+    resource_url: &str,
+) -> Result<u16, OAuthError> {
+    let resource = policy.check(resource_url)?;
+    let resp = http
+        .0
+        .post(resource.clone())
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .json(&initialize_probe_body())
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| network_error(&e))?;
+    ensure_direct(&resp, &resource, OAuthError::Discovery("weiterleitung"))?;
+    Ok(resp.status().as_u16())
 }
 
 /// Discover the authorization server of an MCP resource and validate its
@@ -654,16 +698,7 @@ pub async fn discover(
     let resource = policy.check(resource_url)?;
 
     // 1. Unauthenticated initialize; a 401 names the metadata document.
-    let probe = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "OpenFang", "version": env!("CARGO_PKG_VERSION")}
-        }
-    });
+    let probe = initialize_probe_body();
     let resp = http
         .0
         .post(resource.clone())
@@ -816,6 +851,7 @@ pub async fn discover(
         expires_at: None,
         scopes: Vec::new(),
         iss_supported: meta.authorization_response_iss_parameter_supported,
+        scopes_supported: meta.scopes_supported,
     })
 }
 
@@ -1489,6 +1525,26 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e, OAuthError::Discovery("kein s256"));
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn discover_liest_scopes_supported() {
+        let b = mock_meta(good_prm, |b| {
+            let mut m = good_meta(b, b);
+            m["scopes_supported"] = serde_json::json!(["offline_access", "read"]);
+            m
+        })
+        .await;
+        let rec = discover(
+            &http(),
+            &UrlPolicy::allow_loopback_http(),
+            &format!("{b}/mcp"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rec.scopes_supported, vec!["offline_access", "read"]);
+        assert!(rec.scopes.is_empty(), "angeforderte Scopes bleiben leer");
     }
 
     #[cfg(feature = "test-insecure-oauth")]
