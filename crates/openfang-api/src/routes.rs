@@ -9526,6 +9526,7 @@ pub async fn list_integrations(State(state): State<Arc<AppState>>) -> impl IntoR
             "name": info.template.name,
             "icon": info.template.icon,
             "category": info.template.category.to_string(),
+            "verified": info.template.is_verified(),
             "status": status,
             "zustand": zustand,
             "detail": detail,
@@ -9562,6 +9563,7 @@ pub async fn list_available_integrations(State(state): State<Arc<AppState>>) -> 
                 "description": t.description,
                 "icon": t.icon,
                 "category": t.category.to_string(),
+                "verified": t.is_verified(),
                 "installed": installed,
                 "tags": t.tags,
                 "required_env": t.required_env.iter().map(|e| serde_json::json!({

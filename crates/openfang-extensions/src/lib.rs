@@ -66,6 +66,10 @@ pub enum IntegrationCategory {
     Data,
     Cloud,
     AI,
+    Sales,
+    Marketing,
+    Finance,
+    Design,
 }
 
 impl std::fmt::Display for IntegrationCategory {
@@ -77,6 +81,10 @@ impl std::fmt::Display for IntegrationCategory {
             Self::Data => write!(f, "Data"),
             Self::Cloud => write!(f, "Cloud"),
             Self::AI => write!(f, "AI & Search"),
+            Self::Sales => write!(f, "Sales"),
+            Self::Marketing => write!(f, "Marketing"),
+            Self::Finance => write!(f, "Finance"),
+            Self::Design => write!(f, "Design & Media"),
         }
     }
 }
@@ -161,7 +169,7 @@ pub enum Admission {
 }
 
 /// Katalog-Metadaten einer Vorlage.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogMeta {
     #[serde(default)]
     pub replaces_openai_plugin: Option<String>,
@@ -169,6 +177,25 @@ pub struct CatalogMeta {
     pub license: Option<String>,
     #[serde(default)]
     pub admission: Admission,
+    /// `false` = vom Hersteller uebernommen, noch nicht von uns geprueft ("ungeprueft").
+    /// Fehlt das Feld, gilt die Vorlage als geprueft.
+    #[serde(default = "default_verified")]
+    pub verified: bool,
+}
+
+fn default_verified() -> bool {
+    true
+}
+
+impl Default for CatalogMeta {
+    fn default() -> Self {
+        Self {
+            replaces_openai_plugin: None,
+            license: None,
+            admission: Admission::default(),
+            verified: true,
+        }
+    }
 }
 
 /// Praefix aller vom Kernel verwalteten Tresor-Referenzen; nie ueber /api/credentials/* ausstellbar.
@@ -255,6 +282,11 @@ pub struct IntegrationTemplate {
 impl IntegrationTemplate {
     pub fn is_admitted(&self) -> bool {
         self.catalog.as_ref().map(|c| c.admission == Admission::Admitted).unwrap_or(true)
+    }
+
+    /// Geprueft? Fehlt `[catalog]` oder `verified`, gilt die Vorlage als geprueft.
+    pub fn is_verified(&self) -> bool {
+        self.catalog.as_ref().map(|c| c.verified).unwrap_or(true)
     }
 }
 
@@ -388,6 +420,60 @@ mod tests {
         assert_eq!(IntegrationStatus::TemplateInvalid.zustand(), "nicht_zugelassen");
         assert_eq!(IntegrationStatus::TemplateInvalid.detail().as_deref(), Some("vorlage ungueltig"));
     }
+    fn vorlage_toml(category: &str, catalog: &str) -> String {
+        format!(
+            "id = \"t\"
+name = \"T\"
+description = \"d\"
+category = \"{category}\"
+icon = \"T\"
+
+[transport]
+type = \"sse\"
+url = \"https://example.com/mcp\"
+{catalog}"
+        )
+    }
+
+    #[test]
+    fn vorlage_ohne_verified_gilt_als_geprueft() {
+        let mit = vorlage_toml("devtools", "
+[catalog]
+admission = \"admitted\"
+");
+        let t: IntegrationTemplate = toml::from_str(&mit).unwrap();
+        assert!(t.is_verified());
+        let ohne = vorlage_toml("devtools", "");
+        let t: IntegrationTemplate = toml::from_str(&ohne).unwrap();
+        assert!(t.catalog.is_none());
+        assert!(t.is_verified());
+    }
+
+    #[test]
+    fn vorlage_mit_verified_false_ist_ungeprueft() {
+        let toml_str = vorlage_toml("devtools", "
+[catalog]
+verified = false
+");
+        let t: IntegrationTemplate = toml::from_str(&toml_str).unwrap();
+        assert!(!t.is_verified());
+        assert!(t.is_admitted());
+    }
+
+    #[test]
+    fn neue_kategorien_parsen_und_anzeigen() {
+        for (key, cat, anzeige) in [
+            ("sales", IntegrationCategory::Sales, "Sales"),
+            ("marketing", IntegrationCategory::Marketing, "Marketing"),
+            ("finance", IntegrationCategory::Finance, "Finance"),
+            ("design", IntegrationCategory::Design, "Design & Media"),
+        ] {
+            let t: IntegrationTemplate = toml::from_str(&vorlage_toml(key, "")).unwrap();
+            assert_eq!(t.category, cat);
+            assert_eq!(t.category.to_string(), anzeige);
+        }
+    }
+
     #[test]
     fn category_display() {
         assert_eq!(IntegrationCategory::DevTools.to_string(), "Dev Tools");
