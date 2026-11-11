@@ -890,7 +890,7 @@ struct RegistrationResponse {
 
 /// RFC-7591-Anfrage fuer einen oeffentlichen Client. Der Name enthaelt nur
 /// Buchstaben, Ziffern, Leerzeichen und Bindestriche (Calendly lehnt mehr ab).
-fn registrierungs_body(redirect_uri: &str, scopes: &[String]) -> serde_json::Value {
+pub fn registrierungs_body(redirect_uri: &str, scopes: &[String]) -> serde_json::Value {
     let mut body = serde_json::json!({
         "client_name": "OpenFang VibeMind",
         "redirect_uris": [redirect_uri],
