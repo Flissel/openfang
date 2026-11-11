@@ -24,29 +24,58 @@ struct Vorlage {
 
 fn vorlagen(ordner: &str, nur: &[String]) -> Vec<Vorlage> {
     let mut aus = Vec::new();
-    let Ok(rd) = std::fs::read_dir(ordner) else { return aus };
-    let mut pfade: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "toml")).collect();
+    let Ok(rd) = std::fs::read_dir(ordner) else {
+        return aus;
+    };
+    let mut pfade: Vec<_> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
     pfade.sort();
     for p in pfade {
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
         let Ok(tab) = toml::from_str::<toml::Table>(&text) else {
             eprintln!("nicht lesbar: {}", p.display());
             continue;
         };
         let v = toml::Value::Table(tab);
-        let verified = v.get("catalog").and_then(|c| c.get("verified")).and_then(toml::Value::as_bool).unwrap_or(true);
-        let oauth = v.get("auth").and_then(|a| a.get("type")).and_then(toml::Value::as_str) == Some("oauth");
-        let id = v.get("id").and_then(toml::Value::as_str).unwrap_or("").to_string();
+        let verified = v
+            .get("catalog")
+            .and_then(|c| c.get("verified"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true);
+        let oauth = v
+            .get("auth")
+            .and_then(|a| a.get("type"))
+            .and_then(toml::Value::as_str)
+            == Some("oauth");
+        let id = v
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .to_string();
         // Mit expliziten ids auch gepruefte Vorlagen (zum Eichen an Vercel).
         if !oauth || (nur.is_empty() && verified) || (!nur.is_empty() && !nur.contains(&id)) {
             continue;
         }
-        let url = v.get("transport").and_then(|t| t.get("url")).and_then(toml::Value::as_str).unwrap_or("").to_string();
+        let url = v
+            .get("transport")
+            .and_then(|t| t.get("url"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let scopes = v
             .get("auth")
             .and_then(|a| a.get("scopes"))
             .and_then(toml::Value::as_array)
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
         aus.push(Vorlage { id, url, scopes });
     }
@@ -56,22 +85,45 @@ fn vorlagen(ordner: &str, nur: &[String]) -> Vec<Vorlage> {
 /// Nur OAuth-Fehlercode, Feldnamen und Stichworte aus einer Fehlerantwort.
 fn fehler_klassen(body: &str) -> Value {
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-    let code = v.get("error").and_then(Value::as_str).filter(|s| s.len() <= 40 && s.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+    let code = v
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|s| s.len() <= 40 && s.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
     let felder: Vec<String> = v
         .get("errors")
         .and_then(Value::as_object)
         .map(|o| o.keys().filter(|k| k.len() <= 40).cloned().collect())
         .unwrap_or_default();
     let klein = body.to_ascii_lowercase();
-    let stichworte: Vec<&str> = ["https", "redirect_uri", "localhost", "127.0.0.1", "loopback", "client_name", "scope", "not allowed", "disabled", "whitelist", "allowlist"]
-        .into_iter()
-        .filter(|w| klein.contains(w))
-        .collect();
+    let stichworte: Vec<&str> = [
+        "https",
+        "redirect_uri",
+        "localhost",
+        "127.0.0.1",
+        "loopback",
+        "client_name",
+        "scope",
+        "not allowed",
+        "disabled",
+        "whitelist",
+        "allowlist",
+    ]
+    .into_iter()
+    .filter(|w| klein.contains(w))
+    .collect();
     json!({ "code": code, "felder": felder, "stichworte": stichworte })
 }
 
-async fn pruefen(http: &mcp_oauth::OAuthHttp, roh: &reqwest::Client, policy: &UrlPolicy, v: &Vorlage) -> Value {
-    let redirect = format!("http://{API_LISTEN}/api/integrations/{}/oauth/callback", v.id);
+async fn pruefen(
+    http: &mcp_oauth::OAuthHttp,
+    roh: &reqwest::Client,
+    policy: &UrlPolicy,
+    v: &Vorlage,
+) -> Value {
+    let redirect = format!(
+        "http://{API_LISTEN}/api/integrations/{}/oauth/callback",
+        v.id
+    );
     let mut rec = match mcp_oauth::discover(http, policy, &v.url).await {
         Ok(r) => r,
         Err(e) => return json!({ "stufe": "ermittlung", "klasse": e.class() }),
@@ -108,14 +160,25 @@ async fn pruefen(http: &mcp_oauth::OAuthHttp, roh: &reqwest::Client, policy: &Ur
         Err(_) => return json!({ "stufe": "anmeldeseite", "klasse": "netz" }),
     };
     let status = r.status().as_u16();
-    let ziel = r.headers().get("location").and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
+    let ziel = r
+        .headers()
+        .get("location")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     if (300..400).contains(&status) {
         let zu_uns = ziel.starts_with(&redirect);
         let fehler = url::Url::parse(&ziel)
             .ok()
-            .and_then(|u| u.query_pairs().find(|(k, _)| k == "error").map(|(_, v)| v.to_string()))
+            .and_then(|u| {
+                u.query_pairs()
+                    .find(|(k, _)| k == "error")
+                    .map(|(_, v)| v.to_string())
+            })
             .filter(|s| s.len() <= 40 && s.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
-        let host = url::Url::parse(&ziel).ok().and_then(|u| u.host_str().map(str::to_string));
+        let host = url::Url::parse(&ziel)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string));
         let klasse = match (zu_uns, &fehler) {
             (true, Some(_)) => "abgelehnt_per_rueckruf",
             (_, Some(_)) => "weiterleitung_mit_fehler",
@@ -156,8 +219,17 @@ async fn main() {
             Ok(r) => r,
             Err(_) => json!({ "stufe": "gesamt", "klasse": "zeitlimit" }),
         };
-        println!("{} {} {}", v.id, r["stufe"].as_str().unwrap_or("?"), r["klasse"].as_str().unwrap_or("?"));
+        println!(
+            "{} {} {}",
+            v.id,
+            r["stufe"].as_str().unwrap_or("?"),
+            r["klasse"].as_str().unwrap_or("?")
+        );
         aus.insert(v.id.clone(), r);
     }
-    std::fs::write(&args[2], serde_json::to_string_pretty(&Value::Object(aus)).unwrap() + "\n").expect("Ausgabe schreibbar");
+    std::fs::write(
+        &args[2],
+        serde_json::to_string_pretty(&Value::Object(aus)).unwrap() + "\n",
+    )
+    .expect("Ausgabe schreibbar");
 }

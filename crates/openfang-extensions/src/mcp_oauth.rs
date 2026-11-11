@@ -675,7 +675,12 @@ pub struct ProbeStatus {
 /// True for `application/json` and `text/event-stream` (parameters such as
 /// `; charset=utf-8` and letter case are ignored).
 pub fn is_mcp_content_type(value: &str) -> bool {
-    let media = value.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let media = value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     media == "application/json" || media == "text/event-stream"
 }
 
@@ -749,11 +754,14 @@ pub async fn discover(
     drop(resp);
 
     // The announced metadata document must live on the resource's own origin.
+    let mut announced_is_root = false;
     if let Some(h) = &from_header {
         let hu = policy.check(h)?;
         if hu.origin() != resource.origin() {
             return Err(OAuthError::Discovery("schutzbeschreibung fremder host"));
         }
+        announced_is_root =
+            hu.path() == "/.well-known/oauth-protected-resource" && hu.query().is_none();
     }
 
     // 2./3. Protected-resource metadata (RFC 9728 section 3.3): announced URL,
@@ -794,6 +802,9 @@ pub async fn discover(
             }
         }
     };
+    // A header-announced document at the origin's root well-known path is the
+    // root variant as well (RFC 9728 section 3.3: its identifier is the origin).
+    let root_variant = root_variant || announced_is_root;
     // The document must describe exactly the requested resource; the root
     // variant may instead name the resource's origin.
     let got = normalised_resource(&prm.resource);
@@ -810,24 +821,46 @@ pub async fn discover(
     policy.check(&as_url)?;
     let as_base = as_url.trim_end_matches('/');
 
-    let meta: AuthServerMetadata = match get_json(
-        http,
-        policy,
-        &format!("{as_base}/.well-known/oauth-authorization-server"),
-    )
-    .await?
-    {
-        Some(m) => m,
-        None => get_json(
-            http,
-            policy,
-            &format!("{as_base}/.well-known/openid-configuration"),
-        )
-        .await?
-        .ok_or(OAuthError::Discovery(
-            "anmeldeserver-metadaten nicht lesbar",
-        ))?,
-    };
+    // AS metadata (RFC 8414 section 3.1): for an issuer with a path the
+    // well-known segment goes between host and path. The appended forms stay
+    // as fallback (OIDC style and what earlier versions read). The issuer
+    // check below applies to whichever document is found.
+    let as_parsed = policy.check(as_base)?;
+    let as_path = as_parsed.path().trim_end_matches('/');
+    let as_origin = as_parsed.origin().ascii_serialization();
+    let mut candidates: Vec<(String, bool)> = Vec::new();
+    if !as_path.is_empty() {
+        candidates.push((
+            format!("{as_origin}/.well-known/oauth-authorization-server{as_path}"),
+            true,
+        ));
+        candidates.push((
+            format!("{as_origin}/.well-known/openid-configuration{as_path}"),
+            true,
+        ));
+    }
+    candidates.push((
+        format!("{as_base}/.well-known/oauth-authorization-server"),
+        false,
+    ));
+    candidates.push((format!("{as_base}/.well-known/openid-configuration"), false));
+    let mut found: Option<AuthServerMetadata> = None;
+    for (url, inserted) in candidates {
+        let doc = match get_json(http, policy, &url).await {
+            Ok(d) => d,
+            // A path-inserted location that redirects (e.g. to a login page)
+            // counts as absent, so providers read so far keep working.
+            Err(OAuthError::Discovery("weiterleitung")) if inserted => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(m) = doc {
+            found = Some(m);
+            break;
+        }
+    }
+    let meta: AuthServerMetadata = found.ok_or(OAuthError::Discovery(
+        "anmeldeserver-metadaten nicht lesbar",
+    ))?;
 
     // 4a. Every URL passes the policy.
     let issuer = policy.check(&meta.issuer)?;
@@ -1201,7 +1234,8 @@ mod tests {
         let name = body["client_name"].as_str().unwrap();
         assert!(!name.is_empty());
         assert!(
-            name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-'),
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-'),
             "client_name {name:?}"
         );
         assert!(body.get("scope").is_none());
@@ -2313,6 +2347,142 @@ mod tests {
         );
     }
 
+    /// Resource that answers 401 and announces the PRM at `announced` (a path
+    /// on its own origin); the PRM is served there, AS metadata at `as_meta_path`
+    /// with issuer `{b}{issuer_path}`.
+    #[cfg(feature = "test-insecure-oauth")]
+    async fn mock_announced(
+        announced: &'static str,
+        prm: impl Fn(&str) -> serde_json::Value + Send + 'static,
+        as_meta_path: &'static str,
+        issuer_path: &'static str,
+    ) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = format!("http://{}", l.local_addr().unwrap());
+        let doc = prm(&b);
+        let m = good_meta(&format!("{b}{issuer_path}"), &b);
+        let hdr = format!("Bearer resource_metadata=\"{b}{announced}\"");
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(move || {
+                    let hdr = hdr.clone();
+                    async move {
+                        let mut h = HeaderMap::new();
+                        h.insert("www-authenticate", hdr.parse().unwrap());
+                        (StatusCode::UNAUTHORIZED, h)
+                    }
+                }),
+            )
+            .route(
+                announced,
+                get(move || {
+                    let d = doc.clone();
+                    async move { Json(d) }
+                }),
+            )
+            .route(
+                as_meta_path,
+                get(move || {
+                    let m = m.clone();
+                    async move { Json(m) }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        b
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn announced_root_document_naming_the_origin_is_accepted() {
+        // Brand24/DigitalOcean-Fall: der 401-Header nennt die Wurzel-Beschreibung,
+        // die den Ursprung als resource meldet (RFC 9728 3.3, Wurzel-Variante).
+        let p = UrlPolicy::allow_loopback_http();
+        let b = mock_announced(
+            "/.well-known/oauth-protected-resource",
+            |b| serde_json::json!({"resource": format!("{b}/"), "authorization_servers": [b]}),
+            "/.well-known/oauth-authorization-server",
+            "",
+        )
+        .await;
+        let rec = discover(&http(), &p, &format!("{b}/mcp")).await.unwrap();
+        assert_eq!(
+            rec.resource,
+            format!("{b}/mcp"),
+            "resource bleibt die Vorlagen-Adresse"
+        );
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn announced_path_document_naming_only_the_origin_is_still_rejected() {
+        let p = UrlPolicy::allow_loopback_http();
+        let b = mock_announced(
+            "/.well-known/oauth-protected-resource/mcp",
+            |b| serde_json::json!({"resource": b, "authorization_servers": [b]}),
+            "/.well-known/oauth-authorization-server",
+            "",
+        )
+        .await;
+        assert_eq!(
+            discover(&http(), &p, &format!("{b}/mcp"))
+                .await
+                .unwrap_err(),
+            OAuthError::Discovery("resource passt nicht")
+        );
+        // Wurzel-Beschreibung mit fremdem Pfad bleibt ebenfalls abgelehnt.
+        let b = mock_announced(
+            "/.well-known/oauth-protected-resource",
+            |b| serde_json::json!({"resource": format!("{b}/other"), "authorization_servers": [b]}),
+            "/.well-known/oauth-authorization-server",
+            "",
+        )
+        .await;
+        assert_eq!(
+            discover(&http(), &p, &format!("{b}/mcp"))
+                .await
+                .unwrap_err(),
+            OAuthError::Discovery("resource passt nicht")
+        );
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn as_metadata_with_path_uses_rfc8414_path_insertion() {
+        // Stripe/monday-Fall: Anmeldeserver https://as/mcp, Beschreibung nur unter
+        // /.well-known/oauth-authorization-server/mcp (RFC 8414 3.1).
+        let p = UrlPolicy::allow_loopback_http();
+        let b = mock_announced(
+            "/.well-known/oauth-protected-resource/mcp",
+            |b| serde_json::json!({"resource": format!("{b}/mcp"), "authorization_servers": [format!("{b}/auth")]}),
+            "/.well-known/oauth-authorization-server/auth",
+            "/auth",
+        )
+        .await;
+        let rec = discover(&http(), &p, &format!("{b}/mcp")).await.unwrap();
+        assert_eq!(rec.issuer, format!("{b}/auth"));
+    }
+
+    #[cfg(feature = "test-insecure-oauth")]
+    #[tokio::test]
+    async fn as_metadata_path_insertion_still_checks_the_issuer() {
+        let p = UrlPolicy::allow_loopback_http();
+        // Beschreibung unter dem Einschub, aber issuer ohne Pfad -> passt nicht
+        let b = mock_announced(
+            "/.well-known/oauth-protected-resource/mcp",
+            |b| serde_json::json!({"resource": format!("{b}/mcp"), "authorization_servers": [format!("{b}/auth")]}),
+            "/.well-known/oauth-authorization-server/auth",
+            "",
+        )
+        .await;
+        assert_eq!(
+            discover(&http(), &p, &format!("{b}/mcp"))
+                .await
+                .unwrap_err(),
+            OAuthError::Discovery("issuer passt nicht")
+        );
+    }
+
     #[test]
     fn pkce_challenge_is_s256_of_verifier() {
         use base64::Engine;
@@ -2345,7 +2515,12 @@ mod tests {
         ] {
             assert!(is_mcp_content_type(ok), "{ok}");
         }
-        for nein in ["text/html", "text/html; charset=utf-8", "", "application/xml"] {
+        for nein in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "",
+            "application/xml",
+        ] {
             assert!(!is_mcp_content_type(nein), "{nein}");
         }
     }
