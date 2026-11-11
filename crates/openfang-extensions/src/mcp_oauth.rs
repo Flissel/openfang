@@ -888,6 +888,22 @@ struct RegistrationResponse {
     client_id: Option<String>,
 }
 
+/// RFC-7591-Anfrage fuer einen oeffentlichen Client. Der Name enthaelt nur
+/// Buchstaben, Ziffern, Leerzeichen und Bindestriche (Calendly lehnt mehr ab).
+fn registrierungs_body(redirect_uri: &str, scopes: &[String]) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "client_name": "OpenFang VibeMind",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
+    });
+    if !scopes.is_empty() {
+        body["scope"] = serde_json::Value::String(scopes.join(" "));
+    }
+    body
+}
+
 /// Register a public client (no secret) via RFC 7591 and store its client id.
 pub async fn register_client(
     http: &OAuthHttp,
@@ -900,16 +916,7 @@ pub async fn register_client(
         .as_deref()
         .ok_or(OAuthError::Discovery("keine selbstregistrierung"))?;
     let u = issuer_endpoint(policy, rec, endpoint)?;
-    let mut body = serde_json::json!({
-        "client_name": "OpenFang (VibeMind)",
-        "redirect_uris": [redirect_uri],
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "none"
-    });
-    if !rec.scopes.is_empty() {
-        body["scope"] = serde_json::Value::String(rec.scopes.join(" "));
-    }
+    let body = registrierungs_body(redirect_uri, &rec.scopes);
     let resp = http
         .0
         .post(u.clone())
@@ -1185,6 +1192,24 @@ pub async fn revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registrierungs_name_ohne_sonderzeichen() {
+        // Calendly lehnt Namen mit Klammern ab: "may only contain alphanumeric
+        // characters, hyphens, and spaces".
+        let body = registrierungs_body("http://127.0.0.1:4200/cb", &[]);
+        let name = body["client_name"].as_str().unwrap();
+        assert!(!name.is_empty());
+        assert!(
+            name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-'),
+            "client_name {name:?}"
+        );
+        assert!(body.get("scope").is_none());
+        let mit = registrierungs_body("http://x/cb", &["a".into(), "b".into()]);
+        assert_eq!(mit["scope"], "a b");
+        assert_eq!(mit["redirect_uris"][0], "http://x/cb");
+        assert_eq!(mit["token_endpoint_auth_method"], "none");
+    }
 
     #[cfg(feature = "test-insecure-oauth")]
     use axum::{
