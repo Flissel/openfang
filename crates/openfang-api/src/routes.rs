@@ -7157,14 +7157,10 @@ pub async fn runtime_admit_plan_approval(
         return runtime_route_error(StatusCode::BAD_REQUEST, "invalid_runtime_authority_request")
             .into_response();
     }
-    match state
-        .kernel
-        .runtime_admission
-        .request_plan_approval(
-            request,
-            state.kernel.config.runtime_admission.auto_approve_plans,
-        )
-    {
+    match state.kernel.runtime_admission.request_plan_approval(
+        request,
+        state.kernel.config.runtime_admission.auto_approve_plans,
+    ) {
         Ok(outcome) => (
             StatusCode::OK,
             Json(serde_json::to_value(outcome).unwrap_or_default()),
