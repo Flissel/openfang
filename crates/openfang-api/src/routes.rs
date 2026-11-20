@@ -7160,7 +7160,10 @@ pub async fn runtime_admit_plan_approval(
     match state
         .kernel
         .runtime_admission
-        .request_plan_approval(request, state.kernel.config.approval.auto_approve)
+        .request_plan_approval(
+            request,
+            state.kernel.config.runtime_admission.auto_approve_plans,
+        )
     {
         Ok(outcome) => (
             StatusCode::OK,

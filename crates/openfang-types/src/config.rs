@@ -1344,6 +1344,10 @@ pub struct RuntimeConfig {
 #[serde(default)]
 pub struct RuntimeAdmissionConfig {
     pub enabled: bool,
+    /// Approve Brain plan-approval requests immediately instead of leaving
+    /// them pending. Independent of `[approval] auto_approve`, which only
+    /// governs per-tool prompts such as `shell_exec`. Default: `false`.
+    pub auto_approve_plans: bool,
     pub receipt_max_bytes: usize,
     pub dispatch_stale_after_secs: u64,
 }
@@ -1352,6 +1356,7 @@ impl Default for RuntimeAdmissionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            auto_approve_plans: false,
             receipt_max_bytes: 65_536,
             dispatch_stale_after_secs: 300,
         }
@@ -4163,8 +4168,25 @@ mod tests {
         let config = RuntimeAdmissionConfig::default();
 
         assert!(!config.enabled);
+        assert!(!config.auto_approve_plans);
         assert_eq!(config.receipt_max_bytes, 65_536);
         assert!(config.dispatch_stale_after_secs > 0);
+    }
+
+    #[test]
+    fn runtime_admission_plan_auto_approval_is_its_own_switch() {
+        let config: KernelConfig =
+            toml::from_str("[runtime_admission]\nenabled = true\nauto_approve_plans = true\n")
+                .expect("runtime_admission section parses");
+
+        assert!(config.runtime_admission.enabled);
+        assert!(config.runtime_admission.auto_approve_plans);
+        // The general shorthand stays off, so per-tool prompts keep their default.
+        assert!(!config.approval.auto_approve);
+        assert_eq!(
+            config.approval.require_approval,
+            vec!["shell_exec".to_string()]
+        );
     }
 
     #[test]

@@ -108,7 +108,7 @@ async fn start_tool_only_runtime_admission_test_server_with_dispatch_probe(
     };
     config.runtime.tool_only = true;
     config.runtime_admission.enabled = true;
-    config.approval.auto_approve = true;
+    config.runtime_admission.auto_approve_plans = true;
 
     let kernel =
         Arc::new(OpenFangKernel::boot_with_config(config).expect("tool-only kernel boots"));
@@ -157,6 +157,7 @@ async fn start_runtime_admission_test_server_with_dispatch_probe(
         auto_approve,
         "runtime-admission-test-key",
         Some(probe),
+        false,
     )
     .await
 }
@@ -238,6 +239,21 @@ async fn start_runtime_admission_test_server_with_api_key(
         auto_approve,
         api_key,
         None,
+        false,
+    )
+    .await
+}
+
+/// Starts runtime admission with only the general tool-approval shorthand
+/// (`[approval] auto_approve`) set. Plan approvals must stay pending: the
+/// shorthand governs per-tool prompts, not Brain plan authority.
+async fn start_runtime_admission_test_server_with_general_auto_approve_only() -> TestServer {
+    start_runtime_admission_test_server_with_api_key_and_dispatch_probe(
+        true,
+        false,
+        "runtime-admission-test-key",
+        None,
+        true,
     )
     .await
 }
@@ -247,6 +263,7 @@ async fn start_runtime_admission_test_server_with_api_key_and_dispatch_probe(
     auto_approve: bool,
     api_key: &str,
     dispatch_probe: Option<Arc<RuntimeMcpDispatchProbe>>,
+    general_auto_approve: bool,
 ) -> TestServer {
     let tmp = tempfile::tempdir().expect("Failed to create temp dir");
     let mut config = KernelConfig {
@@ -263,7 +280,8 @@ async fn start_runtime_admission_test_server_with_api_key_and_dispatch_probe(
         ..KernelConfig::default()
     };
     config.runtime_admission.enabled = runtime_admission_enabled;
-    config.approval.auto_approve = auto_approve;
+    config.runtime_admission.auto_approve_plans = auto_approve;
+    config.approval.auto_approve = general_auto_approve;
 
     let kernel = Arc::new(OpenFangKernel::boot_with_config(config).expect("Kernel should boot"));
     kernel.set_self_handle();
@@ -1195,6 +1213,26 @@ async fn runtime_admission_rejects_body_authority_and_non_string_invocation_ids(
         assert_eq!(body["error"]["data"]["authority_status"], "denied");
     }
     assert_eq!(probe.calls(), 0, "denied calls must not dispatch");
+}
+
+#[tokio::test]
+async fn runtime_plan_approval_ignores_the_general_auto_approve_shorthand() {
+    let server = start_runtime_admission_test_server_with_general_auto_approve_only().await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+
+    let response = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", server.base_url),
+    )
+    .json(&runtime_approval_request(&caller_id))
+    .send()
+    .await
+    .expect("runtime approval route responds");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("approval JSON");
+    assert_eq!(body["status"], "pending_approval");
 }
 
 #[tokio::test]
