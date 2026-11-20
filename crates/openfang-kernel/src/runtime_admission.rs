@@ -6,7 +6,7 @@ use openfang_memory::runtime_authority::{RuntimeAuthorityStore, StoreAdmission};
 use openfang_types::runtime_admission::{
     ExecutionReceiptV1, ReceiptFinalizationV1, RuntimeAdmissionContextV1,
     RuntimeAdmissionDecisionV1, RuntimeCostReservationOutcomeV1, RuntimeCostReservationRequestV1,
-    RuntimePlanApprovalOutcomeV1, RuntimePlanApprovalRequestV1,
+    RuntimePendingPlanApprovalV1, RuntimePlanApprovalOutcomeV1, RuntimePlanApprovalRequestV1,
 };
 use std::sync::Arc;
 
@@ -35,6 +35,8 @@ pub trait RuntimeAuthorityRepository: Send + Sync {
     ) -> Result<RuntimePlanApprovalOutcomeV1, String>;
     fn resolve(&self, approval_ref: &str, approved: bool, now: DateTime<Utc>)
         -> Result<(), String>;
+    fn list_pending(&self, now: DateTime<Utc>)
+        -> Result<Vec<RuntimePendingPlanApprovalV1>, String>;
     fn reserve(
         &self,
         request: RuntimeCostReservationRequestV1,
@@ -84,6 +86,14 @@ impl RuntimeAuthorityRepository for RuntimeAuthorityStore {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         self.resolve_plan_approval(approval_ref, approved, now)
+            .map_err(|error| error.to_string())
+    }
+
+    fn list_pending(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<RuntimePendingPlanApprovalV1>, String> {
+        self.list_pending_plan_approvals(now)
             .map_err(|error| error.to_string())
     }
 
@@ -222,6 +232,12 @@ impl RuntimeAdmissionService {
     pub fn resolve(&self, approval_ref: &str, approved: bool) -> Result<(), String> {
         self.require_enabled()?;
         self.store.resolve(approval_ref, approved, self.clock.now())
+    }
+
+    /// List pending plan approvals that an operator can still resolve.
+    pub fn list_pending_plan_approvals(&self) -> Result<Vec<RuntimePendingPlanApprovalV1>, String> {
+        self.require_enabled()?;
+        self.store.list_pending(self.clock.now())
     }
 
     pub fn reserve(
@@ -468,6 +484,12 @@ mod tests {
             Err("unused".into())
         }
         fn resolve(&self, _: &str, _: bool, _: DateTime<Utc>) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn list_pending(
+            &self,
+            _: DateTime<Utc>,
+        ) -> Result<Vec<RuntimePendingPlanApprovalV1>, String> {
             Err("unused".into())
         }
         fn reserve(

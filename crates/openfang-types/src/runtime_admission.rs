@@ -67,6 +67,20 @@ impl RuntimePlanApprovalOutcomeV1 {
     }
 }
 
+/// One pending plan approval that an operator can still resolve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePendingPlanApprovalV1 {
+    pub approval_ref: String,
+    pub correlation_id: String,
+    pub plan_id: String,
+    pub plan_revision: u64,
+    pub space_id: String,
+    pub agent_id: String,
+    pub max_plan_cost_microusd: u64,
+    pub expires_at: DateTime<Utc>,
+}
+
 /// A request to reserve the bounded cost of one exact invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

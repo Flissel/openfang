@@ -1216,6 +1216,67 @@ async fn runtime_admission_rejects_body_authority_and_non_string_invocation_ids(
 }
 
 #[tokio::test]
+async fn runtime_pending_plan_approvals_are_listed_for_the_control_plane_only() {
+    let server = start_runtime_admission_test_server(false).await;
+    let client = reqwest::Client::new();
+    let caller_id = spawn_runtime_test_agent(&server).await;
+    let url = format!("{}/api/runtime/approvals", server.base_url);
+
+    let unauthenticated = client.get(&url).send().await.expect("route responds");
+    assert_eq!(unauthenticated.status(), 401);
+
+    let empty = runtime_authorized_request(&client, reqwest::Method::GET, url.clone())
+        .send()
+        .await
+        .expect("route responds");
+    assert_eq!(empty.status(), 200);
+    let empty: serde_json::Value = empty.json().await.expect("list JSON");
+    assert_eq!(empty["total"], 0);
+
+    let pending = runtime_authorized_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/api/runtime/approvals/admit", server.base_url),
+    )
+    .json(&runtime_approval_request(&caller_id))
+    .send()
+    .await
+    .expect("approval route responds");
+    assert_eq!(pending.status(), 200);
+    let pending: serde_json::Value = pending.json().await.expect("pending JSON");
+    let approval_ref = pending["approval_ref"]
+        .as_str()
+        .expect("pending approval ref");
+
+    let listed = runtime_authorized_request(&client, reqwest::Method::GET, url.clone())
+        .send()
+        .await
+        .expect("route responds");
+    assert_eq!(listed.status(), 200);
+    let listed: serde_json::Value = listed.json().await.expect("list JSON");
+    assert_eq!(listed["total"], 1);
+    assert_eq!(listed["approvals"][0]["approval_ref"], approval_ref);
+    assert_eq!(listed["approvals"][0]["plan_id"], "plan-runtime-admission");
+    assert_eq!(listed["approvals"][0]["agent_id"], caller_id);
+}
+
+#[tokio::test]
+async fn runtime_pending_plan_approvals_fail_closed_when_admission_is_disabled() {
+    let disabled = start_runtime_admission_test_server_with_enabled(false, false).await;
+    let client = reqwest::Client::new();
+
+    let closed = runtime_authorized_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{}/api/runtime/approvals", disabled.base_url),
+    )
+    .send()
+    .await
+    .expect("route responds");
+    assert_eq!(closed.status(), 503);
+}
+
+#[tokio::test]
 async fn runtime_plan_approval_ignores_the_general_auto_approve_shorthand() {
     let server = start_runtime_admission_test_server_with_general_auto_approve_only().await;
     let client = reqwest::Client::new();

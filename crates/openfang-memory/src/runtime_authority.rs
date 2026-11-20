@@ -6,8 +6,8 @@ use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::runtime_admission::{
     ExecutionReceiptStatus, ExecutionReceiptV1, ReceiptFinalStatus, ReceiptFinalizationV1,
     ResultStorageMode, RuntimeAdmissionContextV1, RuntimeCostReservationOutcomeV1,
-    RuntimeCostReservationRecordV1, RuntimeCostReservationRequestV1, RuntimePlanApprovalOutcomeV1,
-    RuntimePlanApprovalRequestV1,
+    RuntimeCostReservationRecordV1, RuntimeCostReservationRequestV1, RuntimePendingPlanApprovalV1,
+    RuntimePlanApprovalOutcomeV1, RuntimePlanApprovalRequestV1,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::sync::{Arc, Mutex};
@@ -117,6 +117,37 @@ impl RuntimeAuthorityStore {
             params![approval_ref, if approved { "approved" } else { "denied" }, timestamp(now)],
         ).map_err(memory_error)?;
         tx.commit().map_err(memory_error)
+    }
+
+    /// List pending approvals that have not expired, soonest expiry first.
+    pub fn list_pending_plan_approvals(
+        &self,
+        now: DateTime<Utc>,
+    ) -> OpenFangResult<Vec<RuntimePendingPlanApprovalV1>> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        let mut statement = conn
+            .prepare("SELECT approval_ref, correlation_id, plan_id, plan_revision, space_id, agent_id, max_plan_cost_microusd, ttl_seconds, status, expires_at FROM runtime_approvals WHERE status = 'pending' ORDER BY expires_at ASC, approval_ref ASC LIMIT 200")
+            .map_err(memory_error)?;
+        let rows = statement
+            .query_map([], approval_row)
+            .map_err(memory_error)?;
+        let mut pending = Vec::new();
+        for row in rows {
+            let row = row.map_err(memory_error)?;
+            if row.expires_at > now {
+                pending.push(RuntimePendingPlanApprovalV1 {
+                    approval_ref: row.approval_ref,
+                    correlation_id: row.correlation_id,
+                    plan_id: row.plan_id,
+                    plan_revision: row.plan_revision,
+                    space_id: row.space_id,
+                    agent_id: row.agent_id,
+                    max_plan_cost_microusd: row.max_plan_cost_microusd,
+                    expires_at: row.expires_at,
+                });
+            }
+        }
+        Ok(pending)
     }
 
     /// Reserve one exact invocation cost without exceeding its approval ceiling.
@@ -1223,6 +1254,48 @@ mod tests {
             params![cost_ref, status],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn pending_plan_approvals_are_listed_until_resolved_or_expired() {
+        let store = test_store();
+        assert!(store.list_pending_plan_approvals(now()).unwrap().is_empty());
+
+        let approval_ref = match store
+            .request_plan_approval(approval_request(0), false, now())
+            .unwrap()
+        {
+            RuntimePlanApprovalOutcomeV1::PendingApproval { approval_ref } => approval_ref,
+            other => panic!("expected pending outcome, got {other:?}"),
+        };
+
+        let pending = store.list_pending_plan_approvals(now()).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].approval_ref, approval_ref);
+        assert_eq!(pending[0].plan_id, "plan-1");
+        assert_eq!(pending[0].space_id, "ideas");
+        assert_eq!(pending[0].agent_id, "agent-1");
+        assert_eq!(pending[0].expires_at, now() + Duration::seconds(300));
+
+        // An expired approval is no longer actionable and is not listed.
+        assert!(store
+            .list_pending_plan_approvals(now() + Duration::seconds(300))
+            .unwrap()
+            .is_empty());
+
+        store
+            .resolve_plan_approval(&approval_ref, true, now())
+            .unwrap();
+        assert!(store.list_pending_plan_approvals(now()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_approved_plans_are_never_listed_as_pending() {
+        let store = test_store();
+        store
+            .request_plan_approval(approval_request(0), true, now())
+            .unwrap();
+        assert!(store.list_pending_plan_approvals(now()).unwrap().is_empty());
     }
 
     #[test]

@@ -7203,6 +7203,24 @@ pub async fn runtime_resolve_plan_approval(
     }
 }
 
+/// GET /api/runtime/approvals — list pending plan approvals awaiting a decision.
+pub async fn runtime_list_pending_plan_approvals(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_runtime_control_plane_auth(&state, &headers) {
+        return response;
+    }
+    match state.kernel.runtime_admission.list_pending_plan_approvals() {
+        Ok(approvals) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"total": approvals.len(), "approvals": approvals})),
+        )
+            .into_response(),
+        Err(error) => runtime_service_error(&error).into_response(),
+    }
+}
+
 /// POST /api/runtime/cost-reservations — reserve bounded cost for one invocation.
 pub async fn runtime_reserve_cost(
     State(state): State<Arc<AppState>>,

@@ -594,6 +594,10 @@ async fn build_router_inner(
         // and also require the configured administrative control-plane API key
         // in their handlers. Agent identity headers are never credentials.
         .route(
+            "/api/runtime/approvals",
+            axum::routing::get(routes::runtime_list_pending_plan_approvals),
+        )
+        .route(
             "/api/runtime/approvals/admit",
             axum::routing::post(routes::runtime_admit_plan_approval),
         )
