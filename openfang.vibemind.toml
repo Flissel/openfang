@@ -33,6 +33,16 @@ default_timeout_secs = 360
 # Without this block, broadcast/reply approvals expire after 60s.
 [approval]
 timeout_secs = 300
+# 2026-11-20 (Felix): Plan-Freigaben des Gehirns laufen sofort durch. Nebenwirkung:
+# die Rueckfrage vor shell_exec entfaellt fuer alle Agenten. Marketing-Freigaben
+# (POST /api/approvals) bleiben wartend. Zwischenstand, bis es einen eigenen Schalter
+# fuer Plan-Freigaben gibt (docs/superpowers/specs/2026-11-20-brain-ueber-openfang-design.md).
+auto_approve = true
+
+# 2026-11-20 (Felix): Zulassung je Werkzeug-Aufruf des Gehirns (Freigabe, Reservierung,
+# Beleg). Vorgabe ist aus; ohne diesen Abschnitt scheitert jeder mcp:-Schritt des Gehirns.
+[runtime_admission]
+enabled = true
 
 # ── Telegram Channel ─────────────────────────────────────────────
 # Enables polling for the @VibeMind_agent_bot bot. Without this block
