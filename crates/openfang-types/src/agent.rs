@@ -1501,6 +1501,7 @@ memory_write = ["self.*"]
                 &[
                     "memory_store",
                     "memory_recall",
+                    "mcp_spaces_ideas_aenderung_zurueck",
                     "mcp_spaces_ideas_idea_connect",
                 ][..],
             ),
