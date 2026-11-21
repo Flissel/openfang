@@ -541,11 +541,14 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "OP
 [[mcp_servers]]
 name = "spaces-ideas"
 timeout_secs = 60
-env = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
+# 2026-11-21: ueber mcp_mit_env. Der Daemon hat SUPABASE_URL und SUPABASE_SERVICE_ROLE_KEY nicht
+# in seiner Umgebung (der Waechter reicht nur OPENFANG_API_KEY weiter), die env-Liste lief
+# deshalb ins Leere: jedes Werkzeug antwortete mit "configuration_error: SUPABASE_URL and
+# SUPABASE_SERVICE_ROLE_KEY must be set". Der Starter holt genau diese zwei Werte aus der Root-.env.
 [mcp_servers.transport]
 type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/ideas/mcp_server.py"]
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "SUPABASE_URL", "--env", "SUPABASE_SERVICE_ROLE_KEY", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/ideas/mcp_server.py"]
 
 [[mcp_servers]]
 name = "spaces-minibook"
