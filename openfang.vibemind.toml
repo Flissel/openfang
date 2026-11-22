@@ -563,6 +563,18 @@ type = "stdio"
 command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
 args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "AUFTRAGSBUCH_URL", "--env", "AUFTRAGSBUCH_SCHLUESSEL", "--env", "AUFTRAGSBUCH_CA_DATEI", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/auftragsbuch/bruecke.py"]
 
+# Rowboat-Status (ein lesendes Werkzeug rowboat_status, HEAD gegen ROWBOAT_URL). Der Eintrag
+# stand bisher nur in der Vorlage; ohne ihn lehnt OpenFang das Werkzeug fuer rowboat-chat als
+# "not permitted" ab, weil der Server fehlt. Ueber mcp_mit_env, weil der Daemon ROWBOAT_URL
+# nicht in seiner Umgebung hat (wie bei spaces-ideas).
+[[mcp_servers]]
+name = "spaces-rowboat"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "ROWBOAT_URL", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/rowboat/mcp_server.py"]
+
 [[mcp_servers]]
 name = "spaces-minibook"
 timeout_secs = 10
