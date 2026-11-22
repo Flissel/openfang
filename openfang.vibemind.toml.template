@@ -356,6 +356,18 @@ type = "stdio"
 command = "python"
 args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/ideas/mcp_server.py"]
 
+# Auftragsbuch (Sales-Stufe 1): Die Bruecke reicht Aufrufe an den Dienst auf dem Mini-PC weiter.
+# Adresse und Schluessel stehen nur in der Root-.env; ohne diese Werte beendet sich
+# die Bruecke mit einer Meldung.
+[[mcp_servers]]
+name = "auftragsbuch"
+timeout_secs = 60
+env = ["AUFTRAGSBUCH_URL", "AUFTRAGSBUCH_SCHLUESSEL"]
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/auftragsbuch/bruecke.py"]
+
 [[mcp_servers]]
 name = "spaces-rowboat"
 timeout_secs = 10
