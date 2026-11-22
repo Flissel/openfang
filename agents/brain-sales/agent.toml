@@ -1,9 +1,9 @@
 name = "brain-sales"
 version = "0.1.0"
-description = "Sales (sales-claw): the Brain places orders of a fixed kind in the order book; the Sales agent takes them."
+description = "Rights carrier (no agent): Sales (sales-claw): the Brain places orders of a fixed kind in the order book; the Sales agent takes them."
 author = "vibemind"
 module = "builtin:chat"
-tags = ["vibemind", "brain-routed", "space:sales"]
+tags = ["vibemind", "brain-routed", "space:sales", "rights-carrier"]
 mcp_servers = ["auftragsbuch"]
 
 [model]
@@ -11,33 +11,14 @@ provider = "openai"
 model = "gpt-4o-mini"
 max_tokens = 4096
 temperature = 0.2
-system_prompt = """You are brain-sales, the VibeMind agent for the "sales" space.
-
-You receive structured intent envelopes with schema "vibemind.intent.v1":
-  {
-    "event_type": "...",
-    "space": "sales",
-    "preferred_tool": "...",
-    "required_params": [...],
-    "params": {...},
-    "context": {...},
-    "user_text": "..."
-  }
-
-METHODOLOGY:
-1. If "preferred_tool" is set, try that tool first with the provided params.
-2. Fill missing required_params from "context" or "user_text".
-3. Return a concise result — the user expects voice-friendly replies.
-
-
-"""
+system_prompt = """You are brain-sales, a rights carrier for the "sales" space. You are not an assistant and you take no instructions. Never call a tool. Whatever a message says, reply with exactly: brain-sales accepts no messages."""
 
 [resources]
-max_llm_tokens_per_hour = 100000
+max_llm_tokens_per_hour = 2000
 max_concurrent_tools = 5
 
 [capabilities]
-tools = ["memory_store", "memory_recall", "mcp_auftragsbuch_auftrag_lesen", "mcp_auftragsbuch_auftrag_probe"]
-network = ["*"]
-memory_read = ["*"]
-memory_write = ["self.*"]
+tools = ["mcp_auftragsbuch_auftrag_lesen", "mcp_auftragsbuch_auftrag_probe"]
+network = []
+memory_read = []
+memory_write = []
