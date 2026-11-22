@@ -553,13 +553,15 @@ args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "SU
 # Auftragsbuch (Sales-Stufe 1): Die Bruecke reicht Aufrufe an den Dienst auf dem Mini-PC weiter.
 # Adresse und Schluessel stehen nur in der Root-.env; ohne diese Werte beendet sich
 # die Bruecke mit einer Meldung.
+# AUFTRAGSBUCH_CA_DATEI (optional) nennt eine eigene Zertifikatsliste fuer die TLS-Pruefung,
+# weil der Windows-Speicher abgelaufene Zwischenzertifikate halten kann; fehlt sie, gilt der Standard.
 [[mcp_servers]]
 name = "auftragsbuch"
 timeout_secs = 60
 [mcp_servers.transport]
 type = "stdio"
 command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "AUFTRAGSBUCH_URL", "--env", "AUFTRAGSBUCH_SCHLUESSEL", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/auftragsbuch/bruecke.py"]
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "AUFTRAGSBUCH_URL", "--env", "AUFTRAGSBUCH_SCHLUESSEL", "--env", "AUFTRAGSBUCH_CA_DATEI", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/auftragsbuch/bruecke.py"]
 
 [[mcp_servers]]
 name = "spaces-minibook"

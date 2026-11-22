@@ -359,10 +359,12 @@ args = ["${VIBEMIND_ROOT}/vibemind-os/spaces/ideas/mcp_server.py"]
 # Auftragsbuch (Sales-Stufe 1): Die Bruecke reicht Aufrufe an den Dienst auf dem Mini-PC weiter.
 # Adresse und Schluessel stehen nur in der Root-.env; ohne diese Werte beendet sich
 # die Bruecke mit einer Meldung.
+# AUFTRAGSBUCH_CA_DATEI (optional) nennt eine eigene Zertifikatsliste fuer die TLS-Pruefung,
+# weil der Windows-Speicher abgelaufene Zwischenzertifikate halten kann; fehlt sie, gilt der Standard.
 [[mcp_servers]]
 name = "auftragsbuch"
 timeout_secs = 60
-env = ["AUFTRAGSBUCH_URL", "AUFTRAGSBUCH_SCHLUESSEL"]
+env = ["AUFTRAGSBUCH_URL", "AUFTRAGSBUCH_SCHLUESSEL", "AUFTRAGSBUCH_CA_DATEI"]
 [mcp_servers.transport]
 type = "stdio"
 command = "python"
