@@ -74,6 +74,119 @@ model = "claude-code/sonnet"
 # Course Factory (~5 min). Obergrenze fuer alle claude-code-Agenten; Wrapper bleiben darunter.
 subprocess_timeout_secs = 600
 
+# Full CRUD for all 22 VibeMind tables via Supabase PostgREST
+[[mcp_servers]]
+name = "vibemind-db"
+timeout_secs = 10
+env = ["SUPABASE_URL", "SUPABASE_ANON_KEY"]
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_mcp.py"]
+
+[[mcp_servers]]
+name = "spaces-ideas"
+timeout_secs = 60
+# 2026-11-21: ueber mcp_mit_env. Der Daemon hat SUPABASE_URL und SUPABASE_SERVICE_ROLE_KEY nicht
+# in seiner Umgebung (der Waechter reicht nur OPENFANG_API_KEY weiter), die env-Liste lief
+# deshalb ins Leere: jedes Werkzeug antwortete mit "configuration_error: SUPABASE_URL and
+# SUPABASE_SERVICE_ROLE_KEY must be set". Der Starter holt genau diese zwei Werte aus der Root-.env.
+[mcp_servers.transport]
+type = "stdio"
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "SUPABASE_URL", "--env", "SUPABASE_SERVICE_ROLE_KEY", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/ideas/mcp_server.py"]
+
+# 2026-11-23: Desktop-Space, feste Aufrufe des Gehirns (spaces/desktop/mcp_server.py).
+# Der Dienst spricht nur mit dem Desktop-Dienst am eigenen Rechner und liest dasselbe Aufgabenbuch.
+# VIBEMIND_DESKTOP_AUSFUEHREN ist absichtlich NICHT gesetzt: ohne den Schalter ist jede Aufgabe ein Trockenlauf.
+[[mcp_servers]]
+name = "spaces-desktop"
+timeout_secs = 60
+
+[mcp_servers.transport]
+type = "stdio"
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--set", "DESKTOP_AUTOMATION_URL=http://127.0.0.1:8007", "--set", "VIBEMIND_DESKTOP_AUFGABEN_DIR=C:/Users/User/AppData/Local/VibeMind/desktop-aufgaben", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/mcp_server.py"]
+
+# Rowboat-Status (ein lesendes Werkzeug rowboat_status, HEAD gegen ROWBOAT_URL). Der Eintrag
+# stand bisher nur in der Vorlage; ohne ihn lehnt OpenFang das Werkzeug fuer rowboat-chat als
+# "not permitted" ab, weil der Server fehlt. Ueber mcp_mit_env, weil der Daemon ROWBOAT_URL
+# nicht in seiner Umgebung hat (wie bei spaces-ideas).
+[[mcp_servers]]
+name = "spaces-rowboat"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "ROWBOAT_URL", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/rowboat/mcp_server.py"]
+
+[[mcp_servers]]
+name = "spaces-minibook"
+timeout_secs = 10
+env = ["MINIBOOK_STATUS_URL"]
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/minibook/mcp_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# n8n — workflow automation (third-party engine)
+# Registry-routed MCP tool surface for the eight canonical n8n.* events
+# scoped by the brain-n8n agent (agents/brain-n8n/agent.toml:7;
+# vibemind-os/config/space_agent_registry.yml:269-286). There is no
+# VibeMind-owned n8n Space application — every tool call is executed by
+# the third-party n8n engine, reached through the `n8n-mcp` npm package
+# (vibemind-os/docs/mcp-archive/MCP_SERVER_INVENTORY.md:103-108). The one
+# in-repo launch of this server uses `npx -y n8n-mcp`, sets N8N_API_URL,
+# N8N_API_KEY, MCP_MODE=stdio and LOG_LEVEL=error, and allows 120 s per
+# request (vibemind-os/security/poc_n8n/agent.py:139-155).
+#
+# NOTE: `env` lists variable NAMES only — never values. OpenFang spawns
+# stdio MCP servers with a cleared environment and forwards exactly these
+# names from the host (crates/openfang-runtime/src/mcp.rs). The values,
+# including MCP_MODE=stdio, must therefore already exist in the host
+# environment / root .env; OpenFang cannot inject them.
+# ═══════════════════════════════════════════════════════════════════
+
+# Auftragsbuch (Sales-Stufe 1): Die Bruecke reicht Aufrufe an den Dienst auf dem Mini-PC weiter.
+# Adresse und Schluessel stehen nur in der Root-.env; ohne diese Werte beendet sich
+# die Bruecke mit einer Meldung.
+# AUFTRAGSBUCH_CA_DATEI (optional) nennt eine eigene Zertifikatsliste fuer die TLS-Pruefung,
+# weil der Windows-Speicher abgelaufene Zwischenzertifikate halten kann; fehlt sie, gilt der Standard.
+[[mcp_servers]]
+name = "auftragsbuch"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "AUFTRAGSBUCH_URL", "--env", "AUFTRAGSBUCH_SCHLUESSEL", "--env", "AUFTRAGSBUCH_CA_DATEI", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/auftragsbuch/bruecke.py"]
+
+[[mcp_servers]]
+name = "openfang-agents"
+timeout_secs = 120
+[mcp_servers.transport]
+type = "stdio"
+command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
+args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "OPENFANG_API_KEY", "--set", "OPENFANG_URL=http://127.0.0.1:4200", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/openfang/mcp/openfang_agents_server.py"]
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 11.A — Spaces MCP Servers
+# Bubble + Idea tools as MCP for brain-bubbles and brain-ideas agents.
+# ═══════════════════════════════════════════════════════════════════
+
+[[mcp_servers]]
+name = "space-navigator"
+timeout_secs = 30
+[mcp_servers.transport]
+type = "stdio"
+command = "python"
+args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/_navigator/mcp_server.py"]
+env = { OPENROUTER_API_KEY = "${OPENROUTER_API_KEY}", NAVIGATOR_LLM_MODEL = "openai/gpt-4o-mini", NAVIGATOR_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B" }
+
+# ═══════════════════════════════════════════════════════════════════
+# A2A Protocol
+# ═══════════════════════════════════════════════════════════════════
+
 # ── Brain MCP Server ────────────────────────────────────────────
 # Gives agents access to cognitive state via SSE
 [[mcp_servers]]
@@ -402,16 +515,6 @@ args = ["-y", "@kazuph/mcp-taskmanager"]
 # VibeMind Database MCP (Supabase PostgREST)
 # ═══════════════════════════════════════════════════════════════════
 
-# Full CRUD for all 22 VibeMind tables via Supabase PostgREST
-[[mcp_servers]]
-name = "vibemind-db"
-timeout_secs = 10
-env = ["SUPABASE_URL", "SUPABASE_ANON_KEY"]
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/voice/python/vibemind_db_mcp.py"]
-
 # 2026-08-22: Laura-MCP (28 Tools, lokaler Videoeditor auf 127.0.0.1:8765).
 # WIRKSAM wird der Eintrag erst in ~/.openfang/config.toml — diese Datei ist
 # die versionierte Vorlage. Beide muessen uebereinstimmen.
@@ -526,96 +629,6 @@ command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
 args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "SUPABASE_ANON_KEY", "--env", "OPENFANG_API_KEY", "--set", "SUPABASE_URL=http://localhost:54321", "--set", "QDRANT_URL=http://localhost:6730", "--set", "OPENFANG_URL=http://127.0.0.1:4200", "--set", "KNOWLEDGE_DIR=C:/Users/User/.rowboat/knowledge", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/rowboat/knowledge_mcp_server.py"]
 
 [[mcp_servers]]
-name = "openfang-agents"
-timeout_secs = 120
-[mcp_servers.transport]
-type = "stdio"
-command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "OPENFANG_API_KEY", "--set", "OPENFANG_URL=http://127.0.0.1:4200", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/openfang/mcp/openfang_agents_server.py"]
-
-# ═══════════════════════════════════════════════════════════════════
-# Phase 11.A — Spaces MCP Servers
-# Bubble + Idea tools as MCP for brain-bubbles and brain-ideas agents.
-# ═══════════════════════════════════════════════════════════════════
-
-[[mcp_servers]]
-name = "spaces-ideas"
-timeout_secs = 60
-# 2026-11-21: ueber mcp_mit_env. Der Daemon hat SUPABASE_URL und SUPABASE_SERVICE_ROLE_KEY nicht
-# in seiner Umgebung (der Waechter reicht nur OPENFANG_API_KEY weiter), die env-Liste lief
-# deshalb ins Leere: jedes Werkzeug antwortete mit "configuration_error: SUPABASE_URL and
-# SUPABASE_SERVICE_ROLE_KEY must be set". Der Starter holt genau diese zwei Werte aus der Root-.env.
-[mcp_servers.transport]
-type = "stdio"
-command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "SUPABASE_URL", "--env", "SUPABASE_SERVICE_ROLE_KEY", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/ideas/mcp_server.py"]
-
-# 2026-11-23: Desktop-Space, feste Aufrufe des Gehirns (spaces/desktop/mcp_server.py).
-# Der Dienst spricht nur mit dem Desktop-Dienst am eigenen Rechner und liest dasselbe Aufgabenbuch.
-# VIBEMIND_DESKTOP_AUSFUEHREN ist absichtlich NICHT gesetzt: ohne den Schalter ist jede Aufgabe ein Trockenlauf.
-[[mcp_servers]]
-name = "spaces-desktop"
-timeout_secs = 60
-
-[mcp_servers.transport]
-type = "stdio"
-command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--set", "DESKTOP_AUTOMATION_URL=http://127.0.0.1:8007", "--set", "VIBEMIND_DESKTOP_AUFGABEN_DIR=C:/Users/User/AppData/Local/VibeMind/desktop-aufgaben", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/desktop/mcp_server.py"]
-
-# Auftragsbuch (Sales-Stufe 1): Die Bruecke reicht Aufrufe an den Dienst auf dem Mini-PC weiter.
-# Adresse und Schluessel stehen nur in der Root-.env; ohne diese Werte beendet sich
-# die Bruecke mit einer Meldung.
-# AUFTRAGSBUCH_CA_DATEI (optional) nennt eine eigene Zertifikatsliste fuer die TLS-Pruefung,
-# weil der Windows-Speicher abgelaufene Zwischenzertifikate halten kann; fehlt sie, gilt der Standard.
-[[mcp_servers]]
-name = "auftragsbuch"
-timeout_secs = 60
-[mcp_servers.transport]
-type = "stdio"
-command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "AUFTRAGSBUCH_URL", "--env", "AUFTRAGSBUCH_SCHLUESSEL", "--env", "AUFTRAGSBUCH_CA_DATEI", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/auftragsbuch/bruecke.py"]
-
-# Rowboat-Status (ein lesendes Werkzeug rowboat_status, HEAD gegen ROWBOAT_URL). Der Eintrag
-# stand bisher nur in der Vorlage; ohne ihn lehnt OpenFang das Werkzeug fuer rowboat-chat als
-# "not permitted" ab, weil der Server fehlt. Ueber mcp_mit_env, weil der Daemon ROWBOAT_URL
-# nicht in seiner Umgebung hat (wie bei spaces-ideas).
-[[mcp_servers]]
-name = "spaces-rowboat"
-timeout_secs = 30
-[mcp_servers.transport]
-type = "stdio"
-command = "C:/Users/User/Desktop/Vibemind_V1/.venv/Scripts/python.exe"
-args = ["C:/Users/User/Desktop/Vibemind_V1/scripts/mcp_mit_env.py", "--env", "ROWBOAT_URL", "--", "C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/rowboat/mcp_server.py"]
-
-[[mcp_servers]]
-name = "spaces-minibook"
-timeout_secs = 10
-env = ["MINIBOOK_STATUS_URL"]
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/minibook/mcp_server.py"]
-
-# ═══════════════════════════════════════════════════════════════════
-# n8n — workflow automation (third-party engine)
-# Registry-routed MCP tool surface for the eight canonical n8n.* events
-# scoped by the brain-n8n agent (agents/brain-n8n/agent.toml:7;
-# vibemind-os/config/space_agent_registry.yml:269-286). There is no
-# VibeMind-owned n8n Space application — every tool call is executed by
-# the third-party n8n engine, reached through the `n8n-mcp` npm package
-# (vibemind-os/docs/mcp-archive/MCP_SERVER_INVENTORY.md:103-108). The one
-# in-repo launch of this server uses `npx -y n8n-mcp`, sets N8N_API_URL,
-# N8N_API_KEY, MCP_MODE=stdio and LOG_LEVEL=error, and allows 120 s per
-# request (vibemind-os/security/poc_n8n/agent.py:139-155).
-#
-# NOTE: `env` lists variable NAMES only — never values. OpenFang spawns
-# stdio MCP servers with a cleared environment and forwards exactly these
-# names from the host (crates/openfang-runtime/src/mcp.rs). The values,
-# including MCP_MODE=stdio, must therefore already exist in the host
-# environment / root .env; OpenFang cannot inject them.
-# ═══════════════════════════════════════════════════════════════════
-
-[[mcp_servers]]
 name = "n8n"
 timeout_secs = 120
 env = ["N8N_API_URL", "N8N_API_KEY", "MCP_MODE", "LOG_LEVEL"]
@@ -629,19 +642,6 @@ args = ["-y", "n8n-mcp"]
 # Maps natural-language queries to one of 14 spaces and broadcasts
 # navigation events to the Electron UI. Layers: alias → Qwen3 embedding
 # → LLM tiebreaker.
-# ═══════════════════════════════════════════════════════════════════
-
-[[mcp_servers]]
-name = "space-navigator"
-timeout_secs = 30
-[mcp_servers.transport]
-type = "stdio"
-command = "python"
-args = ["C:/Users/User/Desktop/Vibemind_V1/vibemind-os/spaces/_navigator/mcp_server.py"]
-env = { OPENROUTER_API_KEY = "${OPENROUTER_API_KEY}", NAVIGATOR_LLM_MODEL = "openai/gpt-4o-mini", NAVIGATOR_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B" }
-
-# ═══════════════════════════════════════════════════════════════════
-# A2A Protocol
 # ═══════════════════════════════════════════════════════════════════
 
 [a2a]
