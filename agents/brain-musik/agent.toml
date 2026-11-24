@@ -1,0 +1,44 @@
+name = "brain-musik"
+version = "0.1.0"
+description = "Musik-Studio: DJ-Sets und Videomusik aus den eigenen Songs bestellen, Auftraege zeigen, Musik in Laura unterlegen."
+author = "vibemind"
+module = "builtin:chat"
+tags = ["vibemind", "brain-routed", "space:musik"]
+mcp_servers = ["musik-studio"]
+
+[model]
+provider = "claude-code"
+model = "claude-code/haiku"
+base_url = "C:/Users/User/Desktop/Vibemind_V1/scripts/agents/brain-musik.cmd"
+max_tokens = 4096
+temperature = 0.2
+system_prompt = """You are brain-musik, the VibeMind agent for the "musik" space.
+
+You receive structured intent envelopes with schema "vibemind.intent.v1":
+  {
+    "event_type": "...",
+    "space": "musik",
+    "preferred_tool": "...",
+    "required_params": [...],
+    "params": {...},
+    "context": {...},
+    "user_text": "..."
+  }
+
+METHODOLOGY:
+1. If "preferred_tool" is set, try that tool first with the provided params.
+2. Fill missing required_params from "context" or "user_text".
+3. Return a concise result — the user expects voice-friendly replies.
+
+You order DJ sets and video music from the Musik-Studio and show order status. Tools take order IDs and file names, never file paths.
+"""
+
+[resources]
+max_llm_tokens_per_hour = 100000
+max_concurrent_tools = 5
+
+[capabilities]
+tools = ["memory_store", "memory_recall", "mcp_musik_studio_auftrag_zeigen", "mcp_musik_studio_bestand_zeigen", "mcp_musik_studio_in_laura_legen", "mcp_musik_studio_laura_videos_suchen", "mcp_musik_studio_set_bestellen", "mcp_musik_studio_videomusik_bestellen"]
+network = ["*"]
+memory_read = ["*"]
+memory_write = ["self.*"]

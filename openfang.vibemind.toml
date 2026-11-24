@@ -532,6 +532,18 @@ args = [
     "laura-mcp",
 ]
 
+# 2026-11-24: Musik-Studio (Plan 3). Der Musik-Dienst laeuft als eigener PC-Dienst
+# (spaces/musik/studio/scripts/musik-dienste-starten.ps1) und spricht MCP ueber HTTP.
+# Er nimmt nur Host 127.0.0.1:8148 ohne Origin an. Agent: brain-musik.
+# Wie bei laura auch in ~/.openfang/config.toml eintragen.
+[[mcp_servers]]
+name = "musik-studio"
+timeout_secs = 1200
+
+[mcp_servers.transport]
+type = "http"
+url = "http://127.0.0.1:8148/mcp"
+
 # ═══════════════════════════════════════════════════════════════════
 # Desktop Automation (handoff multi-agent system)
 # ═══════════════════════════════════════════════════════════════════
